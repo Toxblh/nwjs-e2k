@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 17:29:21 +0100
+Subject: [PATCH 60/99] v8: e2k: regexp code reads its int parameters as 32
+ bits
+
+The start index and the size of the capture array are C ints pushed as
+whole registers at the entry and were loaded back as 64 bits.  A C++ caller
+(the runtime path of RegExp execution) leaves the upper half of such a
+register undefined.
+---
+ chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc b/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc
+index a1200467b2..ca613d0a91 100644
+--- a/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc
++++ b/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc
+@@ -811,7 +811,8 @@ DirectHandle<HeapObject> RegExpMacroAssemblerE2K::GetCode(
+     __ Sub_d(current_input_offset(), a0, end_of_input_address());
+     // Set a0 to address of char before start of the input string
+     // (effectively string position -1).
+-    __ Ld_d(a1, MemOperand(frame_pointer(), kStartIndexOffset));
++    // An int parameter: a C caller defines only the lower half of the register.
++    __ Ld_w(a1, MemOperand(frame_pointer(), kStartIndexOffset));
+     __ Sub_d(a0, current_input_offset(), Operand(char_size()));
+     __ slli_d(t1, a1, (mode() == UC16) ? 1 : 0);
+     __ Sub_d(a0, a0, t1);
+@@ -874,7 +875,7 @@ DirectHandle<HeapObject> RegExpMacroAssemblerE2K::GetCode(
+         // Copy captures to output.
+         __ Ld_d(a1, MemOperand(frame_pointer(), kInputStartOffset));
+         __ Ld_d(a0, MemOperand(frame_pointer(), kRegisterOutputOffset));
+-        __ Ld_d(a2, MemOperand(frame_pointer(), kStartIndexOffset));
++        __ Ld_w(a2, MemOperand(frame_pointer(), kStartIndexOffset));
+         __ Sub_d(a1, end_of_input_address(), a1);
+         // a1 is length of input in bytes.
+         if (mode() == UC16) {
+@@ -915,7 +916,7 @@ DirectHandle<HeapObject> RegExpMacroAssemblerE2K::GetCode(
+       if (global()) {
+         // Restart matching if the regular expression is flagged as global.
+         __ Ld_d(a0, MemOperand(frame_pointer(), kSuccessfulCapturesOffset));
+-        __ Ld_d(a1, MemOperand(frame_pointer(), kNumOutputRegistersOffset));
++        __ Ld_w(a1, MemOperand(frame_pointer(), kNumOutputRegistersOffset));
+         __ Ld_d(a2, MemOperand(frame_pointer(), kRegisterOutputOffset));
+         // Increment success counter.
+         __ Add_d(a0, a0, 1);

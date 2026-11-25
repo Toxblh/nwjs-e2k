@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Fri, 9 Oct 2026 09:31:41 +0100
+Subject: [PATCH 10/99] e2k: protected_memory section flags, webrtc syscall
+ header
+
+---
+ chromium/base/memory/protected_memory.h                    | 7 +++++++
+ .../third_party/webrtc/rtc_base/platform_thread_types.cc   | 4 +++-
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/chromium/base/memory/protected_memory.h b/chromium/base/memory/protected_memory.h
+index 72698cee40..d37fd335b0 100644
+--- a/chromium/base/memory/protected_memory.h
++++ b/chromium/base/memory/protected_memory.h
+@@ -138,8 +138,15 @@ inline constexpr int kProtectedMemoryAlignment = 16384;
+ inline constexpr int kProtectedMemoryAlignment = 4096;
+ #endif
+ 
++#if defined(__e2k__)
++// The external assembler used on e2k rejects a section whose flags differ from
++// the ones the compiler emits for the (writable) protected variables.
++__asm__(".section protected_memory, \"aw\"\n\t");
++__asm__(".section protected_memory_buffer, \"aw\"\n\t");
++#else
+ __asm__(".section protected_memory, \"a\"\n\t");
+ __asm__(".section protected_memory_buffer, \"a\"\n\t");
++#endif
+ 
+ // Explicitly mark these variables hidden so the symbols are local to the
+ // currently built component. Otherwise they are created with global (external)
+diff --git a/chromium/third_party/webrtc/rtc_base/platform_thread_types.cc b/chromium/third_party/webrtc/rtc_base/platform_thread_types.cc
+index 20bf4afc44..94484dac9c 100644
+--- a/chromium/third_party/webrtc/rtc_base/platform_thread_types.cc
++++ b/chromium/third_party/webrtc/rtc_base/platform_thread_types.cc
+@@ -16,7 +16,9 @@
+ #include <sys/prctl.h>
+ #include <sys/syscall.h>
+ 
+-#if !defined(WEBRTC_ARCH_ARM) && !defined(WEBRTC_ARCH_ARM64)
++#if defined(__e2k__)
++#include <asm/unistd.h>
++#elif !defined(WEBRTC_ARCH_ARM) && !defined(WEBRTC_ARCH_ARM64)
+ #include <asm/unistd_64.h>
+ #endif
+ #endif

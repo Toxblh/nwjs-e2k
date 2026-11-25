@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 13:30:36 +0100
+Subject: [PATCH 49/99] v8: e2k: no extension of what is extended: Smi
+ untagging, int32 to double
+
+Two sequences found in the hot code of array loops:
+
+TruncateInt64ToInt32 of an untagged Smi was a shift by zero and a sign
+extension after the arithmetic shift by 32: the selector recognized
+Word64Sar but not the kind of shift that untagging is
+(kShiftRightArithmeticShiftOutZeros).
+
+Int32 to float64/float32 moved the value into a scratch floating-point
+register first. The registers are one file: new layer instructions
+ffint_d_wr, ffint_s_wr convert from the general register.
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc      |  2 ++
+ chromium/v8/src/codegen/e2k/assembler-e2k.h       |  3 +++
+ chromium/v8/src/codegen/e2k/la_asm.h              |  5 +++++
+ .../compiler/backend/e2k/code-generator-e2k.cc    | 15 +++++----------
+ .../backend/e2k/instruction-selector-e2k.cc       |  8 ++++++--
+ 5 files changed, 21 insertions(+), 12 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index eacfa61501..2c264dece3 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -1193,6 +1193,8 @@ void Assembler::bcmpi(Condition cond, Register rj, int64_t imm,
+   }
+   LA(bcmpi(cmp, negate, rj, imm, offset));
+ }
++void Assembler::ffint_d_wr(FPURegister fd, Register rj) { LA(ffint_d_wr(fd, rj)); }
++void Assembler::ffint_s_wr(FPURegister fd, Register rj) { LA(ffint_s_wr(fd, rj)); }
+ void Assembler::beqz(Register rj, int32_t offset) { LA(beqz(rj, offset)); }
+ void Assembler::bnez(Register rj, int32_t offset) { LA(bnez(rj, offset)); }
+ void Assembler::jirl(Register rd, Register rj, int32_t offset) { LA(jirl(rd, rj, offset)); }
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index df06510a19..716b348faa 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -485,6 +485,9 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   // Not LoongArch: branch on rj <cond> imm, the constant a literal of the
+   // compare.
+   void bcmpi(Condition cond, Register rj, int64_t imm, int32_t offset);
++  // Not LoongArch: int32 in a general register to double, to float.
++  void ffint_d_wr(FPURegister fd, Register rj);
++  void ffint_s_wr(FPURegister fd, Register rj);
+   void beqz(Register rj, int32_t offset);
+   inline void beqz(Register rj, Label* L) {
+     beqz(rj, shifted_branch_offset21(L));
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index eccde2f343..822f6abb23 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -593,6 +593,11 @@ class Assembler : private e2k::Assembler {
+   void ffint_s_w(FPURegister fd, FPURegister fj) { L(istofs(0, F(fj), F(fd))); }
+   void ffint_s_l(FPURegister fd, FPURegister fj) { L(idtofs(0, F(fj), F(fd))); }
+   void ffint_d_w(FPURegister fd, FPURegister fj) { L(istofd(0, F(fj), F(fd))); }
++  // Not LoongArch: the same from a general register (its low 32 bits): on
++  // e2k the registers are one file, the move into a floating-point one
++  // (movgr2fr_w) is an operation and a delay for nothing.
++  void ffint_d_wr(FPURegister fd, Register rj) { L(istofd(0, R(rj), F(fd))); }
++  void ffint_s_wr(FPURegister fd, Register rj) { L(istofs(0, R(rj), F(fd))); }
+   void ffint_d_l(FPURegister fd, FPURegister fj) { L(idtofd(0, F(fj), F(fd))); }
+   // Saturating, NaN gives 0.  Two slots each.  Rounding: 0 nearest even,
+   // 1 down, 2 up, 3 to zero, 4 as %pfpfr says.
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index 94718faa68..d01a2f05b4 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -1840,18 +1840,13 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+     case kE2kFloat32ToFloat64:
+       __ fcvt_d_s(i.OutputDoubleRegister(), i.InputSingleRegister(0));
+       break;
+-    case kE2kInt32ToFloat64: {
+-      FPURegister scratch = kScratchDoubleReg;
+-      __ movgr2fr_w(scratch, i.InputRegister(0));
+-      __ ffint_d_w(i.OutputDoubleRegister(), scratch);
++    case kE2kInt32ToFloat64:
++      // One register file: no move into a floating-point register first.
++      __ ffint_d_wr(i.OutputDoubleRegister(), i.InputRegister(0));
+       break;
+-    }
+-    case kE2kInt32ToFloat32: {
+-      FPURegister scratch = kScratchDoubleReg;
+-      __ movgr2fr_w(scratch, i.InputRegister(0));
+-      __ ffint_s_w(i.OutputDoubleRegister(), scratch);
++    case kE2kInt32ToFloat32:
++      __ ffint_s_wr(i.OutputDoubleRegister(), i.InputRegister(0));
+       break;
+-    }
+     case kE2kUint32ToFloat32: {
+       __ Ffint_s_uw(i.OutputDoubleRegister(), i.InputRegister(0));
+       break;
+diff --git a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+index 2f522ac8f6..00db181511 100644
+--- a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+@@ -1907,8 +1907,12 @@ void InstructionSelector::VisitTruncateInt64ToInt32(OpIndex node) {
+   E2kOperandGenerator g(this);
+   // TODO(e2k): Check TruncateInt64ToInt32 in VisitNode
+   OpIndex value = this->Get(node).input(0);
+-  if (Get(value).Is<Opmask::kWord64ShiftRightArithmetic>()) {
+-    const ShiftOp& shift = Cast<ShiftOp>(value);
++  // Untagging a Smi is a shift of the other kind (kShiftOutZeros).
++  if (const ShiftOp* sar = Get(value).TryCast<ShiftOp>();
++      sar && sar->rep == WordRepresentation::Word64() &&
++      (sar->kind == ShiftOp::Kind::kShiftRightArithmetic ||
++       sar->kind == ShiftOp::Kind::kShiftRightArithmeticShiftOutZeros)) {
++    const ShiftOp& shift = *sar;
+     auto shift_value = shift.right();
+     bool cover = CanCover(node, value);
+     if (cover && CanCover(value, shift.left()) &&

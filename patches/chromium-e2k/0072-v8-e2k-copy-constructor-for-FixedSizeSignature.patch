@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 23:07:29 +0100
+Subject: [PATCH 72/99] v8: e2k: copy constructor for FixedSizeSignature
+
+The base class Signature points at the array held by the derived object
+itself. Without a copy constructor the class is trivially copyable and
+an ABI may return it by copy: on e2k the result of Returns() or Params()
+that was not inlined (the tree is built at -O1) is a bitwise copy whose
+pointer still leads into the frame of the callee. Liftoff then read the
+kinds of builtin parameters from a dead frame and moved them to
+floating-point registers (calls of WasmThrow, CallIndirectIC and others
+got garbage). Measured apart from V8 for sizes of 32 to 224 bytes with
+clang 21 and lcc.
+---
+ chromium/v8/src/codegen/signature.h | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/chromium/v8/src/codegen/signature.h b/chromium/v8/src/codegen/signature.h
+index 38cbb25428..f0b507fca4 100644
+--- a/chromium/v8/src/codegen/signature.h
++++ b/chromium/v8/src/codegen/signature.h
+@@ -191,6 +191,17 @@ class FixedSizeSignature : public Signature<T> {
+         reps_, std::initializer_list<T>{param_types...}.begin()};
+   }
+ 
++  // The base class points at reps_ of this very object, so a copy has to
++  // point at its own. Without this constructor the class is trivially
++  // copyable, and an ABI may then return it in registers: on e2k (objects up
++  // to 64 bytes) the result of Returns() or Params(), when the call is not
++  // inlined, is a bitwise copy whose pointer still leads into the frame of
++  // the callee.
++  constexpr FixedSizeSignature(const FixedSizeSignature& other) V8_NOEXCEPT
++      : Signature<T>(kNumReturns, kNumParams, reps_) {
++    std::copy(other.reps_, other.reps_ + kNumReturns + kNumParams, reps_);
++  }
++
+  private:
+   // Other template instantiations can call the private constructor.
+   template <typename T2, size_t kNumReturns2, size_t kNumParams2>

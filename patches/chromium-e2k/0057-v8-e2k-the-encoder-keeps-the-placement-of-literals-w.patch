@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 16:29:53 +0100
+Subject: [PATCH 57/99] v8: e2k: the encoder keeps the placement of literals
+ with the command
+
+A command of the scheduling window is written again every time a command
+before it changes, and each time its literals were placed by the
+exhaustive search.  The placement is now kept in the command and dropped
+when a literal is added; the search works in place and does not descend
+into a choice that cannot win; end() sizes the buffer once.  The generated
+code is the same byte for byte.
+---
+ chromium/v8/src/codegen/e2k/e2k_asm.h | 51 +++++++++++++++++----------
+ 1 file changed, 33 insertions(+), 18 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/e2k_asm.h b/chromium/v8/src/codegen/e2k/e2k_asm.h
+index 3b073d413d..64a8f85e22 100644
+--- a/chromium/v8/src/codegen/e2k/e2k_asm.h
++++ b/chromium/v8/src/codegen/e2k/e2k_asm.h
+@@ -92,6 +92,10 @@ struct Command {
+   uint8_t elp_[4]; uint16_t clp_[3]; int pls_used_;
+   uint32_t ss_, cs0_, cs1_; bool has_ss_, has_cs0_, has_cs1_, setwd_, setbr_, mas_;
+   Lit lits_[7]; int nlits_, nop_;
++  // Where plan() has put the literals: kept with the command (lp_n_ == nlits_
++  // when it is valid), because a command is planned again every time the
++  // commands after it are written, and the placement search is the costly part.
++  mutable uint8_t lp_half_[16], lp_choice_[7]; mutable uint16_t lp_best_; mutable int8_t lp_n_ = -1;
+   Label* cs0_label_;
+   // For join(): the operation of each channel, and what the command writes.
+   // def_ is a bit set over operand codes (registers), pdef_ over predicate
+@@ -319,6 +323,7 @@ class Assembler : public Command {
+     als_mask_ = ales_mask_ = rlp_mask_ = mrgc_mask_ = pls_used_ = 0;
+     has_ss_ = has_cs0_ = has_cs1_ = setwd_ = setbr_ = mas_ = false;
+     nop_ = norder_ = nlits_ = 0; cs0_label_ = nullptr;
++    lp_n_ = -1;
+     memset(elp_, 0, sizeof elp_); memset(clp_, 0, sizeof clp_);
+     memset(def_, 0, sizeof def_); memset(gdef_, 0, sizeof gdef_); memset(mem_, 0, sizeof mem_);
+     pdef_ = gpdef_ = 0; store_ = gstore_ = alone_ = join_ = bad_ = false;
+@@ -409,7 +414,6 @@ class Assembler : public Command {
+     bad_ = true;
+     return -1;
+   }
+-  void word(uint32_t w) { for (int i = 0; i < 4; i++) buf_.push_back(uint8_t(w >> (8 * i))); }
+   // ALS = cop:b2:src2:b0, plus ALES = opc2:ales_lo where the channel needs it.
+   // Returns the channel taken, -1 when the operation does not join.
+   int alop(Op op, int ch, uint8_t b2, Src2 s2, uint8_t b0, int src3 = -1, int mem = 0) {
+@@ -484,6 +488,7 @@ class Assembler : public Command {
+     if (join_ && nlits_ >= 4) bad_ = true;
+     if (bad_) return;
+     assert(nlits_ < 7); lits_[nlits_++] = Lit{v, l, uint8_t(cls), int8_t(ch)};
++    lp_n_ = -1;
+   }
+   static int choices(const Lit& l, uint8_t pos[11], uint8_t size[11]) {
+     if (l.ch < 0) { pos[0] = 0; size[0] = 2; return 1; }       // setwd owns LTS0
+@@ -501,23 +506,22 @@ class Assembler : public Command {
+   }
+   // ponytail: exhaustive search, up to 11^6 leaves for six 16-bit literals
+   // that cannot fit; fine for a prototype, cache or special-case if it shows up.
+-  void search(Plan& p, const int* order, int k, const Half* h, unsigned mask, uint8_t* idx) const {
+-    if (mask >= p.best) return;
++  // h is changed in place and put back: a choice that is no better than the
++  // best one found costs neither a copy nor a call.
++  void search(Plan& p, const int* order, int k, Half* h, unsigned mask, uint8_t* idx) const {
+     if (k == nlits_) { p.best = mask; memcpy(p.half_lts, h, sizeof p.half_lts); memcpy(p.choice, idx, 7); return; }
+     const Lit& l = lits_[order[k]];
+     uint8_t pos[11], size[11];
+     int n = choices(l, pos, size);
+     for (int c = 0; c < n; c++) {
+-      Half t[8]; memcpy(t, h, sizeof t);
+-      unsigned m = mask; bool ok = true;
++      unsigned m = mask, taken = 0; bool ok = true;
+       for (int i = 0; i < size[c] && ok; i++) {
+-        Half& x = t[pos[c] + i];
++        Half& x = h[pos[c] + i];
+         if (x.owner >= 0) ok = same_piece(x, l, i);
+-        else { x.owner = int8_t(order[k]); x.sub = uint8_t(i); m |= 1u << ((pos[c] + i) ^ 1); }
++        else { x.owner = int8_t(order[k]); x.sub = uint8_t(i); m |= 1u << ((pos[c] + i) ^ 1); taken |= 1u << i; }
+       }
+-      if (!ok) continue;
+-      idx[order[k]] = uint8_t(c);
+-      search(p, order, k + 1, t, m, idx);
++      if (ok && m < p.best) { idx[order[k]] = uint8_t(c); search(p, order, k + 1, h, m, idx); }
++      for (int i = 0; i < size[c]; i++) if (taken >> i & 1) h[pos[c] + i] = Half{-1, 0};
+     }
+   }
+ 
+@@ -549,11 +553,19 @@ inline bool Assembler::plan(Plan& p) const {
+   for (int i = 0; i < nlits_; i++) if (lits_[i].ch < 0) order[n++] = i;
+   for (int cls = 2; cls >= 0; cls--)
+     for (int i = 0; i < nlits_; i++) if (lits_[i].ch >= 0 && lits_[i].cls == cls) order[n++] = i;
+-  Half free_lts[8]; uint8_t idx[7] = {};
+-  for (Half& h : free_lts) h = Half{-1, 0};
+-  p.best = 0x100;
+-  memcpy(p.half_lts, free_lts, sizeof free_lts);
+-  search(p, order, 0, free_lts, 0, idx);
++  static_assert(sizeof p.half_lts == sizeof lp_half_ && sizeof p.choice == sizeof lp_choice_);
++  if (lp_n_ == nlits_) {
++    p.best = lp_best_; memcpy(p.half_lts, lp_half_, sizeof lp_half_); memcpy(p.choice, lp_choice_, sizeof lp_choice_);
++  } else {
++    Half free_lts[8]; uint8_t idx[7] = {};
++    for (Half& h : free_lts) h = Half{-1, 0};
++    p.best = 0x100;
++    memcpy(p.half_lts, free_lts, sizeof free_lts);
++    memset(p.choice, 0, sizeof p.choice);
++    search(p, order, 0, free_lts, 0, idx);
++    lp_n_ = int8_t(nlits_); lp_best_ = uint16_t(p.best);
++    memcpy(lp_half_, p.half_lts, sizeof lp_half_); memcpy(lp_choice_, p.choice, sizeof lp_choice_);
++  }
+   if (nlits_ && p.best == 0x100) return false;
+   p.nlts = 0;
+   for (int s = 0; s < 4; s++) {
+@@ -622,24 +634,27 @@ inline void Assembler::end(int min_words) {
+   int ncdsw = (p.ncds + 1) / 2, padded = (p.total + 1) & ~1;
+   assert(min_words % 2 == 0 && min_words <= 16);
+   if (padded < min_words) padded = min_words;
++  buf_.resize(start + size_t(padded) * 4);                 // once: the words are written in place
++  size_t at = start;
++  auto word = [&](uint32_t w) { put(at, w); at += 4; };
+   word(uint32_t(p.mid - 1) | uint32_t(padded / 2 - 1) << 4 | uint32_t(nop_) << 7 |
+        uint32_t(has_ss_) << 12 | uint32_t(has_cs0_) << 14 | uint32_t(has_cs1_) << 15 |
+        uint32_t(ncdsw) << 16 | uint32_t(p.npls) << 18 | uint32_t(ales_mask_) << 20 | uint32_t(als_mask_) << 26);
+   if (has_ss_) word(ss_);
+   for (int i = 0; i < 6; i++)
+     if (als_mask_ & (1 << i)) word(als[i]);
+-  size_t cs0_word = buf_.size();
++  size_t cs0_word = at;
+   if (has_cs0_) word(cs0_);
+   if (p.ales25) word(uint32_t(ales_mask_ & 4 ? ales_[2] : 0x01c0) << 16 | (ales_mask_ & 32 ? ales_[5] : 0x01c0));
+   if (has_cs1_) word(cs1_word());
+   for (int i = 0; i < p.nhalf; i += 2) word(uint32_t(p.half[i]) << 16 | (i + 1 < p.nhalf ? p.half[i + 1] : 0));
+   for (int i = p.total; i < padded; i++) word(0);
+   size_t lts_word[4];
+-  for (int i = p.nlts - 1; i >= 0; i--) { lts_word[i] = buf_.size(); word(p.lts[i]); }
++  for (int i = p.nlts - 1; i >= 0; i--) { lts_word[i] = at; word(p.lts[i]); }
+   for (int i = p.npls - 1; i >= 0; i--)
+     word(uint32_t(i < 2 ? elp_[2 * i] : 0) << 24 | uint32_t(i < 2 ? elp_[2 * i + 1] : 0) << 16 | clp_[i]);
+   for (int i = ncdsw - 1; i >= 0; i--) word(uint32_t(p.cds[2 * i]) << 16 | (2 * i + 1 < p.ncds ? p.cds[2 * i + 1] : 0));
+-  assert(buf_.size() - start == size_t(padded) * 4);
++  assert(at - start == size_t(padded) * 4);
+   if (cs0_label_) use(cs0_label_, {cs0_word, start, false});
+   for (int i = 0; i < nlits_; i++)
+     if (lits_[i].label) use(lits_[i].label, {lts_word[p.ref[i] & 3], start, true});

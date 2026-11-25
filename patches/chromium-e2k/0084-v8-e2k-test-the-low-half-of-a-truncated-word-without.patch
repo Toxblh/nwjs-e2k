@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Fri, 16 Oct 2026 08:50:27 +0100
+Subject: [PATCH 84/99] v8: e2k: test the low half of a truncated word without
+ its sxt
+
+Word32And(TruncateInt64ToInt32(y), m) == 0 with a constant m (TaggedIsSmi
+and the other tag checks of CSA) and TruncateInt64ToInt32(y) == 0 read y
+itself: the low half of y & m, m zero-extended, is that of the 32-bit and,
+and its high half is zero, so one cmpandedb with m (0xffffffff for the
+test against zero) replaces the sxt of the truncation and its delay.
+The register keeps the upper half of y, which nobody reads here.
+---
+ .../backend/e2k/instruction-selector-e2k.cc   | 36 +++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+index 24620d07cd..5a042ef0c4 100644
+--- a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+@@ -2371,6 +2371,29 @@ Instruction* VisitWordCompare(InstructionSelector* selector, OpIndex node,
+   }
+ }
+ 
++// A test against zero of Word32And(TruncateInt64ToInt32(y), m), m a
++// constant: the low half of y & m, m taken as unsigned, is that of the 32-bit
++// and and its high half is zero, so the test reads y itself (cmpandedb) and the
++// truncation (an sxt and its delay before the compare) is not needed.
++bool TryVisitTstOfTruncation(InstructionSelector* selector, OpIndex node,
++                             FlagsContinuation* cont) {
++  const Operation& op = selector->Get(node);
++  for (int k = 0; k < 2; k++) {
++    uint32_t mask;
++    if (!selector->MatchIntegralWord32Constant(op.input(1 - k), &mask)) {
++      continue;
++    }
++    const ChangeOp* truncation =
++        selector->TryCast<Opmask::kTruncateWord64ToWord32>(op.input(k));
++    if (truncation == nullptr) return false;
++    E2kOperandGenerator g(selector);
++    VisitCompare(selector, kE2kTst, g.UseRegister(truncation->input()),
++                 g.UseImmediate64(mask), cont);
++    return true;
++  }
++  return false;
++}
++
+ void VisitWord32Compare(InstructionSelector* selector, OpIndex node,
+                         FlagsContinuation* cont) {
+   E2kOperandGenerator g(selector);
+@@ -2883,6 +2906,10 @@ void InstructionSelector::VisitWordCompareZero(OpIndex user, OpIndex value,
+         }
+       } else if (value_op.Is<Opmask::kWord32BitwiseAnd>() ||
+                  value_op.Is<Opmask::kWord64BitwiseAnd>()) {
++        if (value_op.Is<Opmask::kWord32BitwiseAnd>() &&
++            TryVisitTstOfTruncation(this, value, cont)) {
++          return;
++        }
+         VisitWordCompare(this, value, kE2kTst, cont, true);
+         return;
+       } else if (value_op.Is<StackPointerGreaterThanOp>()) {
+@@ -2893,6 +2920,15 @@ void InstructionSelector::VisitWordCompareZero(OpIndex user, OpIndex value,
+ 
+     // Continuation could not be combined with a compare, emit compare against
+     // 0.
++    if (const ChangeOp* truncation =
++            TryCast<Opmask::kTruncateWord64ToWord32>(value);
++        truncation != nullptr && (cont->condition() == kEqual ||
++                                  cont->condition() == kNotEqual)) {
++      // The low half of y against zero: a test of y with 0xffffffff, no sxt.
++      VisitCompare(this, kE2kTst, g.UseRegister(truncation->input()),
++                   g.UseImmediate64(0xffffffff), cont);
++      return;
++    }
+     InstructionOperand leftOp = g.TempRegister();
+     const Operation& lhs = value_op;
+     if (const ComparisonOp* cmp = Get(user).TryCast<ComparisonOp>()) {

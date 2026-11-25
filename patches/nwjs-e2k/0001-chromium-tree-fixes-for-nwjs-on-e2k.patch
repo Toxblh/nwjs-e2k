@@ -1,0 +1,196 @@
+--- a/build/config/gcc/BUILD.gn
++++ b/build/config/gcc/BUILD.gn
+@@ -78,7 +78,14 @@
+     if (current_toolchain == default_toolchain && ldso_path != "") {
+       ldflags += [ "-Wl,--dynamic-linker=${ldso_path}" ]
+     }
+-    ldflags += [ "-Wl,-rpath=" + getenv("CHROMIUM_RPATH") ]
++    # ALT CHROMIUM_RPATH vs NW.js (ldflags commented out above): define it when unset
++    if (getenv("CHROMIUM_RPATH") != "") {
++      if (defined(ldflags)) {
++        ldflags += [ "-Wl,-rpath=" + getenv("CHROMIUM_RPATH") ]
++      } else {
++        ldflags = [ "-Wl,-rpath=" + getenv("CHROMIUM_RPATH") ]
++      }
++    }
+   }
+ }
+ 
+--- a/build/rust/allocator/BUILD.gn
++++ b/build/rust/allocator/BUILD.gn
+@@ -11,6 +11,12 @@
+ if (build_with_chromium) {
+   import("//base/allocator/partition_allocator/partition_alloc.gni")
+   rust_allocator_uses_partition_alloc = use_partition_alloc_as_malloc
++  if (current_cpu == "e2k" && use_allocator_shim && current_toolchain == default_toolchain) {
++    # NW.js/e2k: NW turns PartitionAlloc-as-malloc off on Linux; keep the Rust allocator on the allocator shim's
++    # Unchecked* entry points anyway (they go to glibc malloc then), so the Rust crates stay identical to the
++    # e2k Chrome build and come from its native rustc seed.
++    rust_allocator_uses_partition_alloc = true
++  }
+ }
+ 
+ # In ASAN builds, PartitionAlloc-Everywhere is disabled, meaning malloc() and
+@@ -99,6 +105,10 @@
+         "allocator_impls.cc",
+         "allocator_impls.h",
+       ]
++      if (current_cpu == "e2k" && !use_partition_alloc_as_malloc && current_toolchain == default_toolchain) {
++        # NW.js/e2k: Rust allocator crate as in the PartitionAlloc build, implemented on glibc malloc here
++        defines = [ "RUST_ALLOC_E2K_MALLOC" ]
++      }
+       visibility = [ ":*" ]
+     }
+   }
+--- a/build/rust/allocator/allocator_impls.cc
++++ b/build/rust/allocator/allocator_impls.cc
+@@ -20,6 +20,35 @@
+ #define BUILD_UNSAFE_BUFFERS(...) __VA_ARGS__
+ #endif
+ 
++#if defined(RUST_ALLOC_E2K_MALLOC)
++// NW.js/e2k (see BUILD.gn): no PartitionAlloc-as-malloc, the Rust allocator goes to glibc malloc.
++#include <stdlib.h>
++#include <string.h>
++#include <stddef.h>
++namespace rust_allocator_internal {
++static inline bool small(size_t align) { return align <= alignof(max_align_t); }
++static unsigned char* big(size_t size, size_t align) {
++  void* p = nullptr;
++  return posix_memalign(&p, align, size ? size : 1) == 0 ? static_cast<unsigned char*>(p) : nullptr;
++}
++unsigned char* alloc(size_t size, size_t align) {
++  return small(align) ? static_cast<unsigned char*>(malloc(size)) : big(size, align);
++}
++unsigned char* alloc_zeroed(size_t size, size_t align) {
++  if (small(align)) return static_cast<unsigned char*>(calloc(1, size));
++  unsigned char* p = big(size, align);
++  if (p) memset(p, 0, size);
++  return p;
++}
++void dealloc(unsigned char* p, size_t, size_t) { free(p); }
++unsigned char* realloc(unsigned char* p, size_t old_size, size_t align, size_t new_size) {
++  if (small(align)) return static_cast<unsigned char*>(::realloc(p, new_size));
++  unsigned char* n = big(new_size, align);
++  if (n) { memcpy(n, p, old_size < new_size ? old_size : new_size); free(p); }
++  return n;
++}
++}  // namespace rust_allocator_internal
++#else  // RUST_ALLOC_E2K_MALLOC
+ #include "build/build_config.h"
+ #include "build/rust/allocator/buildflags.h"
+ 
+@@ -113,3 +142,4 @@
+ }
+ 
+ }  // namespace rust_allocator_internal
++#endif  // RUST_ALLOC_E2K_MALLOC
+--- a/build/toolchain/gcc_toolchain.gni
++++ b/build/toolchain/gcc_toolchain.gni
+@@ -475,7 +475,12 @@
+         # TODO(40208899): See if it adding --detach for local builds helps.
+         link_command += "\"-Wl,--separate-debug-file=$sofile_with_symbols\" -Wl,--no-detach "
+       }
+-      link_command += "@\"$rspfile\" {{rlibs}}"
++      if (target_cpu == "e2k") {
++        # NW.js/e2k: libnw.so is a shared library; GNU ld needs the rlibs in one group with the archives
++        link_command += "-Wl,--start-group @\"$rspfile\" {{rlibs}} -Wl,--end-group"
++      } else {
++        link_command += "@\"$rspfile\" {{rlibs}}"
++      }
+ 
+       # Generate a map file to be used for binary size analysis.
+       # Map file adds ~10% to the link time on a z620.
+@@ -596,7 +601,12 @@
+         # TODO(40208899): See if it adding --detach for local builds helps.
+         link_command += "\"-Wl,--separate-debug-file=$sofile_with_symbols\" -Wl,--no-detach "
+       }
+-      link_command += "@\"$rspfile\" {{rlibs}}"
++      if (target_cpu == "e2k") {
++        # NW.js/e2k: libnw.so is a shared library; GNU ld needs the rlibs in one group with the archives
++        link_command += "-Wl,--start-group @\"$rspfile\" {{rlibs}} -Wl,--end-group"
++      } else {
++        link_command += "@\"$rspfile\" {{rlibs}}"
++      }
+ 
+       # Generate a map file to be used for binary size analysis.
+       # Map file adds ~10% to the link time on a z620.
+--- a/buildtools/third_party/libc++/__config_site
++++ b/buildtools/third_party/libc++/__config_site
+@@ -16,12 +16,12 @@
+ //    on Windows, the increase is great enough that we go above the 4GB size
+ //    limit for PDBs (https://crbug.com/1327710#c5). To fix this, we set
+ //    _LIBCPP_ABI_NAMESPACE to a shorter value.
+-#define _LIBCPP_ABI_NAMESPACE __1
++#define _LIBCPP_ABI_NAMESPACE __Cr
+ 
+ #define _LIBCPP_ABI_VERSION 2
+ 
+-//#define _LIBCPP_ABI_FORCE_ITANIUM 0
+-//#define _LIBCPP_ABI_FORCE_MICROSOFT 0
++#define _LIBCPP_ABI_FORCE_ITANIUM 0
++#define _LIBCPP_ABI_FORCE_MICROSOFT 0
+ #define _LIBCPP_HAS_THREADS 1
+ #define _LIBCPP_HAS_MONOTONIC_CLOCK 1
+ #define _LIBCPP_HAS_TERMINAL 1
+@@ -29,21 +29,21 @@
+ #ifdef ANDROID_HOST_MUSL
+ #define _LIBCPP_HAS_MUSL_LIBC 1
+ #else
+-//#define _LIBCPP_HAS_MUSL_LIBC 0
++#define _LIBCPP_HAS_MUSL_LIBC 0
+ #endif
+ 
+ #ifdef _WIN32
+-//#define _LIBCPP_HAS_THREAD_API_PTHREAD 0
+-//#define _LIBCPP_HAS_THREAD_API_EXTERNAL 0
++#define _LIBCPP_HAS_THREAD_API_PTHREAD 0
++#define _LIBCPP_HAS_THREAD_API_EXTERNAL 0
+ #define _LIBCPP_HAS_THREAD_API_WIN32 1
+ #else
+ #define _LIBCPP_HAS_THREAD_API_PTHREAD 1
+-//#define _LIBCPP_HAS_THREAD_API_EXTERNAL 0
+-//#define _LIBCPP_HAS_THREAD_API_WIN32 0
++#define _LIBCPP_HAS_THREAD_API_EXTERNAL 0
++#define _LIBCPP_HAS_THREAD_API_WIN32 0
+ #endif
+ 
+ /* #undef _LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS */
+-//#define _LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS 0
++#define _LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS 0
+ /* #undef _LIBCPP_NO_VCRUNTIME */
+ /* #undef _LIBCPP_TYPEINFO_COMPARISON_IMPLEMENTATION */
+ #define _LIBCPP_HAS_FILESYSTEM 1
+--- a/v8/src/api/api.cc
++++ b/v8/src/api/api.cc
+@@ -12371,6 +12371,30 @@
+ void WasmModuleCompilation::SetUrl(const char* url, size_t length) {}
+ #endif  // !V8_ENABLE_WEBASSEMBLY
+ 
++void SetTLSPlatform(Platform* platform) {
++  i::V8::SetTLSPlatform(platform);
++}
++
++void FixSourceNWBin(Isolate* v8_isolate, Local<UnboundScript> script) {
++  i::Isolate* isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
++  i::Handle<i::HeapObject> obj =
++    i::Cast<i::HeapObject>(v8::Utils::OpenHandle(*script));
++  i::Handle<i::SharedFunctionInfo>
++    function_info(i::Cast<i::SharedFunctionInfo>(*obj), isolate);
++  i::Handle<i::Script> iscript(i::Cast<i::Script>(function_info->script()),
++                              isolate);
++  iscript->set_source(i::ReadOnlyRoots(isolate).undefined_value());
++}
++
++void FixSourceNWBin(Isolate* v8_isolate, Local<Module> module) {
++  i::Isolate* isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
++  i::Handle<i::SourceTextModule> obj =
++    i::Cast<i::SourceTextModule>(v8::Utils::OpenHandle(*module));
++  i::Handle<i::Script> iscript(i::Cast<i::Script>(obj->GetScript()), isolate);
++  iscript->set_source(i::ReadOnlyRoots(isolate).undefined_value());
++}
++
++
+ namespace internal {
+ 
+ 

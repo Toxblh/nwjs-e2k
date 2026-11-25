@@ -1,0 +1,40 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index d37be53..ff39233 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -9,6 +9,7 @@ if (is_mac) {
+ }
+ import("//chrome/version.gni")
+ import("//ui/gl/features.gni")
++import("//third_party/ffmpeg/ffmpeg_options.gni")
+ 
+ group("nwjs") {
+   deps = [
+@@ -27,7 +28,10 @@ group("nwjs") {
+     deps += [ "//third_party/dawn/src/dawn/tests:copy_dxc_binary" ]
+   }
+   if (is_linux) {
+-    deps += [ "//chrome:linux_cros_extra_data", "//components/crash/core/app:chrome_crashpad_handler", ":copy_icd" ]
++    deps += [ "//chrome:linux_cros_extra_data", "//components/crash/core/app:chrome_crashpad_handler" ]
++    if (target_cpu != "e2k") {  # e2k: no SwiftShader (marl needs makecontext, absent in e2k glibc)
++      deps += [ ":copy_icd" ]
++    }
+   }
+ }
+ 
+@@ -373,12 +377,14 @@ if (is_linux && !is_component_build) {
+                 "$root_build_dir/chrome_crashpad_handler",
+                 "$root_shlib_dir/libnw.so",
+                 "$root_shlib_dir/libnode.so",
+-                "$root_shlib_dir/libffmpeg.so",
+                 "$root_shlib_dir/libvulkan.so.1",
+                 "$root_shlib_dir/libvk_swiftshader.so",
+                 "$root_build_dir/chromedriver",
+                 "$root_build_dir/minidump_stackwalk",
+                 "$root_build_dir/nwjc"]
++    if (is_component_ffmpeg) {  # e2k: static ffmpeg (snapshot generator runs remotely)
++      sources += [ "$root_shlib_dir/libffmpeg.so" ]
++    }
+     if (!use_static_angle) {
+       sources += [ "$root_shlib_dir/libEGL.so",
+                    "$root_shlib_dir/libGLESv2.so" ]

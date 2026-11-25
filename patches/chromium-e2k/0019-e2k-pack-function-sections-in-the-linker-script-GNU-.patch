@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Mon, 12 Oct 2026 08:56:05 +0100
+Subject: [PATCH 19/99] e2k: pack function sections in the linker script (GNU
+ as aligns them to 1024)
+
+---
+ chromium/build/config/linux/BUILD.gn          |  2 +-
+ chromium/build/config/linux/e2k.ld            | 33 +++++++++++++++++++
+ .../config/linux/e2k_protected_memory.ld      | 15 ---------
+ 3 files changed, 34 insertions(+), 16 deletions(-)
+ create mode 100644 chromium/build/config/linux/e2k.ld
+ delete mode 100644 chromium/build/config/linux/e2k_protected_memory.ld
+
+diff --git a/chromium/build/config/linux/BUILD.gn b/chromium/build/config/linux/BUILD.gn
+index b96182c7cc..a6cc08582a 100644
+--- a/chromium/build/config/linux/BUILD.gn
++++ b/chromium/build/config/linux/BUILD.gn
+@@ -46,7 +46,7 @@ config("runtime_library") {
+ 
+   if (current_cpu == "e2k") {
+     # See the comment in the script.
+-    ldflags = [ "-Wl,-T," + rebase_path("e2k_protected_memory.ld",
++    ldflags = [ "-Wl,-T," + rebase_path("e2k.ld",
+                                         root_build_dir) ]
+   }
+ }
+diff --git a/chromium/build/config/linux/e2k.ld b/chromium/build/config/linux/e2k.ld
+new file mode 100644
+index 0000000000..e9b84f11e3
+--- /dev/null
++++ b/chromium/build/config/linux/e2k.ld
+@@ -0,0 +1,33 @@
++/* Additions to the default GNU ld script for e2k. */
++SECTIONS
++{
++  /* GNU as for e2k aligns every named code section to 1024 bytes, which with
++   * -ffunction-sections nearly doubles the code and pushes chrome beyond the
++   * +-1GB reach of a direct call (R_E2K_DISP). The compiler itself only asks
++   * for 8. */
++  .text : SUBALIGN(16)
++  {
++    *(.text.unlikely .text.*_unlikely .text.unlikely.*)
++    *(.text.exit .text.exit.*)
++    *(.text.startup .text.startup.*)
++    *(.text.hot .text.hot.*)
++    *(.text .stub .text.*)
++  }
++}
++INSERT BEFORE .fini;
++
++SECTIONS
++{
++  /* clang for e2k does not honour the section attribute of inline variables,
++   * so the page-aligned `writers` guard of base/memory/protected_memory.h does
++   * not end up in the protected_memory section. Put it there, and pad the
++   * section to a page boundary in place of protected_memory_buffer. */
++  protected_memory : ALIGN(4096)
++  {
++    *(.data._ZN4base22AutoWritableMemoryBase10WriterData7writersE)
++    *(.bss._ZN4base22AutoWritableMemoryBase10WriterData7writersE)
++    *(protected_memory)
++    . = ALIGN(4096);
++  }
++}
++INSERT AFTER .data;
+diff --git a/chromium/build/config/linux/e2k_protected_memory.ld b/chromium/build/config/linux/e2k_protected_memory.ld
+deleted file mode 100644
+index 4c2faba91f..0000000000
+--- a/chromium/build/config/linux/e2k_protected_memory.ld
++++ /dev/null
+@@ -1,15 +0,0 @@
+-/* clang for e2k does not honour the section attribute of inline variables, so
+- * the page-aligned `writers` guard of base/memory/protected_memory.h does not
+- * end up in the protected_memory section. Put it there, and pad the section to
+- * a page boundary in place of protected_memory_buffer. */
+-SECTIONS
+-{
+-  protected_memory : ALIGN(4096)
+-  {
+-    *(.data._ZN4base22AutoWritableMemoryBase10WriterData7writersE)
+-    *(.bss._ZN4base22AutoWritableMemoryBase10WriterData7writersE)
+-    *(protected_memory)
+-    . = ALIGN(4096);
+-  }
+-}
+-INSERT AFTER .data;

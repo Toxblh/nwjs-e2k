@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Thu, 8 Oct 2026 22:30:04 +0100
+Subject: [PATCH 07/99] e2k: portable fp16 conversions (no half-float
+ intrinsics in lccrt)
+
+---
+ chromium/third_party/fp16/src/include/fp16/macros.h | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/chromium/third_party/fp16/src/include/fp16/macros.h b/chromium/third_party/fp16/src/include/fp16/macros.h
+index 4018b0c9d0..14cb38be8c 100644
+--- a/chromium/third_party/fp16/src/include/fp16/macros.h
++++ b/chromium/third_party/fp16/src/include/fp16/macros.h
+@@ -2,6 +2,14 @@
+ #ifndef FP16_MACROS_H
+ #define FP16_MACROS_H
+ 
++/* e2k: clang predefines __F16C__ there, but the lccrt backend cannot lower
++ * the half-float conversion intrinsics. Use the portable conversions. */
++#if defined(__e2k__)
++	#define FP16_USE_NATIVE_CONVERSION 0
++	#define FP16_USE_FLOAT16_TYPE 0
++	#define FP16_USE_FP16_TYPE 0
++#endif
++
+ #ifndef FP16_USE_NATIVE_CONVERSION
+ 	#if (defined(__INTEL_COMPILER) || defined(__GNUC__)) && defined(__F16C__)
+ 		#define FP16_USE_NATIVE_CONVERSION 1

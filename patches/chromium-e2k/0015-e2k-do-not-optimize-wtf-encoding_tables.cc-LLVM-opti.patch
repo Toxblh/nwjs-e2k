@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Sat, 10 Oct 2026 04:02:47 +0100
+Subject: [PATCH 15/99] e2k: do not optimize wtf/encoding_tables.cc (LLVM
+ optimizer hangs)
+
+---
+ .../blink/renderer/platform/wtf/text/encoding_tables.cc      | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/chromium/third_party/blink/renderer/platform/wtf/text/encoding_tables.cc b/chromium/third_party/blink/renderer/platform/wtf/text/encoding_tables.cc
+index cd4887f884..58e09c36fd 100644
+--- a/chromium/third_party/blink/renderer/platform/wtf/text/encoding_tables.cc
++++ b/chromium/third_party/blink/renderer/platform/wtf/text/encoding_tables.cc
+@@ -41,6 +41,11 @@
+ #include "third_party/blink/renderer/platform/wtf/text/text_codec_icu.h"
+ #include "third_party/blink/renderer/platform/wtf/text/wtf_uchar.h"
+ 
++#if defined(__e2k__) && defined(__clang__)
++// The LLVM optimizer of clang 21 for e2k does not terminate on this file.
++#pragma clang optimize off
++#endif
++
+ namespace blink {
+ 
+ // These are values from https://encoding.spec.whatwg.org/index-jis0208.txt that

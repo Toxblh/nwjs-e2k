@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Fri, 9 Oct 2026 08:37:21 +0100
+Subject: [PATCH 09/99] e2k: DevTools: no split compilation, run the JS tsc
+ through node
+
+---
+ .../src/inspector_overlay/BUILD.gn              |  2 +-
+ .../scripts/build/ninja/devtools_entrypoint.gni |  2 +-
+ .../build/typescript/ts_library_split.gni       | 17 ++++++++---------
+ .../scripts/build/typescript/ts_type_check.gni  | 11 ++++++-----
+ .../src/scripts/build/typescript/typescript.gni |  6 +++++-
+ .../build/typescript/typescript_vars.gni        | 14 ++++++++++++++
+ 6 files changed, 35 insertions(+), 17 deletions(-)
+
+diff --git a/chromium/third_party/devtools-frontend/src/inspector_overlay/BUILD.gn b/chromium/third_party/devtools-frontend/src/inspector_overlay/BUILD.gn
+index 2a7e55bef3..bd1fec9729 100644
+--- a/chromium/third_party/devtools-frontend/src/inspector_overlay/BUILD.gn
++++ b/chromium/third_party/devtools-frontend/src/inspector_overlay/BUILD.gn
+@@ -59,7 +59,7 @@ action("build_inspector_overlay") {
+     ":copy_resources",
+   ]
+ 
+-  if (!devtools_skip_typecheck) {
++  if (devtools_split_compilation) {
+     public_deps += [ ":inspector_overlay_checked" ]
+   } else {
+     public_deps += [ ":inspector_overlay" ]
+diff --git a/chromium/third_party/devtools-frontend/src/scripts/build/ninja/devtools_entrypoint.gni b/chromium/third_party/devtools-frontend/src/scripts/build/ninja/devtools_entrypoint.gni
+index ade8eabff0..4e0c29b666 100644
+--- a/chromium/third_party/devtools-frontend/src/scripts/build/ninja/devtools_entrypoint.gni
++++ b/chromium/third_party/devtools-frontend/src/scripts/build/ninja/devtools_entrypoint.gni
+@@ -254,7 +254,7 @@ template("legacy_devtools_entrypoint") {
+ 
+ template("devtools_entrypoint") {
+   _split_compilation = false
+-  if (defined(invoker.split_compilation) && !devtools_skip_typecheck) {
++  if (defined(invoker.split_compilation) && devtools_split_compilation) {
+     _split_compilation = invoker.split_compilation
+   }
+ 
+diff --git a/chromium/third_party/devtools-frontend/src/scripts/build/typescript/ts_library_split.gni b/chromium/third_party/devtools-frontend/src/scripts/build/typescript/ts_library_split.gni
+index 6a3df24c14..76e5e0fbde 100644
+--- a/chromium/third_party/devtools-frontend/src/scripts/build/typescript/ts_library_split.gni
++++ b/chromium/third_party/devtools-frontend/src/scripts/build/typescript/ts_library_split.gni
+@@ -261,8 +261,7 @@ template("ts_library_split") {
+     public_inputs = filter_include(_all_sources, [ "*.d.ts" ])
+ 
+     response_file_contents =
+-        rebase_path(_dts_outputs, root_build_dir) + [ "--" ] + [
+-          rebase_path(tsc_binary, root_build_dir),
++        rebase_path(_dts_outputs, root_build_dir) + [ "--" ] + tsc_command + [
+           "--ignoreConfig",
+           "--declaration",
+           "--emitDeclarationOnly",
+@@ -368,17 +367,17 @@ template("ts_library_split") {
+       response_file_contents = [
+         "--stamp",
+         rebase_path(_stamp_file, root_build_dir),
+-        "--",
+-        rebase_path(tsc_binary, root_build_dir),
+-        "-p",
+-        rebase_path(_tsconfig_file, root_build_dir),
+-      ]
++                                 "--",
++                               ] + tsc_command +
++                               [
++                                 "-p",
++                                 rebase_path(_tsconfig_file, root_build_dir),
++                               ]
+     } else {
+       script = devtools_location_prepend + "scripts/build/run_with_restat.py"
+       outputs = _js_outputs
+       response_file_contents =
+-          rebase_path(_js_outputs, root_build_dir) + [ "--" ] + [
+-            rebase_path(tsc_binary, root_build_dir),
++          rebase_path(_js_outputs, root_build_dir) + [ "--" ] + tsc_command + [
+             "-p",
+             rebase_path(_tsconfig_file, root_build_dir),
+           ]
+diff --git a/chromium/third_party/devtools-frontend/src/scripts/build/typescript/ts_type_check.gni b/chromium/third_party/devtools-frontend/src/scripts/build/typescript/ts_type_check.gni
+index 903724f676..67ec6526d3 100644
+--- a/chromium/third_party/devtools-frontend/src/scripts/build/typescript/ts_type_check.gni
++++ b/chromium/third_party/devtools-frontend/src/scripts/build/typescript/ts_type_check.gni
+@@ -146,11 +146,12 @@ template("ts_type_check") {
+     response_file_contents = [
+       "--stamp",
+       rebase_path(_stamp_file, root_build_dir),
+-      "--",
+-      rebase_path(tsc_binary, root_build_dir),
+-      "-p",
+-      rebase_path(_tsconfig_file, root_build_dir),
+-    ]
++                               "--",
++                             ] + tsc_command +
++                             [
++                               "-p",
++                               rebase_path(_tsconfig_file, root_build_dir),
++                             ]
+ 
+     args = [ "@{{response_file_name}}" ]
+ 
+diff --git a/chromium/third_party/devtools-frontend/src/scripts/build/typescript/typescript.gni b/chromium/third_party/devtools-frontend/src/scripts/build/typescript/typescript.gni
+index b8bbe8c3e4..487936d08d 100644
+--- a/chromium/third_party/devtools-frontend/src/scripts/build/typescript/typescript.gni
++++ b/chromium/third_party/devtools-frontend/src/scripts/build/typescript/typescript.gni
+@@ -19,6 +19,10 @@ declare_args() {
+       build_with_chromium && !is_official_build && host_cpu != "e2k"
+ }
+ 
++# Whether targets that set `split_compilation` are built that way. It bundles
++# the .ts sources with esbuild, which e2k does not have.
++devtools_split_compilation = !devtools_skip_typecheck && host_cpu != "e2k"
++
+ assert(!devtools_skip_typecheck || !is_official_build,
+        "Official build should not skip typecheck")
+ 
+@@ -309,7 +313,7 @@ template("legacy_ts_library") {
+ 
+ template("ts_library") {
+   _split_compilation = false
+-  if (defined(invoker.split_compilation) && !devtools_skip_typecheck) {
++  if (defined(invoker.split_compilation) && devtools_split_compilation) {
+     _split_compilation = invoker.split_compilation
+   }
+ 
+diff --git a/chromium/third_party/devtools-frontend/src/scripts/build/typescript/typescript_vars.gni b/chromium/third_party/devtools-frontend/src/scripts/build/typescript/typescript_vars.gni
+index b234b98227..d2c9000e37 100644
+--- a/chromium/third_party/devtools-frontend/src/scripts/build/typescript/typescript_vars.gni
++++ b/chromium/third_party/devtools-frontend/src/scripts/build/typescript/typescript_vars.gni
+@@ -17,6 +17,20 @@ if (host_os == "linux") {
+   }
+ }
+ 
++# Command line prefix of the actions that run the TypeScript compiler directly.
++if (host_cpu == "e2k") {
++  # There is no native TypeScript compiler for e2k: run the JS-based one from
++  # node_modules with Node there.
++  tsc_command = rebase_path(
++          [
++            "//third_party/node/linux/node-linux-x64/bin/node",
++            devtools_location_prepend + "node_modules/typescript/bin/tsc",
++          ],
++          root_build_dir)
++} else {
++  tsc_command = [ rebase_path(tsc_binary, root_build_dir) ]
++}
++
+ # Standard TypeScript library definitions needed for remote execution (RBE /
+ # Siso). Siso packages declared inputs to send to the remote worker.
+ typescript_standard_lib_dts_inputs = [

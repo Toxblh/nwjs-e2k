@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 10:25:20 +0100
+Subject: [PATCH 46/99] v8: e2k: test bits and branch with one compare
+
+A branch on `x & mask` was `and` into a scratch register and a branch on
+the result: two operations one after the other. cmpandedb compares the
+conjunction with zero by itself. New layer instructions bteqz/btnez (and
+bteqzi/btnezi with a constant mask), MacroAssembler::BranchTst, used for
+kE2kTst branches, deoptimization checks included.
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc  |  4 +++
+ chromium/v8/src/codegen/e2k/assembler-e2k.h   |  7 +++++
+ chromium/v8/src/codegen/e2k/la_asm.h          |  7 +++++
+ .../v8/src/codegen/e2k/macro-assembler-e2k.cc | 26 +++++++++++++++++++
+ .../v8/src/codegen/e2k/macro-assembler-e2k.h  |  3 +++
+ .../backend/e2k/code-generator-e2k.cc         |  5 +---
+ 6 files changed, 48 insertions(+), 4 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index 64ffcc1243..66e02647c6 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -1161,6 +1161,10 @@ void Assembler::blt(Register rj, Register rd, int32_t offset) { LA(blt(rj, rd, o
+ void Assembler::bge(Register rj, Register rd, int32_t offset) { LA(bge(rj, rd, offset)); }
+ void Assembler::bltu(Register rj, Register rd, int32_t offset) { LA(bltu(rj, rd, offset)); }
+ void Assembler::bgeu(Register rj, Register rd, int32_t offset) { LA(bgeu(rj, rd, offset)); }
++void Assembler::bteqz(Register rj, Register rk, int32_t offset) { LA(bteqz(rj, rk, offset)); }
++void Assembler::btnez(Register rj, Register rk, int32_t offset) { LA(btnez(rj, rk, offset)); }
++void Assembler::bteqzi(Register rj, int64_t mask, int32_t offset) { LA(bteqzi(rj, mask, offset)); }
++void Assembler::btnezi(Register rj, int64_t mask, int32_t offset) { LA(btnezi(rj, mask, offset)); }
+ void Assembler::beqz(Register rj, int32_t offset) { LA(beqz(rj, offset)); }
+ void Assembler::bnez(Register rj, int32_t offset) { LA(bnez(rj, offset)); }
+ void Assembler::jirl(Register rd, Register rj, int32_t offset) { LA(jirl(rd, rj, offset)); }
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index 8bdb0f5d7f..4cac7f4c14 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -462,6 +462,13 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   inline void bgeu(Register rj, Register rd, Label* L) {
+     bgeu(rj, rd, shifted_branch_offset(L));
+   }
++  // Not LoongArch: branch when rj & rk (rj & mask) is zero, is not zero. One
++  // compare, where `and` into a scratch register and beqz are two operations
++  // one after the other.
++  void bteqz(Register rj, Register rk, int32_t offset);
++  void btnez(Register rj, Register rk, int32_t offset);
++  void bteqzi(Register rj, int64_t mask, int32_t offset);
++  void btnezi(Register rj, int64_t mask, int32_t offset);
+   void beqz(Register rj, int32_t offset);
+   inline void beqz(Register rj, Label* L) {
+     beqz(rj, shifted_branch_offset21(L));
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 07b9c15031..151f47ae52 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -317,6 +317,13 @@ class Assembler : private e2k::Assembler {
+   void bgeu(Register rj, Register rd, int32_t offset) { br(&E::cmpbdb, true, R(rj), R(rd), offset); }
+   void beqz(Register rj, int32_t offset) { br(&E::cmpedb, false, R(rj), 0, offset); }
+   void bnez(Register rj, int32_t offset) { br(&E::cmpedb, true, R(rj), 0, offset); }
++  // Not LoongArch: branch when rj & rk (or a constant) is zero, is not zero.
++  // One compare (cmpandedb) where LoongArch needs `and` into a scratch
++  // register and a branch on it; its result has no register to wait for.
++  void bteqz(Register rj, Register rk, int32_t offset) { br(&E::cmpandedb, false, R(rj), R(rk), offset); }
++  void btnez(Register rj, Register rk, int32_t offset) { br(&E::cmpandedb, true, R(rj), R(rk), offset); }
++  void bteqzi(Register rj, int64_t mask, int32_t offset) { br(&E::cmpandedb, false, R(rj), mask, offset); }
++  void btnezi(Register rj, int64_t mask, int32_t offset) { br(&E::cmpandedb, true, R(rj), mask, offset); }
+   void bceqz(CFRegister cj, int32_t offset) { brc(~P(cj), offset); }
+   void bcnez(CFRegister cj, int32_t offset) { brc(P(cj), offset); }
+   // pc = rj + offset instructions, rd = address of the next instruction,
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+index abaa58f04b..53f5a82e8b 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+@@ -3531,6 +3531,32 @@ void MacroAssembler::BranchShort(Label* L, Condition cond, Register rj,
+   USE(result);
+ }
+ 
++void MacroAssembler::BranchTst(Label* L, Condition cond, Register rj,
++                               const Operand& rk) {
++  DCHECK(cond == eq || cond == ne);
++  if ((L->is_bound() ? !is_near(L, OffsetSize::kOffset16)
++                     : is_trampoline_emitted()) ||
++      (!rk.is_reg() && !RelocInfo::IsNoInfo(rk.rmode()))) {
++    UseScratchRegisterScope temps(this);
++    Register scratch = temps.Acquire();
++    And(scratch, rj, rk);
++    Branch(L, cond, scratch, Operand(zero_reg));
++    return;
++  }
++  int32_t offset = GetOffset(L, OffsetSize::kOffset16);
++  if (rk.is_reg()) {
++    if (cond == eq) {
++      bteqz(rj, rk.rm(), offset);
++    } else {
++      btnez(rj, rk.rm(), offset);
++    }
++  } else if (cond == eq) {
++    bteqzi(rj, rk.immediate(), offset);
++  } else {
++    btnezi(rj, rk.immediate(), offset);
++  }
++}
++
+ void MacroAssembler::CompareTaggedAndBranch(Label* label, Condition cond,
+                                             Register r1, const Operand& r2,
+                                             bool need_link) {
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h
+index 1c7051817b..528f45e6e4 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h
+@@ -153,6 +153,9 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
+               bool need_link = false);
+   void BranchShort(Label* label, Condition cond, Register r1, const Operand& r2,
+                    bool need_link = false);
++  // Branches when r1 & r2 is zero (eq), is not zero (ne): one compare, no
++  // scratch register.
++  void BranchTst(Label* label, Condition cond, Register r1, const Operand& r2);
+   void Branch(Label* L, Condition cond, Register rj, RootIndex index,
+               bool need_sign_extend = true);
+ 
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index 085584779e..aa6e29fc12 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -4540,10 +4540,7 @@ void AssembleBranchToLabels(CodeGenerator* gen, MacroAssembler* masm,
+ 
+   if (instr->arch_opcode() == kE2kTst) {
+     Condition cc = FlagsConditionToConditionTst(condition);
+-    UseScratchRegisterScope temps(masm);
+-    Register scratch = temps.Acquire();
+-    __ And(scratch, i.InputRegister(0), i.InputOperand(1));
+-    __ Branch(tlabel, cc, scratch, Operand(zero_reg));
++    __ BranchTst(tlabel, cc, i.InputRegister(0), i.InputOperand(1));
+   } else if (instr->arch_opcode() == kE2kAddOvf_w ||
+              instr->arch_opcode() == kE2kSubOvf_w) {
+     if (!instr->InputAt(1)->IsImmediate()) {

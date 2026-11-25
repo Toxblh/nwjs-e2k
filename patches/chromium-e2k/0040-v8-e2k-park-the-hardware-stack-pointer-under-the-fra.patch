@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 06:04:38 +0100
+Subject: [PATCH 40/99] v8: e2k: park the hardware stack pointer under the
+ frames while JS runs
+
+The kernel builds the frame of a signal handler right under the hardware
+data stack pointer (%usd). JS frames lie under it: the code moves sp
+without getsp, and the pointer stayed at the entry sp, or at sp - 64 of
+the last C call. Any signal that came while JS ran (SIGPROF of the CPU
+profiler first of all) wrote over live frames: SIGSEGV, SIGBUS and SIGILL
+with null-page addresses in builtins, in every tier, or an endless loop.
+Whether a live slot was hit depended on where the frames were, with a
+period of 256 bytes of stack, hence "flaky".
+
+EnterFromC now leaves the pointer kStackReserve below the entry sp instead
+of claiming that room and giving it back, and CallC puts it back there
+after the call: the hardware restores the value of the call (sp - 64), the
+scratch register keeps the distance. The two new operations go into wide
+commands that are there anyway: a C call with a result costs the same
+41.5 cycles, one without a result gets one more command.
+---
+ chromium/v8/src/codegen/e2k/la_asm.h | 32 +++++++++++++++++-----------
+ 1 file changed, 19 insertions(+), 13 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 69d3008980..d6e65c3f1a 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -192,12 +192,15 @@ class Assembler : private e2k::Assembler {
+     for (int i = 0; i < 64; i++) if (i < 3 || i >= 12) rest[n++] = e2k::r(i);
+     for (int i = 0; i < 4; i++) rest[n++] = e2k::b(i);
+     for (int i = 0; i < n; i += 6) C(for (int j = 0; j < 6 && i + j < n; j++) addd(j, 0, 0, rest[i + j]));
+-    // The kernel grows the data stack only on getsp (a touch below the
+-    // mapped part is SIGSEGV) and keeps it grown; the code moves sp without
+-    // getsp, so the room is claimed here and given back at once.
+-    C(getsp(0, -kStackReserve, T0));
+-    C(getsp(0, kStackReserve, T0));
+-    L(getsp(0, 0, R(sp)));
++    // The code moves sp without getsp, and the kernel knows only the hardware
++    // stack pointer: it maps the data stack no further than getsp has gone (a
++    // touch below is SIGSEGV) and builds the frame of a signal handler right
++    // under that pointer.  So the pointer is parked kStackReserve below the
++    // entry sp for as long as this code runs: the frames are mapped and no
++    // signal frame lands on them.  ccall lends the pointer to C and parks it
++    // again.
++    C(getsp(0, 0, R(sp)));
++    L(getsp(0, -kStackReserve, T0));
+   }
+   // Return to the C caller of enter() with the value of a0.
+   void leave() { Own own(this); C(addd(0, R(a0), 0, e2k::r(0)); return_(e2k::ctpr3)); L(ct(e2k::ctpr3)); }
+@@ -215,10 +218,11 @@ class Assembler : private e2k::Assembler {
+   // caller's window ends at most 8 registers above that start, so the
+   // argument area is the top of the window (measured: wsz - wbs <= 4).  The
+   // hardware stack pointer is first set to 64 bytes below sp (the callee owns
+-  // that area), so C frames go right under the frames of this code.  It is
+-  // moved up as well as down: C++ measures its stack depth by it, and left low
+-  // after a deep recursion it would make V8 report stack overflows.  Every
+-  // register of the layer survives the call.
++  // that area), so C frames go right under the frames of this code: C++
++  // measures its stack depth by it.  After the call it is parked again where
++  // enter() left it (the hardware gives back the value it had at the call, T0
++  // keeps the distance): a signal that comes while this code runs must not
++  // find it above live frames.  Every register of the layer survives the call.
+   void ccall(Register target, int fp_mask, int results) {
+     assert(fp_mask >= 0 && fp_mask < 256 && results >= 0 && results <= 2);
+     Own own(this);
+@@ -226,13 +230,15 @@ class Assembler : private e2k::Assembler {
+     C(andd(0, T0, 0xffffffffffffll, T0));        // usd.base
+     C(subd(0, R(sp), T0, T0));
+     C(subd(0, T0, 64, T0));
+-    C(andd(0, T0, -16, T0));                     // down to sp - 64, or back up to it
++    C(andd(0, T0, -16, T0));                     // up to sp - 64
+     C(getsp(0, T0, T1));
+     auto arg = [&](int i) { return fp_mask >> i & 1 ? e2k::r(32 + i) : e2k::r(4 + i); };
+     C(for (int i = 0; i < 6; i++) addd(i, arg(i), 0, e2k::b(4 + i)));
+-    C(movtd(R(target), e2k::ctpr1); addd(1, arg(6), 0, e2k::b(10)); addd(2, arg(7), 0, e2k::b(11)));
++    C(movtd(R(target), e2k::ctpr1); addd(1, arg(6), 0, e2k::b(10)); addd(2, arg(7), 0, e2k::b(11)); subd(3, 0, T0, T0));
+     C(call(e2k::ctpr1, kWindow - 4));
+-    if (results >= 1) C(std_(2, R(sp), -8, e2k::b(4)); sm(2); if (results == 2) { std_(5, R(sp), -16, e2k::b(5)); sm(5); });
++    C(getsp(0, T0, T1);                          // and back down
++      if (results >= 1) { std_(2, R(sp), -8, e2k::b(4)); sm(2); }
++      if (results == 2) { std_(5, R(sp), -16, e2k::b(5)); sm(5); });
+     L(if (results >= 1) { ldd(0, R(sp), -8, R(a0)); ldd(2, R(sp), -8, e2k::r(32)); }
+       if (results == 2) ldd(3, R(sp), -16, R(a1)));
+   }

@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Sat, 17 Oct 2026 01:56:54 +0100
+Subject: [PATCH 97/99] v8: e2k: remap the pages around the embedded builtins
+
+The linker of e2k leaves the blob on a 64-byte boundary although its
+section asks for 4 KB, so RemapEmbeddedBuiltins copied it into every code
+range (a private dirty copy per isolate). Remap the pages that hold it
+instead and keep its offset in the page.
+---
+ chromium/v8/src/heap/code-range.cc | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/chromium/v8/src/heap/code-range.cc b/chromium/v8/src/heap/code-range.cc
+index 2035801ea6..47b7a77332 100644
+--- a/chromium/v8/src/heap/code-range.cc
++++ b/chromium/v8/src/heap/code-range.cc
+@@ -516,8 +516,17 @@ uint8_t* CodeRange::RemapEmbeddedBuiltins(Isolate* isolate,
+   }
+ 
+   const size_t allocate_page_size = page_allocator()->AllocatePageSize();
++#if V8_TARGET_ARCH_E2K
++  // The linker of e2k does not keep the page alignment of the section of the
++  // blob (it starts on 64 bytes): the pages around it are remapped below and
++  // the blob keeps its offset in the page, which takes up to a page more.
++  const size_t allocate_code_size = RoundUp(
++      embedded_blob_code_size + page_allocator()->CommitPageSize(),
++      allocate_page_size);
++#else
+   const size_t allocate_code_size =
+       RoundUp(embedded_blob_code_size, allocate_page_size);
++#endif
+   // Allocate the re-embedded code blob in such a way that it will be reachable
+   // by PC-relative addressing from biggest possible region.  Start near the
+   // end and step downward if the target is already occupied (e.g. by code
+@@ -595,6 +604,22 @@ uint8_t* CodeRange::RemapEmbeddedBuiltins(Isolate* isolate,
+     // file-backed mapping, so only remap when the embedded blob is the one
+     // embedded in the binary (and hence file-backed).
+     source_is_remappable &= Isolate::CurrentEmbeddedBlobIsBinaryEmbedded();
++#endif
++#if V8_TARGET_ARCH_E2K && defined(V8_OS_LINUX)
++    if (!source_is_remappable &&
++        Isolate::CurrentEmbeddedBlobIsBinaryEmbedded()) {
++      const uintptr_t source = reinterpret_cast<uintptr_t>(embedded_blob_code);
++      const size_t offset = source & (commit_page_size - 1);
++      const size_t pages =
++          RoundUp(offset + embedded_blob_code_size, commit_page_size);
++      if (base::OS::RemapPages(reinterpret_cast<const void*>(source - offset),
++                               pages, embedded_blob_code_copy,
++                               base::OS::MemoryPermission::kReadExecute)) {
++        uint8_t* copy = embedded_blob_code_copy + offset;
++        embedded_blob_code_copy_.store(copy, std::memory_order_release);
++        return copy;
++      }
++    }
+ #endif
+     if (source_is_remappable) {
+       bool ok = base::OS::RemapPages(embedded_blob_code, code_size,

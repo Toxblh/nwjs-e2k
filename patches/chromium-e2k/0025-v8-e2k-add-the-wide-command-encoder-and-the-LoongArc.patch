@@ -1,0 +1,1359 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Mon, 12 Oct 2026 20:30:15 +0100
+Subject: [PATCH 25/99] v8: e2k: add the wide command encoder and the LoongArch
+ instruction layer
+
+e2k_asm.h encodes e2k wide commands (checked byte for byte against GNU as),
+la_asm.h implements the instruction set of the loong64 Assembler on top of
+it: every instruction is one 32-byte slot of e2k code (a few take two).
+Both come from v8-e2k-lab, where they are tested by execution.
+---
+ chromium/v8/BUILD.gn                    |   2 +
+ chromium/v8/src/codegen/e2k/e2k_asm.h   | 427 ++++++++++++++++
+ chromium/v8/src/codegen/e2k/la_asm.h    | 640 ++++++++++++++++++++++++
+ chromium/v8/src/codegen/e2k/opcodes.inc | 241 +++++++++
+ 4 files changed, 1310 insertions(+)
+ create mode 100644 chromium/v8/src/codegen/e2k/e2k_asm.h
+ create mode 100644 chromium/v8/src/codegen/e2k/la_asm.h
+ create mode 100644 chromium/v8/src/codegen/e2k/opcodes.inc
+
+diff --git a/chromium/v8/BUILD.gn b/chromium/v8/BUILD.gn
+index affbc52db3..d626904743 100644
+--- a/chromium/v8/BUILD.gn
++++ b/chromium/v8/BUILD.gn
+@@ -5307,6 +5307,8 @@ v8_header_set("v8_internal_headers") {
+       "src/codegen/e2k/assembler-e2k-inl.h",
+       "src/codegen/e2k/assembler-e2k.h",
+       "src/codegen/e2k/constants-e2k.h",
++      "src/codegen/e2k/e2k_asm.h",
++      "src/codegen/e2k/la_asm.h",
+       "src/codegen/e2k/macro-assembler-e2k.h",
+       "src/codegen/e2k/register-e2k.h",
+       "src/codegen/e2k/reglist-e2k.h",
+diff --git a/chromium/v8/src/codegen/e2k/e2k_asm.h b/chromium/v8/src/codegen/e2k/e2k_asm.h
+new file mode 100644
+index 0000000000..52bc5dc565
+--- /dev/null
++++ b/chromium/v8/src/codegen/e2k/e2k_asm.h
+@@ -0,0 +1,427 @@
++// e2k wide-command encoder (prototype for the V8 backend).
++// Direct emission: one command is built between begin() and end(), every
++// arithmetic-logic operation names its channel explicitly.  Layout, field
++// positions and literal placement follow GNU as output; test_encode compares
++// byte for byte.  Operation codes and channel masks come from opcodes.inc,
++// which gen_opcodes.py reads back from the assembler.  See NOTES.md.
++#ifndef E2K_ASM_H_
++#define E2K_ASM_H_
++
++#include <cassert>
++#include <cstdint>
++#include <cstring>
++#include <type_traits>
++#include <vector>
++
++namespace e2k {
++
++// Operand encodings shared by src1/src2/src3/dst fields.
++struct Reg { uint8_t code; };
++constexpr Reg r(int n) { return {uint8_t(0x80 | n)}; }   // %rN, window-relative, N < 64
++constexpr Reg b(int n) { return {uint8_t(n)}; }          // %b[N], rotatable, N < 128
++constexpr Reg g(int n) { return {uint8_t(0xe0 | n)}; }   // %gN, global, N < 32
++constexpr Reg empty{0xdf};                               // %empty: result is dropped
++enum Ctpr { ctpr1 = 1, ctpr2 = 2, ctpr3 = 3 };
++struct Pred { uint8_t n; bool negated = false; Pred operator~() const { return {n, !negated}; } };
++constexpr Pred pred(int n) { return {uint8_t(n)}; }      // %predN, N < 32
++// Local predicates of one command: @p0..@p3 are loaded by pass(), @p4..@p6
++// are produced by andp/landp/movep.
++struct Lp { uint8_t n; bool negated = false; Lp operator~() const { return {n, !negated}; } };
++constexpr Lp lp(int n) { return {uint8_t(n)}; }
++// State registers for rrs/rrd/rws/rwd.
++enum class Sreg : uint8_t {
++#define E2K_OP(...)
++#define E2K_SREG(name, code) name = code,
++#include "opcodes.inc"
++#undef E2K_OP
++#undef E2K_SREG
++};
++
++struct Label {
++  int64_t pos = -1;                       // offset in the buffer once bound
++  struct Use { size_t word; size_t bundle; bool abs64; };
++  std::vector<Use> uses;
++};
++
++// First operand: a register or a literal 0..31.
++struct Src1 {
++  uint8_t code;
++  Src1(Reg reg) : code(reg.code) {}
++  Src1(int v) : code(uint8_t(0xc0 | v)) { assert(v >= 0 && v < 32); }
++};
++// Second operand: a register, a number (as picks the literal size, so do we)
++// or the absolute address of a label (64-bit literal).
++struct Src2 {
++  enum Kind { kReg, kImm, kLabel } kind;
++  uint8_t code = 0; int64_t imm = 0; Label* label = nullptr;
++  int8_t cls = -1;                         // forced literal size: 1 = 32 bits, 2 = 64 bits
++  Src2(Reg reg) : kind(kReg), code(reg.code) {}
++  template <class T, class = std::enable_if_t<std::is_integral<T>::value>>
++  Src2(T v) : kind(kImm), imm(int64_t(v)) {}
++  Src2(Label* l) : kind(kLabel), label(l) {}
++  // A literal of a fixed size whatever the value, for code that is patched later.
++  static Src2 lit32(int64_t v) { Src2 s(v); s.cls = 1; return s; }
++  static Src2 lit64(int64_t v) { Src2 s(v); s.cls = 2; return s; }
++};
++
++class Assembler {
++ public:
++  // `base` is the address the first byte will have at run time.
++  explicit Assembler(uint64_t base = 0) : base_(base) { reset(); }
++
++  const std::vector<uint8_t>& code() const { assert(!open_); return buf_; }
++  uint8_t* data() { assert(!open_); return buf_.data(); }   // for patching literal and displacement syllables
++  size_t pc_offset() const { return buf_.size(); }
++  void clear() { assert(!open_); buf_.clear(); }
++  void append(uint8_t b) { assert(!open_); buf_.push_back(b); }
++  // Size in bytes the command built so far would have.
++  int size() const { Plan p; bool ok = plan(p); assert(ok); (void)ok; return ((p.total + 1) & ~1) * 4; }
++  void set_base(uint64_t base) { assert(buf_.empty()); base_ = base; }
++
++  void bind(Label* l) {
++    assert(!open_ && l->pos < 0);
++    l->pos = int64_t(buf_.size());
++    for (const Label::Use& u : l->uses) patch(u, l->pos);
++  }
++
++  // ---- wide command ------------------------------------------------------
++  void begin() { assert(!open_); reset(); open_ = true; }
++  void nop(int n) { assert(open_ && n >= 0 && n <= 7); nop_ = n; }
++  // `min_words` stretches the command with zero words (placed where as puts
++  // its alignment word) so that it is at least that long; they cost no time.
++  void end(int min_words = 0);
++  // False when the operations given so far cannot make one command: literals
++  // do not pack into four LTS, too many conditions, or more than 64 bytes.
++  bool fits() const { Plan p; return plan(p); }
++
++  // ---- arithmetic-logic operations, generated from opcodes.inc -----------
++  //   ALOPF1/11   name(ch, src1, src2, dst)
++  //   ALOPF2/12   name(ch, src2, dst)
++  //   ALOPF3      name(ch, base, index_or_disp, value)    stores
++  //   ALOPF7      name(ch, src1, src2, pred)              compares
++  //   ALOPF21     name(ch, src1, src2, src3, dst)
++  //   MERGE       name(ch, src1, src2, dst, pred)         dst = pred ? src2 : src1
++  //   ALOPF15     name(ch, src2, state_register)          rws/rwd
++  //   ALOPF16     name(ch, state_register, dst)           rrs/rrd
++  struct Op { uint8_t cop, opce, opc2, opce2; bool w32; uint8_t plain, ales; };
++#define E2K_SREG(...)
++#define E2K_OP(name, fmt, cop, opce, opc2, opce2, w32, plain, ales) \
++  E2K_##fmt(name, (Op{cop, opce, opc2, opce2, bool(w32), plain, ales}))
++#define E2K_ALOPF1(name, op) \
++  void name(int ch, Src1 s1, Src2 s2, Reg d) { alop(op, ch, s1.code, s2, d.code); }
++#define E2K_ALOPF11 E2K_ALOPF1
++#define E2K_ALOPF3 E2K_ALOPF1
++#define E2K_ALOPF2(name, op) \
++  void name(int ch, Src2 s2, Reg d) { Op o = op; alop(o, ch, o.opce, s2, d.code); }
++#define E2K_ALOPF12 E2K_ALOPF2
++#define E2K_ALOPF7(name, op) \
++  void name(int ch, Src1 s1, Src2 s2, Pred p) { Op o = op; assert(!p.negated); alop(o, ch, s1.code, s2, uint8_t(o.opce << 5 | p.n)); }
++#define E2K_ALOPF21(name, op) \
++  void name(int ch, Src1 s1, Src2 s2, Reg s3, Reg d) { alop(op, ch, s1.code, s2, d.code, s3.code); }
++#define E2K_MERGE(name, op) \
++  void name(int ch, Src1 s1, Src2 s2, Reg d, Pred p) { alop(op, ch, s1.code, s2, d.code); mrgc_[ch] = p; mrgc_mask_ |= 1 << ch; }
++#define E2K_ALOPF15(name, op) \
++  void name(int ch, Src2 s2, Sreg d) { Op o = op; alop(o, ch, o.opce, s2, uint8_t(d)); }
++#define E2K_ALOPF16(name, op) \
++  void name(int ch, Sreg s, Reg d) { alop(op, ch, uint8_t(s), 0, d.code); }
++#include "opcodes.inc"
++#undef E2K_ALOPF1
++#undef E2K_ALOPF11
++#undef E2K_ALOPF3
++#undef E2K_ALOPF2
++#undef E2K_ALOPF12
++#undef E2K_ALOPF7
++#undef E2K_ALOPF21
++#undef E2K_MERGE
++#undef E2K_ALOPF15
++#undef E2K_ALOPF16
++#undef E2K_OP
++#undef E2K_SREG
++
++  // dst = address of label
++  void lea(int ch, Label* l, Reg d) { addd(ch, 0, l, d); }
++  // Modifiers of the operation already placed in channel `ch`.
++  void sm(int ch) { assert(als_mask_ >> ch & 1); als_[ch] |= 0x80000000u; }             // `op,ch,sm`
++  void when(int ch, Pred p) { assert(als_mask_ >> ch & 1); rlp_[ch] = p; rlp_mask_ |= 1 << ch; }  // `op ? %pred`
++
++  // ---- predicate logic (PLS) ---------------------------------------------
++  void pass(Pred src, Lp dst) {            // pass %predN, @p0..@p3
++    assert(open_ && !src.negated && !dst.negated && dst.n < 4);
++    elp_[dst.n] = uint8_t(0x60 | src.n); pls_used_ |= 1 << dst.n / 2;
++  }
++  void pass(Lp src, Pred dst) {            // pass @p4..@p6, %predN
++    assert(open_ && !src.negated && !dst.negated && src.n >= 4 && src.n <= 6);
++    clp_[src.n - 4] |= uint16_t(0x20 | dst.n); pls_used_ |= 1 << (src.n - 4);
++  }
++  void andp(Lp a, Lp b, Lp dst) { clp(0, a, b, dst); }
++  void landp(Lp a, Lp b, Lp dst) { clp(1, a, b, dst); }
++  void movep(Lp a, Lp b, Lp dst) { clp(3, a, b, dst); }
++
++  // ---- control transfer --------------------------------------------------
++  void disp(Ctpr c, Label* l) { cs0(uint32_t(c) << 30, l); }
++  void ldisp(Ctpr c, Label* l) { assert(c == ctpr2); cs0(uint32_t(c) << 30 | 1u << 28, l); }
++  void sdisp(Ctpr c, int n) { assert(n >= 0 && n < 32); cs0(uint32_t(c) << 30 | 2u << 28 | uint32_t(n), nullptr); }
++  void return_(Ctpr c) { assert(c == ctpr3); cs0(0xf0000000u, nullptr); }
++  void movtd(Src2 src, Ctpr c) { alop(Op{0x61, 0xc0, 0, 0, false, 0x01, 0}, 0, 0xc0, src, uint8_t(0xd0 | c)); }
++  void ct(Ctpr c) { ss(0xc0000000u | uint32_t(c) << 10 | 0x20); }
++  void ct(Ctpr c, Pred p) { ss(0xc0000000u | uint32_t(c) << 10 | cond(p)); }
++  void call(Ctpr c, int wbs) { ct(c); cs1(0x50000000u | uint32_t(wbs)); }
++  void call(Ctpr c, int wbs, Pred p) { ct(c, p); cs1(0x50000000u | uint32_t(wbs)); }
++  void ibranch(Label* l) { ss(0xc0000020u); cs0(0, l); }
++  void ibranch(Label* l, Pred p) { ss(0xc0000000u | cond(p)); cs0(0, l); }
++  // `ibranch l ? %MLOCK` (as also spells it `rbranch l`): taken when the store
++  // with mas = 2 of this command lost the lock taken by a load with mas = 7.
++  void ibranch_mlock(Label* l) { ss(0xc0000100u); cs0(0, l); }
++  // `mas = v` of the load or store in channel 0, 2, 3 or 5.
++  void mas(int ch, int v) {
++    static const int8_t shift[6] = {21, -1, 14, 7, -1, 0};
++    assert(open_ && shift[ch] >= 0 && v > 0 && v < 128 && (!has_cs1_ || mas_));
++    if (!mas_) cs1_ = 0x60000000u;
++    mas_ = has_cs1_ = true; cs1_ |= uint32_t(v) << shift[ch];
++  }
++  // `wait ld_c = .., st_c = ..`: memory barrier.
++  void wait(bool ld_c, bool st_c) { cs1(0x30000000u | uint32_t(ld_c) << 3 | uint32_t(st_c) << 2); }
++
++  // ---- procedure window --------------------------------------------------
++  void setwd(int wsz, bool nfx = true, bool dbl = false) {
++    assert(!setwd_ && wsz >= 0 && wsz <= 0x70);
++    setwd_ = true; lit(-1, int64_t(wsz) << 5 | int64_t(nfx) << 4 | int64_t(dbl) << 3, nullptr, 1); setbr(0);
++  }
++  void setbn(int rsz, int rbs, int rcur) {
++    assert(rsz >= 0 && rsz < 64 && rbs >= 0 && rbs < 64 && rcur >= 0 && rcur < 64);
++    setbr(1u << 26 | uint32_t(rcur) << 12 | uint32_t(rsz) << 6 | uint32_t(rbs));
++  }
++  void setbp(int psz) { assert(psz >= 0 && psz < 32); setbr(1u << 27 | uint32_t(psz) << 18); }
++
++ private:
++  struct Lit { int64_t v; Label* label; uint8_t cls; int8_t ch; };   // cls: 0/1/2 = 16/32/64 bits; ch < 0: setwd
++  struct Half { int8_t owner; uint8_t sub; };                        // literal and which 16-bit piece of it
++  struct Plan {
++    Half half_lts[8]; uint8_t choice[7]; unsigned best;
++    uint32_t lts[4]; uint8_t ref[7]; int nlts, ncds, npls, nhalf, mid, total; bool ales25; uint16_t cds[6], half[4];
++  };
++  bool plan(Plan& p) const;
++
++  void reset() {
++    als_mask_ = ales_mask_ = rlp_mask_ = mrgc_mask_ = pls_used_ = 0;
++    has_ss_ = has_cs0_ = has_cs1_ = setwd_ = setbr_ = mas_ = false;
++    nop_ = norder_ = nlits_ = 0; cs0_label_ = nullptr;
++    memset(elp_, 0, sizeof elp_); memset(clp_, 0, sizeof clp_);
++  }
++  void word(uint32_t w) { for (int i = 0; i < 4; i++) buf_.push_back(uint8_t(w >> (8 * i))); }
++  void als(int ch, uint32_t w) {
++    assert(open_ && ch >= 0 && ch < 6 && !(als_mask_ & (1 << ch)));
++    als_mask_ |= 1 << ch; als_[ch] = w; order_[norder_++] = ch;
++  }
++  // ALS = cop:b2:src2:b0, plus ALES = opc2:ales_lo where the channel needs it.
++  void alop(Op op, int ch, uint8_t b2, Src2 s2, uint8_t b0, int ales_lo = -1) {
++    assert((op.plain | op.ales) >> ch & 1 && "operation is not available in this channel");
++    uint8_t b1 = s2.code;
++    if (s2.kind == Src2::kLabel) { b1 = 0; lit(ch, 0, s2.label, 2); }
++    else if (s2.kind == Src2::kImm) {
++      int64_t v = s2.imm;
++      if (s2.cls >= 0) { b1 = 0; lit(ch, v, nullptr, s2.cls); }
++      else if (v >= 0 && v <= 15) b1 = uint8_t(0xc0 | v);
++      else {
++        b1 = 0;
++        // as sizes the literal by its value as written: 0xffffffff given to a
++        // 32-bit operation is a 32-bit literal, not the 16-bit -1.
++        assert(!op.w32 || (v >= INT32_MIN && v <= int64_t(UINT32_MAX)));
++        lit(ch, v, nullptr, v >= -32768 && v <= 32767 ? 0 : op.w32 || (v >= INT32_MIN && v <= INT32_MAX) ? 1 : 2);
++      }
++    }
++    als(ch, uint32_t(op.cop) << 24 | uint32_t(b2) << 16 | uint32_t(b1) << 8 | b0);
++    if (op.ales >> ch & 1) { ales_mask_ |= 1 << ch; ales_[ch] = uint16_t(op.opc2 << 8 | (ales_lo < 0 ? op.opce2 : ales_lo)); }
++  }
++  void ss(uint32_t w) { assert(open_ && !has_ss_); has_ss_ = true; ss_ = w; }
++  void cs0(uint32_t w, Label* l) { assert(open_ && !has_cs0_); has_cs0_ = true; cs0_ = w; cs0_label_ = l; }
++  void cs1(uint32_t w) { assert(open_ && !has_cs1_); has_cs1_ = true; cs1_ = w; }
++  // setwd, setbn and setbp share one CS1; without setwd its opcode is 4.
++  void setbr(uint32_t w) { assert(open_ && (!has_cs1_ || setbr_)); if (!setbr_) cs1_ = 0; setbr_ = has_cs1_ = true; cs1_ |= w; }
++  uint32_t cs1_word() const { return setbr_ && !setwd_ ? cs1_ | 0x40000000u : cs1_; }
++  static uint32_t cond(Pred p) { return (p.negated ? 0x60u : 0x40u) | p.n; }
++  void clp(int opc, Lp a, Lp b, Lp dst) {
++    assert(open_ && !dst.negated && dst.n >= 4 && dst.n <= 6 && a.n < dst.n && b.n < dst.n);
++    clp_[dst.n - 4] |= uint16_t(opc << 14 | a.negated << 13 | a.n << 10 | b.negated << 9 | b.n << 6);
++    pls_used_ |= 1 << (dst.n - 4);
++  }
++
++  // Literals are placed the way GNU as does it (place_literals in tc-e2k.c).
++  // The four LTS make eight 16-bit halves; half 2n is the low part of LTSn.
++  // A 16-bit literal may take any half of LTS0/LTS1 (high half tried first)
++  // or be widened to 32 or 64 bits; a 32-bit one takes a whole LTS or is
++  // widened to 64; a 64-bit one starts at LTS0, LTS1 or LTS2.  A half may be
++  // shared by literals whose 16-bit pieces there are equal.  All combinations
++  // are tried, literals with fewer choices first (setwd, 64, 32, 16 bits; in
++  // the order given within a size), and the first one with the smallest mask
++  // of used halves wins (the high half of an LTS being the lower bit).
++  void lit(int ch, int64_t v, Label* l, int cls) { assert(nlits_ < 7); lits_[nlits_++] = Lit{v, l, uint8_t(cls), int8_t(ch)}; }
++  static int choices(const Lit& l, uint8_t pos[11], uint8_t size[11]) {
++    if (l.ch < 0) { pos[0] = 0; size[0] = 2; return 1; }       // setwd owns LTS0
++    static const uint8_t p16[4] = {1, 0, 3, 2};
++    int n = 0;
++    if (l.cls == 0) for (int k = 0; k < 4; k++) { pos[n] = p16[k]; size[n++] = 1; }
++    if (l.cls <= 1) for (int p = 0; p < 8; p += 2) { pos[n] = uint8_t(p); size[n++] = 2; }
++    for (int p = 0; p < 6; p += 2) { pos[n] = uint8_t(p); size[n++] = 4; }
++    return n;
++  }
++  bool same_piece(const Half& h, const Lit& l, int i) const {
++    const Lit& o = lits_[h.owner];
++    if (o.label || l.label) return o.label == l.label && h.sub == i;
++    return uint16_t(uint64_t(o.v) >> 16 * h.sub) == uint16_t(uint64_t(l.v) >> 16 * i);
++  }
++  // ponytail: exhaustive search, up to 11^6 leaves for six 16-bit literals
++  // that cannot fit; fine for a prototype, cache or special-case if it shows up.
++  void search(Plan& p, const int* order, int k, const Half* h, unsigned mask, uint8_t* idx) const {
++    if (mask >= p.best) return;
++    if (k == nlits_) { p.best = mask; memcpy(p.half_lts, h, sizeof p.half_lts); memcpy(p.choice, idx, 7); return; }
++    const Lit& l = lits_[order[k]];
++    uint8_t pos[11], size[11];
++    int n = choices(l, pos, size);
++    for (int c = 0; c < n; c++) {
++      Half t[8]; memcpy(t, h, sizeof t);
++      unsigned m = mask; bool ok = true;
++      for (int i = 0; i < size[c] && ok; i++) {
++        Half& x = t[pos[c] + i];
++        if (x.owner >= 0) ok = same_piece(x, l, i);
++        else { x.owner = int8_t(order[k]); x.sub = uint8_t(i); m |= 1u << ((pos[c] + i) ^ 1); }
++      }
++      if (!ok) continue;
++      idx[order[k]] = uint8_t(c);
++      search(p, order, k + 1, t, m, idx);
++    }
++  }
++
++  void use(Label* l, Label::Use u) { if (l->pos >= 0) patch(u, l->pos); else l->uses.push_back(u); }
++  void patch(const Label::Use& u, int64_t target) {
++    if (u.abs64) {  // two literal syllables: the low word is stored after the high one
++      uint64_t a = base_ + uint64_t(target);
++      put(u.word, uint32_t(a)); put(u.word - 4, uint32_t(a >> 32));
++    } else {        // CS0: 28-bit displacement in 8-byte units from the command start
++      int64_t d = (target - int64_t(u.bundle)) / 8;
++      assert(d >= -(1 << 27) && d < (1 << 27));
++      put(u.word, (get(u.word) & 0xf0000000u) | (uint32_t(d) & 0x0fffffffu));
++    }
++  }
++  uint32_t get(size_t at) const { uint32_t w; memcpy(&w, &buf_[at], 4); return w; }
++  void put(size_t at, uint32_t w) { memcpy(&buf_[at], &w, 4); }
++
++  std::vector<uint8_t> buf_;
++  uint64_t base_;
++  bool open_ = false;
++  uint32_t als_[6]; uint16_t ales_[6]; int als_mask_, ales_mask_;
++  int order_[6], norder_;                      // channels in the order the operations were given
++  Pred rlp_[6], mrgc_[6]; int rlp_mask_, mrgc_mask_;
++  uint8_t elp_[4]; uint16_t clp_[3]; int pls_used_;
++  uint32_t ss_, cs0_, cs1_; bool has_ss_, has_cs0_, has_cs1_, setwd_, setbr_, mas_;
++  Lit lits_[7]; int nlits_, nop_;
++  Label* cs0_label_;
++};
++
++inline bool Assembler::plan(Plan& p) const {
++  // Literal syllables.
++  int order[7], n = 0;
++  for (int i = 0; i < nlits_; i++) if (lits_[i].ch < 0) order[n++] = i;
++  for (int cls = 2; cls >= 0; cls--)
++    for (int i = 0; i < nlits_; i++) if (lits_[i].ch >= 0 && lits_[i].cls == cls) order[n++] = i;
++  Half free_lts[8]; uint8_t idx[7] = {};
++  for (Half& h : free_lts) h = Half{-1, 0};
++  p.best = 0x100;
++  memcpy(p.half_lts, free_lts, sizeof free_lts);
++  search(p, order, 0, free_lts, 0, idx);
++  if (nlits_ && p.best == 0x100) return false;
++  p.nlts = 0;
++  for (int s = 0; s < 4; s++) {
++    p.lts[s] = 0;
++    for (int k = 0; k < 2; k++) {
++      const Half& h = p.half_lts[2 * s + k];
++      if (h.owner < 0) continue;
++      p.nlts = s + 1;
++      if (!lits_[h.owner].label) p.lts[s] |= uint32_t(uint16_t(uint64_t(lits_[h.owner].v) >> 16 * h.sub)) << 16 * k;
++    }
++  }
++  for (int i = 0; i < nlits_; i++) {
++    uint8_t pos[11], size[11];
++    choices(lits_[i], pos, size);
++    int c = p.choice[i];
++    p.ref[i] = uint8_t(size[c] == 1 ? 0xd0 | (pos[c] & 1) << 2 | pos[c] >> 1 : (size[c] == 2 ? 0xd8 : 0xdc) | pos[c] >> 1);
++  }
++
++  // Conditional syllables: per operation in source order, RLP then MRGC.
++  // Operations of one cluster (channels 0-2 or 3-5) under the same predicate
++  // number share a half-syllable.
++  p.ncds = 0;
++  auto add_cds = [&](unsigned mrgc, int ch, Pred pr) {
++    uint16_t key = uint16_t(mrgc << 15 | unsigned(ch >= 3) << 14 | 0x60u | pr.n);
++    int i = 0;
++    while (i < p.ncds && (p.cds[i] & 0xc07f) != key) i++;
++    if (i == 6) return false;
++    if (i == p.ncds) p.cds[p.ncds++] = key;
++    p.cds[i] |= uint16_t(1u << (10 + ch % 3) | unsigned(pr.negated) << (7 + ch % 3));
++    return true;
++  };
++  for (int k = 0; k < norder_; k++) {
++    int ch = order_[k];
++    if (rlp_mask_ >> ch & 1 && !add_cds(0, ch, rlp_[ch])) return false;
++    if (mrgc_mask_ >> ch & 1 && !add_cds(1, ch, mrgc_[ch])) return false;
++  }
++  int ncdsw = (p.ncds + 1) / 2;
++  p.npls = pls_used_ & 4 ? 3 : pls_used_ & 2 ? 2 : pls_used_ & 1;
++
++  // ALES2/ALES5 live in one word before CS1; it is omitted when neither
++  // differs from 0x01c0 (the header bits alone then imply that value).
++  p.ales25 = false;
++  for (int ch = 2; ch < 6; ch += 3) if (ales_mask_ >> ch & 1 && ales_[ch] != 0x01c0) p.ales25 = true;
++  p.nhalf = 0;
++  for (int ch = 0; ch < 5; ch++) if (ch != 2 && ales_mask_ >> ch & 1) p.half[p.nhalf++] = ales_[ch];
++
++  p.mid = 1 + has_ss_ + __builtin_popcount(als_mask_) + has_cs0_ + p.ales25 + has_cs1_;
++  p.total = p.mid + (p.nhalf + 1) / 2 + p.nlts + p.npls + ncdsw;
++  return p.total <= 16;
++}
++
++inline void Assembler::end(int min_words) {
++  assert(open_);
++  // as refuses these two pairs
++  auto cop = [&](int ch) { return als_mask_ >> ch & 1 ? als_[ch] >> 24 & 0x7f : 0u; };
++  auto is_load = [&](int ch) { return cop(ch) >= 0x64 && cop(ch) <= 0x67; };
++  auto is_store = [&](int ch) { return cop(ch) >= 0x24 && cop(ch) <= 0x27; };
++  assert(!(is_store(5) && is_load(0)) && !(is_store(2) && is_load(3)));
++  (void)is_load; (void)is_store;
++
++  Plan p;
++  bool ok = plan(p);
++  assert(ok && "literals or syllables cannot be packed into a wide command"); (void)ok;
++  for (int i = 0; i < nlits_; i++)
++    if (lits_[i].ch >= 0) als_[lits_[i].ch] |= uint32_t(p.ref[i]) << 8;
++
++  size_t start = buf_.size();
++  int ncdsw = (p.ncds + 1) / 2, padded = (p.total + 1) & ~1;
++  assert(min_words % 2 == 0 && min_words <= 16);
++  if (padded < min_words) padded = min_words;
++  word(uint32_t(p.mid - 1) | uint32_t(padded / 2 - 1) << 4 | uint32_t(nop_) << 7 |
++       uint32_t(has_ss_) << 12 | uint32_t(has_cs0_) << 14 | uint32_t(has_cs1_) << 15 |
++       uint32_t(ncdsw) << 16 | uint32_t(p.npls) << 18 | uint32_t(ales_mask_) << 20 | uint32_t(als_mask_) << 26);
++  if (has_ss_) word(ss_);
++  for (int i = 0; i < 6; i++)
++    if (als_mask_ & (1 << i)) word(als_[i]);
++  size_t cs0_word = buf_.size();
++  if (has_cs0_) word(cs0_);
++  if (p.ales25) word(uint32_t(ales_mask_ & 4 ? ales_[2] : 0x01c0) << 16 | (ales_mask_ & 32 ? ales_[5] : 0x01c0));
++  if (has_cs1_) word(cs1_word());
++  for (int i = 0; i < p.nhalf; i += 2) word(uint32_t(p.half[i]) << 16 | (i + 1 < p.nhalf ? p.half[i + 1] : 0));
++  for (int i = p.total; i < padded; i++) word(0);
++  size_t lts_word[4];
++  for (int i = p.nlts - 1; i >= 0; i--) { lts_word[i] = buf_.size(); word(p.lts[i]); }
++  for (int i = p.npls - 1; i >= 0; i--)
++    word(uint32_t(i < 2 ? elp_[2 * i] : 0) << 24 | uint32_t(i < 2 ? elp_[2 * i + 1] : 0) << 16 | clp_[i]);
++  for (int i = ncdsw - 1; i >= 0; i--) word(uint32_t(p.cds[2 * i]) << 16 | (2 * i + 1 < p.ncds ? p.cds[2 * i + 1] : 0));
++  assert(buf_.size() - start == size_t(padded) * 4);
++  if (cs0_label_) use(cs0_label_, {cs0_word, start, false});
++  for (int i = 0; i < nlits_; i++)
++    if (lits_[i].label) use(lits_[i].label, {lts_word[p.ref[i] & 3], start, true});
++  open_ = false;
++}
++
++}  // namespace e2k
++#endif  // E2K_ASM_H_
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+new file mode 100644
+index 0000000000..49e8c785b3
+--- /dev/null
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -0,0 +1,640 @@
++// LoongArch64 instruction set on top of e2k wide commands: the bottom layer of
++// the native V8 backend for e2k (see ../DESIGN.md).
++//
++// The class has the methods of V8's loong64 `Assembler` with the same operand
++// order and the semantics of V8's loong64 simulator.  Every instruction takes
++// one slot of kSlot bytes (a few take two, see NOTES.md): one or more wide
++// commands, the last one stretched with zero words up to the slot boundary.
++//
++//   LA r0..r31    %r0..%r31    (%r0 must hold 0: the entry code sets it, the
++//                               layer never writes it)
++//   LA f0..f31    %r32..%r63
++//   LA fcc0..7    %pred0..%pred7
++//   scratch       %b[0]..%b[3] (= %r64..%r67 with setbn rbs = 32), %pred8, %pred9
++//   C arguments   %b[4]..%b[11] (= %r68..%r75), the top of the window: see ccall
++//                 %ctpr1 (jumps and calls), %ctpr2 (return)
++//
++// Code distances are counted in instructions (slots), as in V8: branch
++// offsets, the offset of jirl and the operand of pcaddi.  pc is the address
++// of the slot.  The code is position independent.
++#ifndef LA_ASM_H_
++#define LA_ASM_H_
++
++#ifdef LA_ASM_V8
++#include "src/codegen/e2k/e2k_asm.h"
++#else
++#include "../asm/e2k_asm.h"
++#endif
++
++namespace la {
++
++constexpr int kSlot = 32;
++constexpr uint32_t kFCSRExceptionMasks = 0x1f80;   // all exceptions masked: always set by movgr2fcsr
++
++#ifdef LA_ASM_V8
++// Inside V8 the registers, conditions and FCSR constants are V8's
++// (register-e2k.h, constants-e2k.h).
++using namespace v8::internal;
++typedef DoubleRegister FPURegister;
++#else
++constexpr int kInstrSize = kSlot;
++
++class Register {
++ public:
++  constexpr explicit Register(int code) : code_(code) {}
++  constexpr int code() const { return code_; }
++  constexpr bool operator==(Register o) const { return code_ == o.code_; }
++  constexpr bool operator!=(Register o) const { return code_ != o.code_; }
++ private:
++  int code_;
++};
++class FPURegister {
++ public:
++  constexpr explicit FPURegister(int code) : code_(code) {}
++  constexpr int code() const { return code_; }
++ private:
++  int code_;
++};
++enum CFRegister { FCC0, FCC1, FCC2, FCC3, FCC4, FCC5, FCC6, FCC7 };
++struct FPUControlRegister { int code; };
++constexpr FPUControlRegister FCSR0{0}, FCSR1{1}, FCSR2{2}, FCSR3{3};
++
++constexpr Register zero_reg(0), ra(1), tp(2), sp(3), a0(4), a1(5), a2(6), a3(7), a4(8), a5(9), a6(10), a7(11),
++    t0(12), t1(13), t2(14), t3(15), t4(16), t5(17), t6(18), t7(19), t8(20), x_reg(21), fp(22),
++    s0(23), s1(24), s2(25), s3(26), s4(27), s5(28), s6(29), s7(30), s8(31);
++constexpr FPURegister f0(0), f1(1), f2(2), f3(3), f4(4), f5(5), f6(6), f7(7), f8(8), f9(9), f10(10), f11(11),
++    f12(12), f13(13), f14(14), f15(15), f16(16), f17(17), f18(18), f19(19), f20(20), f21(21), f22(22), f23(23),
++    f24(24), f25(25), f26(26), f27(27), f28(28), f29(29), f30(30), f31(31);
++
++enum FPUCondition {
++  CAF = 0x00, SAF = 0x01, CLT = 0x02, SLT_ = 0x03, CEQ = 0x04, SEQ = 0x05, CLE = 0x06, SLE = 0x07,
++  CUN = 0x08, SUN = 0x09, CULT = 0x0a, SULT = 0x0b, CUEQ = 0x0c, SUEQ = 0x0d, CULE = 0x0e, SULE = 0x0f,
++  CNE = 0x10, SNE = 0x11, COR = 0x14, SOR = 0x15, CUNE = 0x18, SUNE = 0x19,
++};
++
++// FCSR as seen through movfcsr2gr/movgr2fcsr is the e2k %pfpfr (the layout of
++// the x86 MXCSR), not the LoongArch FCSR: only these constants know it.  The
++// flags are sticky, unlike the LoongArch cause bits.
++constexpr uint32_t kFPURoundingModeShift = 13;
++constexpr uint32_t kFPURoundingModeMask = 3u << kFPURoundingModeShift;
++enum FPURoundingMode : uint32_t {
++  RN = 0u << kFPURoundingModeShift, RM = 1u << kFPURoundingModeShift,
++  RP = 2u << kFPURoundingModeShift, RZ = 3u << kFPURoundingModeShift,
++  kRoundToNearest = RN, kRoundToZero = RZ, kRoundToPlusInf = RP, kRoundToMinusInf = RM,
++  mode_round = RN, mode_ceil = RP, mode_floor = RM, mode_trunc = RZ,
++};
++constexpr uint32_t kFCSRInvalidOpCauseBit = 0, kFCSRDivideByZeroCauseBit = 2, kFCSROverflowCauseBit = 3,
++                   kFCSRUnderflowCauseBit = 4, kFCSRInexactCauseBit = 5;
++#endif  // LA_ASM_V8
++
++// One wide command of the current instruction; L is the last one of a
++// one-slot instruction, L2 of a two-slot one.
++#define C(...) do { cmd(); __VA_ARGS__; end(); } while (0)
++#define L(...) do { cmd(); __VA_ARGS__; last(1); } while (0)
++#define L2(...) do { cmd(); __VA_ARGS__; last(2); } while (0)
++#define LF(...) do { cmd(); __VA_ARGS__; finish(); } while (0)
++class Assembler : private e2k::Assembler {
++  typedef e2k::Assembler E;
++  typedef e2k::Reg Reg;
++  typedef e2k::Pred Pred;
++  typedef e2k::Sreg Sreg;
++  typedef e2k::Src1 Src1;
++  typedef void (E::*Alu)(int, e2k::Src1, e2k::Src2, Reg);            // also loads, stores, mask compares
++  typedef void (E::*Cmp)(int, e2k::Src1, e2k::Src2, Pred);
++  typedef void (E::*Mrg)(int, e2k::Src1, e2k::Src2, Reg, Pred);
++  typedef void (E::*Un)(int, e2k::Src2, Reg);
++
++ public:
++  explicit Assembler(uint64_t base = 0) : E(base) {}
++  using E::code;
++  using E::pc_offset;
++  using E::data;
++  using E::clear;
++  // One byte of an instruction assembled elsewhere.
++  void raw_byte(uint8_t b) { assert(!in_slot_); append(b); }
++  // Entry and exit code is not LoongArch: it is written with the e2k encoder.
++  E& raw() { assert(!in_slot_); return *this; }
++
++  // The branch offset (in instructions) held by the b/bl/beq.../bceqz/bcnez
++  // instruction at `slot`, for linking and binding labels.
++  static int32_t branch_offset_at(const uint8_t* slot) {
++    int at; uint32_t cs0 = get32(slot + cs0_at(slot, &at));
++    int64_t bytes = at + int64_t(int32_t(cs0 << 4) >> 4) * 8;
++    assert(bytes % kSlot == 0);
++    return int32_t(bytes / kSlot);
++  }
++  static void set_branch_offset_at(uint8_t* slot, int32_t offset) {
++    int at, w = cs0_at(slot, &at);
++    int64_t d = (int64_t(offset) * kSlot - at) / 8;
++    assert(d >= -(1 << 27) && d < (1 << 27));
++    put32(slot + w, (get32(slot + w) & 0xf0000000u) | (uint32_t(d) & 0x0fffffffu));
++  }
++
++  // The same in bytes from the start of the slot (a multiple of 8): code
++  // that is moved keeps its targets outside by these.
++  static bool is_branch(const uint8_t* slot) { int at; return cs0_at(slot, &at, false) != 0; }
++  static int64_t branch_target_at(const uint8_t* slot) {
++    int at; uint32_t cs0 = get32(slot + cs0_at(slot, &at));
++    return at + int64_t(int32_t(cs0 << 4) >> 4) * 8;
++  }
++  static void set_branch_target_at(uint8_t* slot, int64_t bytes) {
++    int at, w = cs0_at(slot, &at);
++    int64_t d = (bytes - at) / 8;
++    assert((bytes - at) % 8 == 0 && d >= -(1 << 27) && d < (1 << 27));
++    put32(slot + w, (get32(slot + w) & 0xf0000000u) | (uint32_t(d) & 0x0fffffffu));
++  }
++  // pcaddi keeps its operand in a 32-bit literal, the last word of the slot.
++  static bool is_pcaddi(const uint8_t* slot) {
++    // `rrd %ip` into the scratch register: the first two words
++    static const uint64_t model = [] { Assembler a; a.pcaddi(a0, 0); uint64_t w; memcpy(&w, a.data(), 8); return w; }();
++    return !memcmp(slot, &model, 8);
++  }
++  static int32_t pcaddi_offset_at(const uint8_t* slot) { return int32_t(get32(slot + kSlot - 4)) / kSlot; }
++  static void set_pcaddi_offset_at(uint8_t* slot, int32_t offset) { put32(slot + kSlot - 4, uint32_t(offset * kSlot)); }
++  // li64 keeps its value in a 64-bit literal, the last two words of the slot.
++  static uint64_t li64_at(const uint8_t* slot) { return uint64_t(get32(slot + kSlot - 8)) << 32 | get32(slot + kSlot - 4); }
++  static void set_li64_at(uint8_t* slot, uint64_t v) { put32(slot + kSlot - 8, uint32_t(v >> 32)); put32(slot + kSlot - 4, uint32_t(v)); }
++
++  // ---- not LoongArch: entry from C, return to C, call of a C function -------
++  // Entry of a function called by C with nargs <= 8 arguments: opens the one
++  // window all the code runs in, moves the arguments to a0.., sets sp to the
++  // top of the C stack and clears every other register (%r0 must hold 0).
++  // Registers the caller did not set are not read: what is left in them may
++  // be a diagnostic value (of a failed speculative operation), and any
++  // non-speculative use of one, a move or a store included, is SIGILL.
++  void enter(int nargs) {
++    assert(nargs >= 0 && nargs <= 8);
++    C(setwd(kWindow); setbn(5, 32, 0));
++    C(for (int i = 4; i < 8; i++) addd(i - 4, i < nargs ? Src1(e2k::r(i)) : Src1(0), 0, e2k::r(4 + i)));
++    C(for (int i = 0; i < 4; i++) addd(i, i < nargs ? Src1(e2k::r(i)) : Src1(0), 0, e2k::r(4 + i)));
++    Reg rest[59]; int n = 0;
++    for (int i = 0; i < 64; i++) if (i < 3 || i >= 12) rest[n++] = e2k::r(i);
++    for (int i = 0; i < 4; i++) rest[n++] = e2k::b(i);
++    for (int i = 0; i < n; i += 6) C(for (int j = 0; j < 6 && i + j < n; j++) addd(j, 0, 0, rest[i + j]));
++    LF(getsp(0, 0, R(sp)));
++  }
++  // Return to the C caller of enter() with the value of a0.
++  void leave() { C(addd(0, R(a0), 0, e2k::r(0)); return_(e2k::ctpr3)); LF(ct(e2k::ctpr3)); }
++  // Call of the C function at `target` with ngp integer arguments in a0.. and
++  // then nfp floating point ones in f0..; the result comes back in a0 and f0
++  // (results >= 1) and a1 (results == 2).  The results are moved
++  // speculatively: a function that returns nothing leaves anything in its
++  // %r0, a diagnostic value too.  Such a value then sits in a0 and f0 until
++  // they are written; using it traps.  C parameters are the first eight registers of the callee whatever
++  // their type.  The callee's window starts at %b[4]: `call` raises SIGILL
++  // unless the caller's window ends at most 8 registers above that start, so
++  // the argument area is the top of the window (measured: wsz - wbs <= 4).  The hardware
++  // stack pointer is first lowered to 64 bytes below sp (the callee owns that
++  // area), so C frames go under the frames of this code; the hardware return
++  // restores it.  Every register of the layer survives the call.
++  // ponytail: integer arguments first, then floating point ones; a C function
++  // that mixes them in another order needs the real signature here.
++  void ccall(Register target, int ngp, int nfp, int results) {
++    assert(ngp >= 0 && nfp >= 0 && ngp + nfp <= 8 && results >= 0 && results <= 2);
++    C(rrd(0, Sreg::usd_lo, T0));
++    C(andd(0, T0, 0xffffffffffffll, T0));        // usd.base
++    C(subd(0, R(sp), T0, T0));
++    C(subd(0, T0, 64, T0));
++    C(andd(0, T0, -16, T0));
++    C(sard(0, T0, 63, T1));
++    C(andd(0, T0, T1, T0));                      // min(sp - 64 - base, 0)
++    C(getsp(0, T0, T1));
++    auto arg = [&](int i) { return i >= ngp && i < ngp + nfp ? e2k::r(32 + i - ngp) : e2k::r(4 + i); };
++    C(for (int i = 0; i < 6; i++) addd(i, arg(i), 0, e2k::b(4 + i)));
++    C(movtd(R(target), e2k::ctpr1); addd(1, arg(6), 0, e2k::b(10)); addd(2, arg(7), 0, e2k::b(11)));
++    C(call(e2k::ctpr1, kWindow - 4));
++    cmd();
++    if (results >= 1) { addd(0, e2k::b(4), 0, R(a0)); sm(0); addd(2, e2k::b(4), 0, e2k::r(32)); sm(2); }
++    if (results == 2) { addd(1, e2k::b(5), 0, R(a1)); sm(1); }
++    finish();
++  }
++  // rd = a 64-bit value that can be read back and replaced (li64_at).
++  void li64(Register rd, int64_t value) { L(addd(0, 0, e2k::Src2::lit64(value), D(rd))); }
++
++  // ---- branches ------------------------------------------------------------
++  // The target is prepared in %ctpr1 by the first command and taken by the
++  // second: measured faster than a single `ibranch` (see NOTES.md).
++  void b(int32_t offset) { C(disp(e2k::ctpr1, to(offset))); L(ct(e2k::ctpr1)); }
++  void bl(int32_t offset) { C(disp(e2k::ctpr1, to(offset))); L(rrd(0, Sreg::nip, D(ra)); ct(e2k::ctpr1)); }
++  void beq(Register rj, Register rd, int32_t offset) { br(&E::cmpedb, false, R(rj), R(rd), offset); }
++  void bne(Register rj, Register rd, int32_t offset) { br(&E::cmpedb, true, R(rj), R(rd), offset); }
++  void blt(Register rj, Register rd, int32_t offset) { br(&E::cmpldb, false, R(rj), R(rd), offset); }
++  void bge(Register rj, Register rd, int32_t offset) { br(&E::cmpldb, true, R(rj), R(rd), offset); }
++  void bltu(Register rj, Register rd, int32_t offset) { br(&E::cmpbdb, false, R(rj), R(rd), offset); }
++  void bgeu(Register rj, Register rd, int32_t offset) { br(&E::cmpbdb, true, R(rj), R(rd), offset); }
++  void beqz(Register rj, int32_t offset) { br(&E::cmpedb, false, R(rj), 0, offset); }
++  void bnez(Register rj, int32_t offset) { br(&E::cmpedb, true, R(rj), 0, offset); }
++  void bceqz(CFRegister cj, int32_t offset) { L(ibranch(to(offset), ~P(cj))); }
++  void bcnez(CFRegister cj, int32_t offset) { L(ibranch(to(offset), P(cj))); }
++  // pc = rj + offset instructions, rd = address of the next instruction.
++  // Two slots when offset != 0.
++  void jirl(Register rd, Register rj, int32_t offset) {
++    e2k::Ctpr c = rd == zero_reg && rj == ra ? e2k::ctpr2 : e2k::ctpr1;
++    if (offset == 0) C(movtd(R(rj), c));
++    else { C(addd(0, R(rj), int64_t(offset) * kSlot, T0)); C(movtd(T0, c)); }
++    cmd();
++    if (rd != zero_reg) rrd(0, Sreg::nip, D(rd));
++    ct(c);
++    last(offset ? 2 : 1);
++  }
++
++  // ---- integer arithmetic --------------------------------------------------
++  void add_w(Register rd, Register rj, Register rk) { alu_w(&E::adds, rd, R(rj), R(rk)); }
++  void add_d(Register rd, Register rj, Register rk) { alu(&E::addd, rd, R(rj), R(rk)); }
++  void sub_w(Register rd, Register rj, Register rk) { alu_w(&E::subs, rd, R(rj), R(rk)); }
++  void sub_d(Register rd, Register rj, Register rk) { alu(&E::subd, rd, R(rj), R(rk)); }
++  void addi_w(Register rd, Register rj, int32_t si12) { alu_w(&E::adds, rd, R(rj), si12); }
++  void addi_d(Register rd, Register rj, int32_t si12) { alu(&E::addd, rd, R(rj), si12); }
++  void addu16i_d(Register rd, Register rj, int32_t si16) { alu(&E::addd, rd, R(rj), int64_t(si16) * 65536); }
++  // sa2 is the shift itself, 1..4
++  void alsl_w(Register rd, Register rj, Register rk, int32_t sa2) { C(shld(0, R(rj), sa2, T0)); C(addd(0, T0, R(rk), T0)); L(sxt(0, 2, T0, D(rd))); }
++  void alsl_wu(Register rd, Register rj, Register rk, int32_t sa2) { C(shld(0, R(rj), sa2, T0)); C(addd(0, T0, R(rk), T0)); L(sxt(0, 6, T0, D(rd))); }
++  void alsl_d(Register rd, Register rj, Register rk, int32_t sa2) { C(shld(0, R(rj), sa2, T0)); L(addd(0, T0, R(rk), D(rd))); }
++  void lu12i_w(Register rd, int32_t si20) { alu(&E::addd, rd, 0, int64_t(int32_t(uint32_t(si20) << 12))); }
++  void lu32i_d(Register rd, int32_t si20) { C(sxt(0, 6, R(rd), T0)); L(ord(0, T0, int64_t(uint64_t(si20) << 44) >> 12, D(rd))); }
++  void lu52i_d(Register rd, Register rj, int32_t si12) { C(andd(0, R(rj), 0x000fffffffffffffll, T0)); L(ord(0, T0, int64_t(uint64_t(si12) << 52), D(rd))); }
++  void slt(Register rd, Register rj, Register rk) { set(&E::cmpldb, rd, R(rj), R(rk)); }
++  void sltu(Register rd, Register rj, Register rk) { set(&E::cmpbdb, rd, R(rj), R(rk)); }
++  void slti(Register rd, Register rj, int32_t si12) { set(&E::cmpldb, rd, R(rj), si12); }
++  void sltui(Register rd, Register rj, int32_t si12) { set(&E::cmpbdb, rd, R(rj), si12); }
++  // pc is the address of this slot.  pcaddi counts in instructions, pcaddu18i
++  // in units of 2^16 instructions (it pairs with jirl); pcaddu12i and
++  // pcalau12i are byte arithmetic as on LoongArch.  pcalau12i takes two slots.
++  void pcaddi(Register rd, int32_t si20) { pcadd(rd, e2k::Src2::lit32(int64_t(si20) * kSlot)); }
++  void pcaddu12i(Register rd, int32_t si20) { pcadd(rd, int64_t(si20) * 4096); }
++  void pcaddu18i(Register rd, int32_t si20) { pcadd(rd, int64_t(si20) * 65536 * kSlot); }
++  void pcalau12i(Register rd, int32_t si20) { C(rrd(0, Sreg::ip, T0)); C(addd(0, T0, int64_t(si20) * 4096, T0)); L2(andd(0, T0, -4096, D(rd))); }
++
++  void and_(Register rd, Register rj, Register rk) { alu(&E::andd, rd, R(rj), R(rk)); }
++  void or_(Register rd, Register rj, Register rk) { alu(&E::ord, rd, R(rj), R(rk)); }
++  void xor_(Register rd, Register rj, Register rk) { alu(&E::xord, rd, R(rj), R(rk)); }
++  void nor(Register rd, Register rj, Register rk) { C(ord(0, R(rj), R(rk), T0)); L(xornd(0, T0, 0, D(rd))); }
++  void andn(Register rd, Register rj, Register rk) { alu(&E::andnd, rd, R(rj), R(rk)); }
++  void orn(Register rd, Register rj, Register rk) { alu(&E::ornd, rd, R(rj), R(rk)); }
++  void andi(Register rd, Register rj, int32_t ui12) { alu(&E::andd, rd, R(rj), ui12 & 0xfff); }
++  void ori(Register rd, Register rj, int32_t ui12) { alu(&E::ord, rd, R(rj), ui12 & 0xfff); }
++  void xori(Register rd, Register rj, int32_t ui12) { alu(&E::xord, rd, R(rj), ui12 & 0xfff); }
++
++  void mul_w(Register rd, Register rj, Register rk) { alu_w(&E::muls, rd, R(rj), R(rk)); }
++  void mulh_w(Register rd, Register rj, Register rk) { C(smulx(0, R(rj), R(rk), T0)); L(sard(0, T0, 32, D(rd))); }
++  void mulh_wu(Register rd, Register rj, Register rk) { C(umulx(0, R(rj), R(rk), T0)); L(sard(0, T0, 32, D(rd))); }
++  void mul_d(Register rd, Register rj, Register rk) { alu(&E::muld, rd, R(rj), R(rk)); }
++  void mulh_d(Register rd, Register rj, Register rk) { alu(&E::smulhd, rd, R(rj), R(rk)); }
++  void mulh_du(Register rd, Register rj, Register rk) { alu(&E::umulhd, rd, R(rj), R(rk)); }
++  void mulw_d_w(Register rd, Register rj, Register rk) { alu(&E::smulx, rd, R(rj), R(rk)); }
++  void mulw_d_wu(Register rd, Register rj, Register rk) { alu(&E::umulx, rd, R(rj), R(rk)); }
++
++  // Division by zero leaves rd unchanged and does not trap: the divide runs
++  // speculatively, the result is written under "divisor != 0".
++  void div_w(Register rd, Register rj, Register rk) { C(cmpesb(0, R(rk), 0, PT0); sdivs(5, R(rj), R(rk), T0); sm(5)); L(sxt(0, 2, T0, D(rd)); when(0, ~PT0)); }
++  void div_wu(Register rd, Register rj, Register rk) { C(cmpesb(0, R(rk), 0, PT0); udivs(5, R(rj), R(rk), T0); sm(5)); L(sxt(0, 2, T0, D(rd)); when(0, ~PT0)); }
++  void div_d(Register rd, Register rj, Register rk) { C(cmpedb(0, R(rk), 0, PT0)); L(sdivd(5, R(rj), R(rk), D(rd)); when(5, ~PT0)); }
++  void div_du(Register rd, Register rj, Register rk) { C(cmpedb(0, R(rk), 0, PT0)); L(udivd(5, R(rj), R(rk), D(rd)); when(5, ~PT0)); }
++  // Two slots each.
++  void mod_w(Register rd, Register rj, Register rk) { C(cmpesb(0, R(rk), 0, PT0); sxt(1, 2, R(rj), T0)); C(smodx(5, T0, R(rk), T0); sm(5)); L2(sxt(0, 2, T0, D(rd)); when(0, ~PT0)); }
++  void mod_wu(Register rd, Register rj, Register rk) { C(cmpesb(0, R(rk), 0, PT0); sxt(1, 6, R(rj), T0)); C(umodx(5, T0, R(rk), T0); sm(5)); L2(sxt(0, 2, T0, D(rd)); when(0, ~PT0)); }
++  void mod_d(Register rd, Register rj, Register rk) { mod(&E::sdivd, rd, rj, rk); }
++  void mod_du(Register rd, Register rj, Register rk) { mod(&E::udivd, rd, rj, rk); }
++
++  // ---- shifts --------------------------------------------------------------
++  void sll_w(Register rd, Register rj, Register rk) { alu_w(&E::shls, rd, R(rj), R(rk)); }
++  void srl_w(Register rd, Register rj, Register rk) { alu_w(&E::shrs, rd, R(rj), R(rk)); }
++  void sra_w(Register rd, Register rj, Register rk) { alu_w(&E::sars, rd, R(rj), R(rk)); }
++  void rotr_w(Register rd, Register rj, Register rk) { alu_w(&E::scrs, rd, R(rj), R(rk)); }
++  void slli_w(Register rd, Register rj, int32_t ui5) { alu_w(&E::shls, rd, R(rj), ui5 & 31); }
++  void srli_w(Register rd, Register rj, int32_t ui5) { alu_w(&E::shrs, rd, R(rj), ui5 & 31); }
++  void srai_w(Register rd, Register rj, int32_t ui5) { alu_w(&E::sars, rd, R(rj), ui5 & 31); }
++  void rotri_w(Register rd, Register rj, int32_t ui5) { alu_w(&E::scrs, rd, R(rj), ui5 & 31); }
++  void sll_d(Register rd, Register rj, Register rk) { alu(&E::shld, rd, R(rj), R(rk)); }
++  void srl_d(Register rd, Register rj, Register rk) { alu(&E::shrd, rd, R(rj), R(rk)); }
++  void sra_d(Register rd, Register rj, Register rk) { alu(&E::sard, rd, R(rj), R(rk)); }
++  void rotr_d(Register rd, Register rj, Register rk) { alu(&E::scrd, rd, R(rj), R(rk)); }
++  void slli_d(Register rd, Register rj, int32_t ui6) { alu(&E::shld, rd, R(rj), ui6 & 63); }
++  void srli_d(Register rd, Register rj, int32_t ui6) { alu(&E::shrd, rd, R(rj), ui6 & 63); }
++  void srai_d(Register rd, Register rj, int32_t ui6) { alu(&E::sard, rd, R(rj), ui6 & 63); }
++  void rotri_d(Register rd, Register rj, int32_t ui6) { alu(&E::scrd, rd, R(rj), ui6 & 63); }
++
++  // ---- bits ----------------------------------------------------------------
++  void ext_w_b(Register rd, Register rj) { L(sxt(0, 0, R(rj), D(rd))); }
++  void ext_w_h(Register rd, Register rj) { L(sxt(0, 1, R(rj), D(rd))); }
++  void clz_w(Register rd, Register rj) { C(lzcnts(1, R(rj), T0)); L(sxt(0, 6, T0, D(rd))); }
++  void clo_w(Register rd, Register rj) { C(xorns(0, R(rj), 0, T0)); C(lzcnts(1, T0, T0)); L(sxt(0, 6, T0, D(rd))); }
++  void ctz_w(Register rd, Register rj) { C(bitrevs(0, R(rj), T0)); C(lzcnts(1, T0, T0)); L(sxt(0, 6, T0, D(rd))); }
++  void cto_w(Register rd, Register rj) { C(xorns(0, R(rj), 0, T0)); C(bitrevs(0, T0, T0)); C(lzcnts(1, T0, T0)); L(sxt(0, 6, T0, D(rd))); }
++  void clz_d(Register rd, Register rj) { L(lzcntd(1, R(rj), D(rd))); }
++  void clo_d(Register rd, Register rj) { C(xornd(0, R(rj), 0, T0)); L(lzcntd(1, T0, D(rd))); }
++  void ctz_d(Register rd, Register rj) { C(bitrevd(0, R(rj), T0)); L(lzcntd(1, T0, D(rd))); }
++  void cto_d(Register rd, Register rj) { C(xornd(0, R(rj), 0, T0)); C(bitrevd(0, T0, T0)); L(lzcntd(1, T0, D(rd))); }
++
++  void bytepick_w(Register rd, Register rj, Register rk, int32_t sa2) {
++    if (sa2 == 0) { L(sxt(0, 2, R(rk), D(rd))); return; }
++    C(shls(0, R(rk), sa2 * 8, T0); shrs(1, R(rj), 32 - sa2 * 8, T1)); C(ors(0, T0, T1, T0)); L(sxt(0, 2, T0, D(rd)));
++  }
++  void bytepick_d(Register rd, Register rj, Register rk, int32_t sa3) {
++    if (sa3 == 0) { L(addd(0, R(rk), 0, D(rd))); return; }
++    C(shld(0, R(rk), sa3 * 8, T0); shrd(1, R(rj), 64 - sa3 * 8, T1)); L(ord(0, T0, T1, D(rd)));
++  }
++
++  // Byte i of the constant is the number of the source byte that goes to byte i.
++  void revb_2h(Register rd, Register rj) { C(addd(0, 0, 0x8080808002030001ll, T0)); C(pshufb(0, R(rj), R(rj), T0, T0)); L2(sxt(0, 2, T0, D(rd))); }   // two slots
++  void revb_4h(Register rd, Register rj) { shuffle(rd, rj, 0x0607040502030001ll); }
++  void revb_2w(Register rd, Register rj) { shuffle(rd, rj, 0x0405060700010203ll); }
++  void revb_d(Register rd, Register rj) { shuffle(rd, rj, 0x0001020304050607ll); }
++  void revh_2w(Register rd, Register rj) { shuffle(rd, rj, 0x0504070601000302ll); }
++  void revh_d(Register rd, Register rj) { shuffle(rd, rj, 0x0100030205040706ll); }
++  // Two slots each.
++  void bitrev_4b(Register rd, Register rj) { C(bitrevd(0, R(rj), T1); addd(1, 0, 0x8080808004050607ll, T0)); C(pshufb(0, T1, T1, T0, T0)); L2(sxt(0, 2, T0, D(rd))); }
++  void bitrev_8b(Register rd, Register rj) { C(bitrevd(0, R(rj), T1); addd(1, 0, 0x0001020304050607ll, T0)); L2(pshufb(0, T1, T1, T0, D(rd))); }
++  void bitrev_w(Register rd, Register rj) { C(bitrevs(0, R(rj), T0)); L(sxt(0, 2, T0, D(rd))); }
++  void bitrev_d(Register rd, Register rj) { L(bitrevd(0, R(rj), D(rd))); }
++
++  // insfd rotates rd right by lsb and replaces the low bits; getfd with the
++  // sign flag rotates back and sign-extends 32 bits.
++  void bstrins_w(Register rd, Register rj, int32_t msbw, int32_t lsbw) {
++    assert(lsbw >= 0 && lsbw <= msbw && msbw < 32);
++    C(insfd(0, R(rd), lsbw | (msbw - lsbw + 1) << 6, R(rj), T0));
++    L(getfd(0, T0, ((64 - lsbw) & 63) | 32 << 6 | 1 << 12, D(rd)));
++  }
++  void bstrins_d(Register rd, Register rj, int32_t msbd, int32_t lsbd) {
++    assert(lsbd >= 0 && lsbd <= msbd && msbd < 64);
++    int size = msbd - lsbd + 1;
++    if (size == 64) L(addd(0, R(rj), 0, D(rd)));
++    else if (lsbd == 0) L(insfd(0, R(rd), size << 6, R(rj), D(rd)));
++    else { C(insfd(0, R(rd), lsbd | size << 6, R(rj), T0)); L(scld(0, T0, lsbd, D(rd))); }
++  }
++  void bstrpick_w(Register rd, Register rj, int32_t msbw, int32_t lsbw) {
++    assert(lsbw >= 0 && lsbw <= msbw && msbw < 32);
++    if (msbw - lsbw == 31) L(sxt(0, 2, R(rj), D(rd)));
++    else L(getfd(0, R(rj), lsbw | (msbw - lsbw + 1) << 6, D(rd)));
++  }
++  void bstrpick_d(Register rd, Register rj, int32_t msbd, int32_t lsbd) {
++    assert(lsbd >= 0 && lsbd <= msbd && msbd < 64);
++    if (msbd - lsbd == 63) L(addd(0, R(rj), 0, D(rd)));
++    else L(getfd(0, R(rj), lsbd | (msbd - lsbd + 1) << 6, D(rd)));
++  }
++  void maskeqz(Register rd, Register rj, Register rk) { C(cmpedb(0, R(rk), 0, PT0)); L(merged(0, R(rj), 0, D(rd), PT0)); }
++  void masknez(Register rd, Register rj, Register rk) { C(cmpedb(0, R(rk), 0, PT0)); L(merged(0, 0, R(rj), D(rd), PT0)); }
++
++  // ---- memory --------------------------------------------------------------
++  void ld_b(Register rd, Register rj, int32_t si12) { load(&E::ldb, D(rd), rj, si12, 0); }
++  void ld_h(Register rd, Register rj, int32_t si12) { load(&E::ldh, D(rd), rj, si12, 1); }
++  void ld_w(Register rd, Register rj, int32_t si12) { load(&E::ldw, D(rd), rj, si12, 2); }
++  void ld_d(Register rd, Register rj, int32_t si12) { load(&E::ldd, D(rd), rj, si12); }
++  void ld_bu(Register rd, Register rj, int32_t si12) { load(&E::ldb, D(rd), rj, si12); }
++  void ld_hu(Register rd, Register rj, int32_t si12) { load(&E::ldh, D(rd), rj, si12); }
++  void ld_wu(Register rd, Register rj, int32_t si12) { load(&E::ldw, D(rd), rj, si12); }
++  void st_b(Register rd, Register rj, int32_t si12) { L(stb(2, R(rj), si12, R(rd))); }
++  void st_h(Register rd, Register rj, int32_t si12) { L(sth(2, R(rj), si12, R(rd))); }
++  void st_w(Register rd, Register rj, int32_t si12) { L(stw(2, R(rj), si12, R(rd))); }
++  void st_d(Register rd, Register rj, int32_t si12) { L(std_(2, R(rj), si12, R(rd))); }
++  void ldx_b(Register rd, Register rj, Register rk) { load(&E::ldb, D(rd), rj, R(rk), 0); }
++  void ldx_h(Register rd, Register rj, Register rk) { load(&E::ldh, D(rd), rj, R(rk), 1); }
++  void ldx_w(Register rd, Register rj, Register rk) { load(&E::ldw, D(rd), rj, R(rk), 2); }
++  void ldx_d(Register rd, Register rj, Register rk) { load(&E::ldd, D(rd), rj, R(rk)); }
++  void ldx_bu(Register rd, Register rj, Register rk) { load(&E::ldb, D(rd), rj, R(rk)); }
++  void ldx_hu(Register rd, Register rj, Register rk) { load(&E::ldh, D(rd), rj, R(rk)); }
++  void ldx_wu(Register rd, Register rj, Register rk) { load(&E::ldw, D(rd), rj, R(rk)); }
++  void stx_b(Register rd, Register rj, Register rk) { L(stb(2, R(rj), R(rk), R(rd))); }
++  void stx_h(Register rd, Register rj, Register rk) { L(sth(2, R(rj), R(rk), R(rd))); }
++  void stx_w(Register rd, Register rj, Register rk) { L(stw(2, R(rj), R(rk), R(rd))); }
++  void stx_d(Register rd, Register rj, Register rk) { L(std_(2, R(rj), R(rk), R(rd))); }
++  // si14 is the byte offset (a multiple of 4), as in V8
++  void ldptr_w(Register rd, Register rj, int32_t si14) { load(&E::ldw, D(rd), rj, si14, 2); }
++  void ldptr_d(Register rd, Register rj, int32_t si14) { load(&E::ldd, D(rd), rj, si14); }
++  void stptr_w(Register rd, Register rj, int32_t si14) { L(stw(2, R(rj), si14, R(rd))); }
++  void stptr_d(Register rd, Register rj, int32_t si14) { L(std_(2, R(rj), si14, R(rd))); }
++
++  // ---- atomics: load with mas = 7 takes the lock, store with mas = 2 drops it
++  void ll_w(Register rd, Register rj, int32_t si14) { C(ldw(0, R(rj), si14, T0); mas(0, 7)); L(sxt(0, 2, T0, D(rd))); }
++  void ll_d(Register rd, Register rj, int32_t si14) { L(ldd(0, R(rj), si14, D(rd)); mas(0, 7)); }
++  // rd = 1 when the store went through, 0 when the lock was lost.  Two slots.
++  void sc_w(Register rd, Register rj, int32_t si14) { C(stw(2, R(rj), si14, R(rd)); mas(2, 2); addd(0, 0, 0, D(rd)); ibranch_mlock(to(2))); L2(addd(0, 0, 1, D(rd))); }
++  void sc_d(Register rd, Register rj, int32_t si14) { C(std_(2, R(rj), si14, R(rd)); mas(2, 2); addd(0, 0, 0, D(rd)); ibranch_mlock(to(2))); L2(addd(0, 0, 1, D(rd))); }
++  // rd = [rj]; [rj] = rd op rk, atomically.  rd must differ from rj and rk.  Two slots each.
++#define LA_AM(name, w, op)                                                        \
++  void name##_db_##w(Register rd, Register rk, Register rj) { am_##w(op, rd, rk, rj); } \
++  void name##_##w(Register rd, Register rk, Register rj) { am_##w(op, rd, rk, rj); }
++  LA_AM(amswap, w, nullptr) LA_AM(amadd, w, &E::adds) LA_AM(amand, w, &E::ands) LA_AM(amor, w, &E::ors) LA_AM(amxor, w, &E::xors)
++  LA_AM(amswap, d, nullptr) LA_AM(amadd, d, &E::addd) LA_AM(amand, d, &E::andd) LA_AM(amor, d, &E::ord) LA_AM(amxor, d, &E::xord)
++#undef LA_AM
++  void dbar(int32_t = 0) { L(wait(true, true)); }
++  void ibar(int32_t = 0) { nop(); }
++
++  // ---- traps, padding ------------------------------------------------------
++  // A store to the address `code`: SIGSEGV with si_addr == code.
++  void break_(uint32_t code, bool = false) { assert(code < 65536); L(stw(2, 0, code, R(zero_reg))); }
++  void stop(uint32_t code = 127) { break_(code); }
++  void nop(unsigned = 0) { cmd(); last(1); }
++
++  // ---- floating point ------------------------------------------------------
++  void fadd_s(FPURegister fd, FPURegister fj, FPURegister fk) { fop(&E::fadds, fd, fj, fk); }
++  void fadd_d(FPURegister fd, FPURegister fj, FPURegister fk) { fop(&E::faddd, fd, fj, fk); }
++  void fsub_s(FPURegister fd, FPURegister fj, FPURegister fk) { fop(&E::fsubs, fd, fj, fk); }
++  void fsub_d(FPURegister fd, FPURegister fj, FPURegister fk) { fop(&E::fsubd, fd, fj, fk); }
++  void fmul_s(FPURegister fd, FPURegister fj, FPURegister fk) { fop(&E::fmuls, fd, fj, fk); }
++  void fmul_d(FPURegister fd, FPURegister fj, FPURegister fk) { fop(&E::fmuld, fd, fj, fk); }
++  void fdiv_s(FPURegister fd, FPURegister fj, FPURegister fk) { fop(&E::fdivs, fd, fj, fk, 5); }
++  void fdiv_d(FPURegister fd, FPURegister fj, FPURegister fk) { fop(&E::fdivd, fd, fj, fk, 5); }
++  // Not fused (e2k v5 has no fused multiply-add): the product is rounded.
++  void fmadd_s(FPURegister fd, FPURegister fj, FPURegister fk, FPURegister fa) { C(fmuls(0, F(fj), F(fk), T0)); L(fadds(0, T0, F(fa), F(fd))); }
++  void fmadd_d(FPURegister fd, FPURegister fj, FPURegister fk, FPURegister fa) { C(fmuld(0, F(fj), F(fk), T0)); L(faddd(0, T0, F(fa), F(fd))); }
++  void fmsub_s(FPURegister fd, FPURegister fj, FPURegister fk, FPURegister fa) { C(fmuls(0, F(fj), F(fk), T0)); L(fsubs(0, T0, F(fa), F(fd))); }
++  void fmsub_d(FPURegister fd, FPURegister fj, FPURegister fk, FPURegister fa) { C(fmuld(0, F(fj), F(fk), T0)); L(fsubd(0, T0, F(fa), F(fd))); }
++  void fnmadd_s(FPURegister fd, FPURegister fj, FPURegister fk, FPURegister fa) { C(fmuls(0, F(fj), F(fk), T0)); C(fadds(0, T0, F(fa), T0)); L(xors(0, T0, 0x80000000ll, F(fd))); }
++  void fnmadd_d(FPURegister fd, FPURegister fj, FPURegister fk, FPURegister fa) { C(fmuld(0, F(fj), F(fk), T0)); C(faddd(0, T0, F(fa), T0)); L(xord(0, T0, INT64_MIN, F(fd))); }
++  void fnmsub_s(FPURegister fd, FPURegister fj, FPURegister fk, FPURegister fa) { C(fmuls(0, F(fj), F(fk), T0)); C(fsubs(0, T0, F(fa), T0)); L(xors(0, T0, 0x80000000ll, F(fd))); }
++  void fnmsub_d(FPURegister fd, FPURegister fj, FPURegister fk, FPURegister fa) { C(fmuld(0, F(fj), F(fk), T0)); C(fsubd(0, T0, F(fa), T0)); L(xord(0, T0, INT64_MIN, F(fd))); }
++  // IEEE maxNum/minNum with -0 < +0.  Two slots each.
++  void fmax_s(FPURegister fd, FPURegister fj, FPURegister fk) { minmax(&E::fmaxs, &E::ands, &E::fcmpuodsb, &E::merges, fd, fj, fk); }
++  void fmax_d(FPURegister fd, FPURegister fj, FPURegister fk) { minmax(&E::fmaxd, &E::andd, &E::fcmpuoddb, &E::merged, fd, fj, fk); }
++  void fmin_s(FPURegister fd, FPURegister fj, FPURegister fk) { minmax(&E::fmins, &E::ors, &E::fcmpuodsb, &E::merges, fd, fj, fk); }
++  void fmin_d(FPURegister fd, FPURegister fj, FPURegister fk) { minmax(&E::fmind, &E::ord, &E::fcmpuoddb, &E::merged, fd, fj, fk); }
++  void fabs_s(FPURegister fd, FPURegister fj) { L(ands(0, F(fj), 0x7fffffff, F(fd))); }
++  void fabs_d(FPURegister fd, FPURegister fj) { L(andd(0, F(fj), INT64_MAX, F(fd))); }
++  void fneg_s(FPURegister fd, FPURegister fj) { L(xors(0, F(fj), 0x80000000ll, F(fd))); }
++  void fneg_d(FPURegister fd, FPURegister fj) { L(xord(0, F(fj), INT64_MIN, F(fd))); }
++  void fsqrt_s(FPURegister fd, FPURegister fj) { L(fsqrts(5, F(fj), F(fd))); }
++  void fsqrt_d(FPURegister fd, FPURegister fj) { C(fsqrtid(5, F(fj), T0)); L(fsqrttd(5, F(fj), T0, F(fd))); }
++  void fcopysign_s(FPURegister fd, FPURegister fj, FPURegister fk) { L(insfs(0, F(fk), 31 << 6, F(fj), F(fd))); }
++  void fcopysign_d(FPURegister fd, FPURegister fj, FPURegister fk) { L(insfd(0, F(fk), 63 << 6, F(fj), F(fd))); }
++  void fmov_s(FPURegister fd, FPURegister fj) { L(addd(0, F(fj), 0, F(fd))); }
++  void fmov_d(FPURegister fd, FPURegister fj) { L(addd(0, F(fj), 0, F(fd))); }
++
++  void fcmp_cond_s(FPUCondition cc, FPURegister fj, FPURegister fk, CFRegister cd) {
++    fcmp(cc, F(fj), F(fk), P(cd), &E::fcmpeqsb, &E::fcmpltsb, &E::fcmplesb, &E::fcmpuodsb, &E::fcmpneqsb, &E::fcmpnltsb, &E::fcmpnlesb, &E::fcmpodsb);
++  }
++  void fcmp_cond_d(FPUCondition cc, FPURegister fj, FPURegister fk, CFRegister cd) {
++    fcmp(cc, F(fj), F(fk), P(cd), &E::fcmpeqdb, &E::fcmpltdb, &E::fcmpledb, &E::fcmpuoddb, &E::fcmpneqdb, &E::fcmpnltdb, &E::fcmpnledb, &E::fcmpoddb);
++  }
++  void fsel(CFRegister ca, FPURegister fd, FPURegister fj, FPURegister fk) { L(merged(0, F(fj), F(fk), F(fd), P(ca))); }
++
++  void fcvt_s_d(FPURegister fd, FPURegister fj) { L(fdtofs(0, F(fj), F(fd))); }
++  void fcvt_d_s(FPURegister fd, FPURegister fj) { L(fstofd(0, F(fj), F(fd))); }
++  void ffint_s_w(FPURegister fd, FPURegister fj) { L(istofs(0, F(fj), F(fd))); }
++  void ffint_s_l(FPURegister fd, FPURegister fj) { L(idtofs(0, F(fj), F(fd))); }
++  void ffint_d_w(FPURegister fd, FPURegister fj) { L(istofd(0, F(fj), F(fd))); }
++  void ffint_d_l(FPURegister fd, FPURegister fj) { L(idtofd(0, F(fj), F(fd))); }
++  // Saturating, NaN gives 0.  Two slots each.  Rounding: 0 nearest even,
++  // 1 down, 2 up, 3 to zero, 4 as %pfpfr says.
++#define LA_FTINT(name, mode)                                                              \
++  void name##_w_s(FPURegister fd, FPURegister fj) { ftint(false, false, mode, fd, fj); } \
++  void name##_w_d(FPURegister fd, FPURegister fj) { ftint(true, false, mode, fd, fj); }  \
++  void name##_l_s(FPURegister fd, FPURegister fj) { ftint(false, true, mode, fd, fj); }  \
++  void name##_l_d(FPURegister fd, FPURegister fj) { ftint(true, true, mode, fd, fj); }
++  LA_FTINT(ftint, 4) LA_FTINT(ftintrne, 0) LA_FTINT(ftintrm, 1) LA_FTINT(ftintrp, 2) LA_FTINT(ftintrz, 3)
++#undef LA_FTINT
++  void frint_s(FPURegister fd, FPURegister fj) { L(fstoifs(0, 4, F(fj), F(fd))); }
++  void frint_d(FPURegister fd, FPURegister fj) { L(fdtoifd(0, 4, F(fj), F(fd))); }
++
++  void movgr2fr_w(FPURegister fd, Register rj) { L(adds(0, R(rj), 0, F(fd))); }      // the upper half of fd stays
++  void movgr2fr_d(FPURegister fd, Register rj) { L(addd(0, R(rj), 0, F(fd))); }
++  void movgr2frh_w(FPURegister fd, Register rj) { C(shld(0, R(rj), 32, T0); sxt(1, 6, F(fd), T1)); L(ord(0, T0, T1, F(fd))); }
++  void movfr2gr_s(Register rd, FPURegister fj) { L(sxt(0, 2, F(fj), D(rd))); }
++  void movfr2gr_d(Register rd, FPURegister fj) { L(addd(0, F(fj), 0, D(rd))); }
++  void movfrh2gr_s(Register rd, FPURegister fj) { L(sard(0, F(fj), 32, D(rd))); }
++  void movgr2fcsr(Register rj, FPUControlRegister = FCSR0) { C(ord(0, R(rj), kFCSRExceptionMasks, T0)); L(rwd(0, T0, Sreg::pfpfr)); }
++  void movfcsr2gr(Register rd, FPUControlRegister = FCSR0) { L(rrd(0, Sreg::pfpfr, D(rd))); }
++  void movfr2cf(CFRegister cd, FPURegister fj) { C(andd(0, F(fj), 1, T0)); L(cmpedb(0, T0, 1, P(cd))); }
++  void movcf2fr(FPURegister fd, CFRegister cj) { L(merged(0, 0, 1, F(fd), P(cj))); }
++  void movgr2cf(CFRegister cd, Register rj) { C(andd(0, R(rj), 1, T0)); L(cmpedb(0, T0, 1, P(cd))); }
++  void movcf2gr(Register rd, CFRegister cj) { L(merged(0, 0, 1, D(rd), P(cj))); }
++
++  void fld_s(FPURegister fd, Register rj, int32_t si12) { load(&E::ldw, F(fd), rj, si12); }
++  void fld_d(FPURegister fd, Register rj, int32_t si12) { load(&E::ldd, F(fd), rj, si12); }
++  void fst_s(FPURegister fd, Register rj, int32_t si12) { L(stw(2, R(rj), si12, F(fd))); }
++  void fst_d(FPURegister fd, Register rj, int32_t si12) { L(std_(2, R(rj), si12, F(fd))); }
++  void fldx_s(FPURegister fd, Register rj, Register rk) { load(&E::ldw, F(fd), rj, R(rk)); }
++  void fldx_d(FPURegister fd, Register rj, Register rk) { load(&E::ldd, F(fd), rj, R(rk)); }
++  void fstx_s(FPURegister fd, Register rj, Register rk) { L(stw(2, R(rj), R(rk), F(fd))); }
++  void fstx_d(FPURegister fd, Register rj, Register rk) { L(std_(2, R(rj), R(rk), F(fd))); }
++
++ private:
++  static Reg R(Register r) { return e2k::r(r.code()); }                              // source: %r0 holds 0
++  static Reg D(Register r) { return r.code() ? e2k::r(r.code()) : e2k::empty; }      // destination
++  static Reg F(FPURegister f) { return e2k::r(32 + f.code()); }
++  static Pred P(CFRegister c) { return e2k::pred(c); }
++
++  void cmd() {
++    if (!in_slot_) { slot_ = int64_t(pc_offset()); in_slot_ = true; }
++    cmd_ = int64_t(pc_offset());
++    begin();
++  }
++  void last(int slots) {
++    int64_t rest = slot_ + slots * kSlot - cmd_;
++    assert(rest >= 8 && rest <= 64 && "the instruction does not fit its slots");
++    end(int(rest / 4));
++    assert(int64_t(pc_offset()) == slot_ + slots * kSlot && "the instruction does not fit its slots");
++    in_slot_ = false;
++    if (fix_) { set_branch_offset_at(data() + slot_, fix_); fix_ = 0; }
++  }
++  // Ends an instruction of as many slots as it takes.
++  void finish() { last(int(cmd_ - slot_ + size() + kSlot - 1) / kSlot); }
++  // Branch target `offset` instructions from the current one.
++  // A target before the start of the buffer (V8 gives the layer one
++  // instruction at a time) is written when the instruction is complete.
++  e2k::Label* to(int32_t offset) {
++    target_.pos = slot_ + int64_t(offset) * kSlot;
++    if (target_.pos < 0) { target_.pos = slot_; fix_ = offset; }
++    return &target_;
++  }
++  // Word offset of the displacement syllable (CS0) in a slot and the offset
++  // of the command that owns it.
++  static int cs0_at(const uint8_t* slot, int* command, bool must = true) {
++    for (int at = 0; at < kSlot;) {
++      uint32_t hs = get32(slot + at);
++      if (hs & 0x4000) { *command = at; return at + 4 * (1 + int(hs >> 12 & 1) + __builtin_popcount(hs >> 26)); }
++      at += (int(hs >> 4 & 7) + 1) * 8;
++    }
++    assert(!must && "not a branch"); (void)must; *command = 0; return 0;
++  }
++  static uint32_t get32(const uint8_t* p) { uint32_t w; memcpy(&w, p, 4); return w; }
++  static void put32(uint8_t* p, uint32_t w) { memcpy(p, &w, 4); }
++
++  void alu(Alu f, Register rd, e2k::Src1 a, e2k::Src2 b) { L((this->*f)(0, a, b, D(rd))); }
++  // 32-bit operation: e2k leaves the upper half of the destination alone,
++  // LoongArch wants the sign extension.
++  void alu_w(Alu f, Register rd, e2k::Src1 a, e2k::Src2 b) { C((this->*f)(0, a, b, T0)); L(sxt(0, 2, T0, D(rd))); }
++  void set(Cmp f, Register rd, e2k::Src1 a, e2k::Src2 b) { C((this->*f)(0, a, b, PT0)); L(merged(0, 0, 1, D(rd), PT0)); }
++  void br(Cmp f, bool negate, e2k::Src1 a, e2k::Src2 b, int32_t offset) { C((this->*f)(0, a, b, PT0); disp(e2k::ctpr1, to(offset))); L(ct(e2k::ctpr1, negate ? ~PT0 : PT0)); }
++  void pcadd(Register rd, e2k::Src2 bytes) { C(rrd(0, Sreg::ip, T0)); L(addd(0, T0, bytes, D(rd))); }
++  void mod(Alu div, Register rd, Register rj, Register rk) {
++    C(cmpedb(0, R(rk), 0, PT0); (this->*div)(5, R(rj), R(rk), T0); sm(5));
++    C(muld(0, T0, R(rk), T0); sm(0));
++    L2(subd(0, R(rj), T0, D(rd)); when(0, ~PT0));
++  }
++  void shuffle(Register rd, Register rj, int64_t bytes) { C(addd(0, 0, bytes, T0)); L(pshufb(0, R(rj), R(rj), T0, D(rd))); }
++  void load(Alu f, Reg d, Register rj, e2k::Src2 offset, int ext = -1) {
++    if (ext < 0) { L((this->*f)(0, R(rj), offset, d)); return; }
++    C((this->*f)(0, R(rj), offset, T0)); L(sxt(0, ext, T0, d));
++  }
++  void am_w(Alu op, Register rd, Register rk, Register rj) { am(&E::ldw, &E::stw, op, rd, rk, rj, true); }
++  void am_d(Alu op, Register rd, Register rk, Register rj) { am(&E::ldd, &E::std_, op, rd, rk, rj, false); }
++  void am(Alu ld, Alu st, Alu op, Register rd, Register rk, Register rj, bool w) {
++    C((this->*ld)(0, R(rj), 0, T0); mas(0, 7));
++    if (op) C((this->*op)(0, T0, R(rk), T1)); else C(addd(0, R(rk), 0, T1));
++    C((this->*st)(2, R(rj), 0, T1); mas(2, 2); ibranch_mlock(to(0)));
++    if (w) L2(sxt(0, 2, T0, D(rd))); else L2(addd(0, T0, 0, D(rd)));
++  }
++  void fop(Alu f, FPURegister fd, FPURegister fj, FPURegister fk, int ch = 0) { L((this->*f)(ch, F(fj), F(fk), F(fd))); }
++  // The e2k operation gives its second operand when the operands are
++  // unordered or equal, so both orders are computed and joined bitwise
++  // (-0 and +0), then the NaN cases are picked by hand.
++  void minmax(Alu op, Alu join, Cmp uod, Mrg merge, FPURegister fd, FPURegister fj, FPURegister fk) {
++    C((this->*op)(0, F(fk), F(fj), T0); (this->*op)(1, F(fj), F(fk), T1); (this->*uod)(3, F(fk), F(fk), PT0); (this->*uod)(4, F(fj), F(fj), PT1));
++    C((this->*join)(0, T0, T1, T0));
++    C((this->*merge)(0, T0, F(fj), T0, PT0));
++    L2((this->*merge)(0, T0, F(fk), F(fd), PT1));
++  }
++  void fcmp(FPUCondition cc, Reg a, Reg b, Pred cd, Cmp eq, Cmp lt, Cmp le, Cmp uod, Cmp neq, Cmp nlt, Cmp nle, Cmp od) {
++    switch (cc & ~1) {   // the signaling variants compare like the quiet ones
++      case CAF: L(cmpbdb(0, 0, 0, cd)); break;
++      case CUN: L((this->*uod)(0, a, b, cd)); break;
++      case CEQ: L((this->*eq)(0, a, b, cd)); break;
++      case CLT: L((this->*lt)(0, a, b, cd)); break;
++      case CLE: L((this->*le)(0, a, b, cd)); break;
++      case CULT: L((this->*nle)(0, b, a, cd)); break;
++      case CULE: L((this->*nlt)(0, b, a, cd)); break;
++      case COR: L((this->*od)(0, a, b, cd)); break;
++      case CUNE: L((this->*neq)(0, a, b, cd)); break;
++      case CUEQ: both(nlt, a, b, nlt, b, a, cd); break;
++      case CNE: both(neq, a, b, od, a, b, cd); break;
++      default: assert(!"unknown condition");
++    }
++  }
++  void both(Cmp f, Reg a, Reg b, Cmp g, Reg c, Reg d, Pred cd) {
++    C((this->*f)(0, a, b, PT0); (this->*g)(1, c, d, PT1));
++    L(pass(PT0, e2k::lp(0)); pass(PT1, e2k::lp(1)); landp(e2k::lp(0), e2k::lp(1), e2k::lp(4)); pass(e2k::lp(4), cd));
++  }
++  // The e2k conversion answers 0x80..0 to NaN and to everything out of range.
++  // T2 = -1 when the value is too big (or NaN) turns that into 0x7f..f,
++  // T1 = 0 when the operand is NaN turns the result into 0.
++  void ftint(bool from_double, bool to64, int mode, FPURegister fd, FPURegister fj) {
++    Reg x = F(fj);
++    int64_t limit = to64 ? 0x43e0000000000000ll : 0x41e0000000000000ll;   // 2^63, 2^31
++    Un conv = to64 ? &E::fdtoidtr : &E::fdtoistr;
++    if (!from_double) { C(fstofd(0, x, T3)); x = T3; }
++    if (mode == 3) {
++      C((this->*conv)(0, x, T0); fcmpodd(1, x, x, T1); fcmpnltd(3, x, limit, T2));
++    } else {
++      C(fdtoifd(0, mode, x, T3); fcmpodd(1, x, x, T1));
++      C((this->*conv)(0, T3, T0); fcmpnltd(1, T3, limit, T2));
++    }
++    if (to64) { C(addd(0, T0, T2, T0)); L2(andd(0, T0, T1, F(fd))); }
++    else { C(adds(0, T0, T2, T0)); L2(ands(0, T0, T1, F(fd))); }
++  }
++#undef C
++#undef L
++#undef L2
++#undef LF
++
++  static constexpr Reg T0 = e2k::b(0), T1 = e2k::b(1), T2 = e2k::b(2), T3 = e2k::b(3);
++  static constexpr Pred PT0 = e2k::pred(8), PT1 = e2k::pred(9);
++  static constexpr int kWindow = 38;   // setwd wsz: %r0..%r75
++  int64_t slot_ = 0, cmd_ = 0;
++  int32_t fix_ = 0;
++  bool in_slot_ = false;
++  e2k::Label target_;
++};
++
++}  // namespace la
++#endif  // LA_ASM_H_
+diff --git a/chromium/v8/src/codegen/e2k/opcodes.inc b/chromium/v8/src/codegen/e2k/opcodes.inc
+new file mode 100644
+index 0000000000..5e1f23cc85
+--- /dev/null
++++ b/chromium/v8/src/codegen/e2k/opcodes.inc
+@@ -0,0 +1,241 @@
++// Generated by gen_opcodes.py from GNU as (lcc 1.29.15, binutils 2.41, -mcpu=elbrus-v5 default).
++// Do not edit: every field below was read back from assembler output.
++//
++// E2K_OP(name, format, cop, opce, opc2, opce2, w32, plain, ales)
++//   name    mnemonic (a trailing '_' is not part of it)
++//   format  ALOPF1  s1, s2 -> dst             ALOPF2  s2 -> dst, opce in the src1 field
++//           ALOPF3  store: s1 + s2 <- src3    ALOPF7  s1, s2 -> %pred, opce = ALS bits 7:5
++//           ALOPF11/12  as ALOPF1/2 plus ALES = opc2:opce2 in every channel
++//           ALOPF21 s1, s2, s3 -> dst, ALES = opc2:src3
++//           MERGE   s1, s2 -> dst, selector in an MRGC half-syllable of CDS
++//           ALOPF15 s2 -> state register (rw*) ALOPF16 state register -> dst (rr*)
++//   cop     ALS bits 30:24
++//   opc2    high byte of the ALES half-syllable (0 = no ALES in any channel)
++//   opce2   low byte of ALES (ALOPF21 puts src3 there instead)
++//   w32     src2 is a 32-bit operand: literals are at most 32 bits wide
++//   plain   bit mask of channels where the operation is encoded without ALES
++//   ales    bit mask of channels where it needs ALES (opc2)
++//   plain | ales = channels accepted by as; all others are rejected.
++
++// ---- integer
++E2K_OP(adds,       ALOPF1,  0x10, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(addd,       ALOPF1,  0x11, 0x00, 0x00, 0x00, 0, 0x3f, 0x00)  // channels 012345
++E2K_OP(subs,       ALOPF1,  0x12, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(subd,       ALOPF1,  0x13, 0x00, 0x00, 0x00, 0, 0x3f, 0x00)  // channels 012345
++E2K_OP(ands,       ALOPF1,  0x00, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(andd,       ALOPF1,  0x01, 0x00, 0x00, 0x00, 0, 0x3f, 0x00)  // channels 012345
++E2K_OP(andns,      ALOPF1,  0x02, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(andnd,      ALOPF1,  0x03, 0x00, 0x00, 0x00, 0, 0x3f, 0x00)  // channels 012345
++E2K_OP(ors,        ALOPF1,  0x04, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(ord,        ALOPF1,  0x05, 0x00, 0x00, 0x00, 0, 0x3f, 0x00)  // channels 012345
++E2K_OP(orns,       ALOPF1,  0x06, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(ornd,       ALOPF1,  0x07, 0x00, 0x00, 0x00, 0, 0x3f, 0x00)  // channels 012345
++E2K_OP(xors,       ALOPF1,  0x08, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(xord,       ALOPF1,  0x09, 0x00, 0x00, 0x00, 0, 0x3f, 0x00)  // channels 012345
++E2K_OP(xorns,      ALOPF1,  0x0a, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(xornd,      ALOPF1,  0x0b, 0x00, 0x00, 0x00, 0, 0x3f, 0x00)  // channels 012345
++E2K_OP(shls,       ALOPF1,  0x18, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(shld,       ALOPF1,  0x19, 0x00, 0x00, 0x00, 0, 0x3f, 0x00)  // channels 012345
++E2K_OP(shrs,       ALOPF1,  0x1a, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(shrd,       ALOPF1,  0x1b, 0x00, 0x00, 0x00, 0, 0x3f, 0x00)  // channels 012345
++E2K_OP(sars,       ALOPF1,  0x1c, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(sard,       ALOPF1,  0x1d, 0x00, 0x00, 0x00, 0, 0x3f, 0x00)  // channels 012345
++E2K_OP(scls,       ALOPF1,  0x14, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(scld,       ALOPF1,  0x15, 0x00, 0x00, 0x00, 0, 0x3f, 0x00)  // channels 012345
++E2K_OP(scrs,       ALOPF1,  0x16, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(scrd,       ALOPF1,  0x17, 0x00, 0x00, 0x00, 0, 0x3f, 0x00)  // channels 012345
++E2K_OP(sxt,        ALOPF1,  0x0c, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(getfs,      ALOPF1,  0x1e, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(getfd,      ALOPF1,  0x1f, 0x00, 0x00, 0x00, 0, 0x3f, 0x00)  // channels 012345
++E2K_OP(insfs,      ALOPF21, 0x6c, 0x00, 0x0b, 0x00, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(insfd,      ALOPF21, 0x6d, 0x00, 0x0b, 0x00, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(merges,     MERGE,   0x0e, 0x00, 0x00, 0x00, 1, 0x3f, 0x00)  // channels 012345
++E2K_OP(merged,     MERGE,   0x0f, 0x00, 0x00, 0x00, 0, 0x3f, 0x00)  // channels 012345
++// ---- multiply/divide
++E2K_OP(muls,       ALOPF11, 0x20, 0x00, 0x01, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(muld,       ALOPF11, 0x21, 0x00, 0x01, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(umulx,      ALOPF11, 0x22, 0x00, 0x01, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(smulx,      ALOPF11, 0x23, 0x00, 0x01, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(umulhd,     ALOPF11, 0x70, 0x00, 0x01, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(smulhd,     ALOPF11, 0x71, 0x00, 0x01, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(udivs,      ALOPF1,  0x40, 0x00, 0x00, 0x00, 1, 0x20, 0x00)  // channels 5
++E2K_OP(udivd,      ALOPF1,  0x41, 0x00, 0x00, 0x00, 0, 0x20, 0x00)  // channels 5
++E2K_OP(sdivs,      ALOPF1,  0x42, 0x00, 0x00, 0x00, 1, 0x20, 0x00)  // channels 5
++E2K_OP(sdivd,      ALOPF1,  0x43, 0x00, 0x00, 0x00, 0, 0x20, 0x00)  // channels 5
++E2K_OP(udivx,      ALOPF1,  0x44, 0x00, 0x00, 0x00, 1, 0x20, 0x00)  // channels 5
++E2K_OP(umodx,      ALOPF1,  0x45, 0x00, 0x00, 0x00, 1, 0x20, 0x00)  // channels 5
++E2K_OP(sdivx,      ALOPF1,  0x46, 0x00, 0x00, 0x00, 1, 0x20, 0x00)  // channels 5
++E2K_OP(smodx,      ALOPF1,  0x47, 0x00, 0x00, 0x00, 1, 0x20, 0x00)  // channels 5
++// ---- bit counting
++E2K_OP(lzcnts,     ALOPF2,  0x64, 0xc0, 0x00, 0x00, 1, 0x12, 0x00)  // channels 14
++E2K_OP(lzcntd,     ALOPF2,  0x65, 0xc0, 0x00, 0x00, 0, 0x12, 0x00)  // channels 14
++E2K_OP(popcnts,    ALOPF2,  0x66, 0xc0, 0x00, 0x00, 1, 0x12, 0x00)  // channels 14
++E2K_OP(popcntd,    ALOPF2,  0x67, 0xc0, 0x00, 0x00, 0, 0x12, 0x00)  // channels 14
++E2K_OP(bitrevs,    ALOPF2,  0x26, 0xc0, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(bitrevd,    ALOPF2,  0x27, 0xc0, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++// ---- integer compare to predicate
++E2K_OP(cmposb,     ALOPF7,  0x20, 0x00, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpbsb,     ALOPF7,  0x20, 0x01, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpesb,     ALOPF7,  0x20, 0x02, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpbesb,    ALOPF7,  0x20, 0x03, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpssb,     ALOPF7,  0x20, 0x04, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmppsb,     ALOPF7,  0x20, 0x05, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmplsb,     ALOPF7,  0x20, 0x06, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmplesb,    ALOPF7,  0x20, 0x07, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpodb,     ALOPF7,  0x21, 0x00, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpbdb,     ALOPF7,  0x21, 0x01, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpedb,     ALOPF7,  0x21, 0x02, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpbedb,    ALOPF7,  0x21, 0x03, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpsdb,     ALOPF7,  0x21, 0x04, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmppdb,     ALOPF7,  0x21, 0x05, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpldb,     ALOPF7,  0x21, 0x06, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpledb,    ALOPF7,  0x21, 0x07, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpandesb,  ALOPF7,  0x22, 0x02, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpandssb,  ALOPF7,  0x22, 0x04, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpandpsb,  ALOPF7,  0x22, 0x05, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpandlesb, ALOPF7,  0x22, 0x07, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpandedb,  ALOPF7,  0x23, 0x02, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpandsdb,  ALOPF7,  0x23, 0x04, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpandpdb,  ALOPF7,  0x23, 0x05, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(cmpandledb, ALOPF7,  0x23, 0x07, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++// ---- memory
++E2K_OP(ldb,        ALOPF1,  0x64, 0x00, 0x00, 0x00, 0, 0x2d, 0x00)  // channels 0235
++E2K_OP(ldh,        ALOPF1,  0x65, 0x00, 0x00, 0x00, 0, 0x2d, 0x00)  // channels 0235
++E2K_OP(ldw,        ALOPF1,  0x66, 0x00, 0x00, 0x00, 0, 0x2d, 0x00)  // channels 0235
++E2K_OP(ldd,        ALOPF1,  0x67, 0x00, 0x00, 0x00, 0, 0x2d, 0x00)  // channels 0235
++E2K_OP(stb,        ALOPF3,  0x24, 0x00, 0x00, 0x00, 0, 0x24, 0x00)  // channels 25
++E2K_OP(sth,        ALOPF3,  0x25, 0x00, 0x00, 0x00, 0, 0x24, 0x00)  // channels 25
++E2K_OP(stw,        ALOPF3,  0x26, 0x00, 0x00, 0x00, 0, 0x24, 0x00)  // channels 25
++E2K_OP(std_,       ALOPF3,  0x27, 0x00, 0x00, 0x00, 0, 0x24, 0x00)  // channels 25
++// ---- floating point
++E2K_OP(fadds,      ALOPF1,  0x30, 0x00, 0x02, 0xc0, 1, 0x1b, 0x24)  // channels 012345
++E2K_OP(faddd,      ALOPF1,  0x31, 0x00, 0x02, 0xc0, 0, 0x1b, 0x24)  // channels 012345
++E2K_OP(fsubs,      ALOPF1,  0x32, 0x00, 0x02, 0xc0, 1, 0x1b, 0x24)  // channels 012345
++E2K_OP(fsubd,      ALOPF1,  0x33, 0x00, 0x02, 0xc0, 0, 0x1b, 0x24)  // channels 012345
++E2K_OP(fmuls,      ALOPF1,  0x38, 0x00, 0x02, 0xc0, 1, 0x1b, 0x24)  // channels 012345
++E2K_OP(fmuld,      ALOPF1,  0x39, 0x00, 0x02, 0xc0, 0, 0x1b, 0x24)  // channels 012345
++E2K_OP(fdivs,      ALOPF11, 0x48, 0x00, 0x01, 0xc0, 1, 0x00, 0x20)  // channels 5
++E2K_OP(fdivd,      ALOPF11, 0x49, 0x00, 0x01, 0xc0, 0, 0x00, 0x20)  // channels 5
++E2K_OP(fmins,      ALOPF1,  0x34, 0x00, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(fmind,      ALOPF1,  0x35, 0x00, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(fmaxs,      ALOPF1,  0x36, 0x00, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(fmaxd,      ALOPF1,  0x37, 0x00, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(fsqrts,     ALOPF12, 0x4c, 0xc0, 0x01, 0xc0, 1, 0x00, 0x20)  // channels 5
++E2K_OP(fsqrtid,    ALOPF12, 0x4d, 0xc0, 0x01, 0xc0, 0, 0x00, 0x20)  // channels 5
++E2K_OP(fsqrttd,    ALOPF11, 0x51, 0x00, 0x01, 0xc0, 0, 0x00, 0x20)  // channels 5
++E2K_OP(fscales,    ALOPF11, 0x24, 0x00, 0x01, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(fscaled,    ALOPF11, 0x25, 0x00, 0x01, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(fstoifs,    ALOPF11, 0x6c, 0x00, 0x01, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(fdtoifd,    ALOPF11, 0x6d, 0x00, 0x01, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++// ---- floating point compare to predicate
++E2K_OP(fcmpeqsb,   ALOPF7,  0x2e, 0x00, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(fcmpltsb,   ALOPF7,  0x2e, 0x01, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(fcmplesb,   ALOPF7,  0x2e, 0x02, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(fcmpuodsb,  ALOPF7,  0x2e, 0x03, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(fcmpneqsb,  ALOPF7,  0x2e, 0x04, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(fcmpnltsb,  ALOPF7,  0x2e, 0x05, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(fcmpnlesb,  ALOPF7,  0x2e, 0x06, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(fcmpodsb,   ALOPF7,  0x2e, 0x07, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(fcmpeqdb,   ALOPF7,  0x2f, 0x00, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(fcmpltdb,   ALOPF7,  0x2f, 0x01, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(fcmpledb,   ALOPF7,  0x2f, 0x02, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(fcmpuoddb,  ALOPF7,  0x2f, 0x03, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(fcmpneqdb,  ALOPF7,  0x2f, 0x04, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(fcmpnltdb,  ALOPF7,  0x2f, 0x05, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(fcmpnledb,  ALOPF7,  0x2f, 0x06, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(fcmpoddb,   ALOPF7,  0x2f, 0x07, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++// ---- floating point compare to mask
++E2K_OP(fcmpeqs,    ALOPF11, 0x2c, 0x00, 0x01, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(fcmplts,    ALOPF11, 0x2c, 0x00, 0x01, 0xc1, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(fcmples,    ALOPF11, 0x2c, 0x00, 0x01, 0xc2, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(fcmpuods,   ALOPF11, 0x2c, 0x00, 0x01, 0xc3, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(fcmpneqs,   ALOPF11, 0x2c, 0x00, 0x01, 0xc4, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(fcmpnlts,   ALOPF11, 0x2c, 0x00, 0x01, 0xc5, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(fcmpnles,   ALOPF11, 0x2c, 0x00, 0x01, 0xc6, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(fcmpods,    ALOPF11, 0x2c, 0x00, 0x01, 0xc7, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(fcmpeqd,    ALOPF11, 0x2d, 0x00, 0x01, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(fcmpltd,    ALOPF11, 0x2d, 0x00, 0x01, 0xc1, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(fcmpled,    ALOPF11, 0x2d, 0x00, 0x01, 0xc2, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(fcmpuodd,   ALOPF11, 0x2d, 0x00, 0x01, 0xc3, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(fcmpneqd,   ALOPF11, 0x2d, 0x00, 0x01, 0xc4, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(fcmpnltd,   ALOPF11, 0x2d, 0x00, 0x01, 0xc5, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(fcmpnled,   ALOPF11, 0x2d, 0x00, 0x01, 0xc6, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(fcmpodd,    ALOPF11, 0x2d, 0x00, 0x01, 0xc7, 0, 0x00, 0x1b)  // channels 0134
++// ---- conversions
++E2K_OP(istofs,     ALOPF2,  0x3c, 0xc4, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(istofd,     ALOPF2,  0x3e, 0xc4, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(idtofs,     ALOPF2,  0x3f, 0xc4, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(idtofd,     ALOPF2,  0x3d, 0xc4, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(fstois,     ALOPF2,  0x3c, 0xc0, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(fstoid,     ALOPF2,  0x3e, 0xc0, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(fdtois,     ALOPF2,  0x3f, 0xc0, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(fdtoid,     ALOPF2,  0x3d, 0xc0, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(fstoistr,   ALOPF2,  0x3c, 0xc2, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(fstoidtr,   ALOPF2,  0x3e, 0xc2, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(fdtoistr,   ALOPF2,  0x3f, 0xc2, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(fdtoidtr,   ALOPF2,  0x3d, 0xc2, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(fstofd,     ALOPF2,  0x3e, 0xc6, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(fdtofs,     ALOPF2,  0x3f, 0xc6, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(movfi,      ALOPF2,  0x5c, 0xc0, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(movif,      ALOPF1,  0x5e, 0x00, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++// ---- tagged moves, stack, state registers
++E2K_OP(movts,      ALOPF2,  0x60, 0xc0, 0x00, 0x00, 1, 0x1b, 0x00)  // channels 0134
++E2K_OP(movtd,      ALOPF2,  0x61, 0xc0, 0x00, 0x00, 0, 0x1b, 0x00)  // channels 0134
++E2K_OP(getsp,      ALOPF12, 0x58, 0xec, 0x01, 0xc0, 1, 0x00, 0x01)  // channels 0
++E2K_OP(rrs,        ALOPF16, 0x3e, 0xc0, 0x01, 0xc0, 0, 0x00, 0x01)  // channels 0
++E2K_OP(rrd,        ALOPF16, 0x3f, 0xc0, 0x01, 0xc0, 0, 0x00, 0x01)  // channels 0
++E2K_OP(rws,        ALOPF15, 0x3c, 0xc0, 0x01, 0xc0, 1, 0x00, 0x01)  // channels 0
++E2K_OP(rwd,        ALOPF15, 0x3d, 0xc0, 0x01, 0xc0, 0, 0x00, 0x01)  // channels 0
++// ---- packed
++E2K_OP(pshufb,     ALOPF21, 0x4d, 0x00, 0x0f, 0x00, 0, 0x00, 0x1b)  // channels 0134
++
++// ---- not accepted by this assembler
++//   umods: unknown instruction `umods'
++//   umodd: unknown instruction `umodd'
++//   smods: unknown instruction `smods'
++//   smodd: unknown instruction `smodd'
++//   fsqrtd: unknown instruction `fsqrtd'
++
++// ---- state registers: E2K_SREG(name, code); as takes each of them in both rrd and rwd
++E2K_SREG(psr,       0x00)
++E2K_SREG(wd,        0x01)
++E2K_SREG(core_mode, 0x04)
++E2K_SREG(cwd,       0x06)
++E2K_SREG(psp_hi,    0x07)
++E2K_SREG(psp_lo,    0x09)
++E2K_SREG(pshtp,     0x0b)
++E2K_SREG(pcsp_hi,   0x0d)
++E2K_SREG(pcsp_lo,   0x0f)
++E2K_SREG(pcshtp,    0x13)
++E2K_SREG(ctpr1,     0x15)
++E2K_SREG(ctpr2,     0x16)
++E2K_SREG(ctpr3,     0x17)
++E2K_SREG(sbr,       0x1e)
++E2K_SREG(cutd,      0x21)
++E2K_SREG(cuir,      0x25)
++E2K_SREG(eir,       0x23)
++//   %tsd: CU register `%tsd' is not available on elbrus-v5
++E2K_SREG(usbr,      0x1e)
++E2K_SREG(usd_hi,    0x2c)
++E2K_SREG(usd_lo,    0x2d)
++E2K_SREG(cr0_hi,    0x51)
++E2K_SREG(cr0_lo,    0x53)
++E2K_SREG(cr1_hi,    0x55)
++E2K_SREG(cr1_lo,    0x57)
++E2K_SREG(upsr,      0x80)
++E2K_SREG(ip,        0x81)
++E2K_SREG(nip,       0x82)
++E2K_SREG(lsr,       0x83)
++E2K_SREG(lsr1,      0xc3)
++E2K_SREG(ilcr,      0x87)
++E2K_SREG(ilcr1,     0xc7)
++E2K_SREG(pfpfr,     0x84)
++E2K_SREG(fpcr,      0x85)
++E2K_SREG(fpsr,      0x86)
++E2K_SREG(br,        0x88)
++E2K_SREG(bgr,       0x89)
++E2K_SREG(clkr,      0x90)
++E2K_SREG(sclkr,     0x92)
++E2K_SREG(rndpr,     0x91)
++E2K_SREG(idr,       0x8a)
++//   %tr: CU register `%tr' is not available on elbrus-v5

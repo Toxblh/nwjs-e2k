@@ -1,0 +1,566 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 01:52:28 +0100
+Subject: [PATCH 32/99] v8: e2k: pass C parameters by position, clean up C
+ results
+
+A C function takes parameter i from register i of its window whatever
+the type, and the ninth and further ones from the stack. The linkage of
+C calls now gives a parameter the register of its position (a<i> or
+f<i>), and the call takes it from there by a mask of the floating point
+ones; counting integer and floating point parameters separately, as on
+loong64, passed mixed signatures wrong (fast API calls).
+
+The result goes through memory by a speculative store: a function that
+returns nothing may leave a diagnostic value in the result register, and
+that would trap as soon as generated code saved its registers.
+
+The C++ compiler leaves a 32-bit result zero-extended, the code
+generator expects it sign-extended: -1 and -2 from the regexp
+interpreter were taken for a match. Narrow results of calls made by
+TurboFan are extended by the declared type.
+
+Also adds TailCallC for builtins that are entered as C functions.
+---
+ chromium/v8/src/builtins/e2k/builtins-e2k.cc  |  2 +-
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc  | 17 +++--
+ chromium/v8/src/codegen/e2k/assembler-e2k.h   | 21 ++++---
+ chromium/v8/src/codegen/e2k/la_asm.h          | 55 ++++++++++------
+ .../v8/src/codegen/e2k/macro-assembler-e2k.cc | 62 +++++++++++--------
+ .../v8/src/codegen/e2k/macro-assembler-e2k.h  | 22 +++++--
+ .../backend/e2k/code-generator-e2k.cc         | 31 +++++++++-
+ .../src/compiler/backend/instruction-codes.h  |  8 +++
+ .../compiler/backend/instruction-selector.cc  | 34 +++++++++-
+ chromium/v8/src/compiler/c-linkage.cc         | 55 ++--------------
+ 10 files changed, 180 insertions(+), 127 deletions(-)
+
+diff --git a/chromium/v8/src/builtins/e2k/builtins-e2k.cc b/chromium/v8/src/builtins/e2k/builtins-e2k.cc
+index e6f6619d60..f6d8b21627 100644
+--- a/chromium/v8/src/builtins/e2k/builtins-e2k.cc
++++ b/chromium/v8/src/builtins/e2k/builtins-e2k.cc
+@@ -4882,7 +4882,7 @@ void Builtins::Generate_DirectCEntry(MacroAssembler* masm) {
+   // making the call GC safe. The irregexp backend relies on this.
+ 
+   __ St_d(ra, MemOperand(sp, 0));  // Store the return address.
+-  __ CallC(t5, kRegisterPassedArguments, 0, 1);  // Call the C++ function.
++  __ CallC(t5, 0, 1);  // Call the C++ function.
+   __ Ld_d(ra, MemOperand(sp, 0));  // Return to calling code.
+ 
+   // TODO(LOONG_dev): E2K Check this assert.
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index 875cdef179..739a07dbcf 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -957,8 +957,9 @@ int32_t Assembler::branch_offset_helper(Label* L, OffsetSize bits) {
+ }
+ 
+ void Assembler::label_at_put(Label* L, int at_offset) {
+-  // Label constants (irregexp backtrack targets) are not ported: a 4-byte
+-  // constant cannot be told from an instruction slot in a link chain.
++  // Label constants are not ported (a 4-byte constant cannot be told from an
++  // instruction slot in a link chain) and not used: irregexp takes backtrack
++  // targets with LoadLabelRelative.
+   UNIMPLEMENTED();
+ }
+ 
+@@ -997,13 +998,11 @@ void Assembler::EmitSlots(const uint8_t* code, int size) {
+ 
+ void Assembler::EnterFromC(int num_args) { LA(enter(num_args)); }
+ void Assembler::ReturnToC() { LA(leave()); }
+-void Assembler::CallC(Register target, int num_gp, int num_fp,
+-                      int num_results) {
+-  // ponytail: the first eight arguments only, integer ones first; the rest
+-  // are on the stack at sp, where the callee expects them.
+-  num_gp = std::min(num_gp, 8);
+-  num_fp = std::min(num_fp, 8 - num_gp);
+-  LA(ccall(target, num_gp, num_fp, num_results));
++void Assembler::CallC(Register target, int fp_mask, int num_results) {
++  LA(ccall(target, fp_mask, num_results));
++}
++void Assembler::TailCallC(int arg, int32_t offset) {
++  LA(tail_c(arg, offset));
+ }
+ void Assembler::li64(Register rd, int64_t imm) { LA(li64(rd, imm)); }
+ 
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index f87ef7de7b..867733096d 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -374,19 +374,22 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   void EnterFromC(int num_args);
+   // Returns to the C++ caller of EnterFromC() with the value of a0.
+   void ReturnToC();
+-  // Calls the C function at `target`: num_gp integer arguments from a0..,
+-  // then num_fp floating point ones from f0... With num_results >= 1 the
+-  // result is copied to a0 and f0, with 2 also to a1. All other registers
+-  // survive the call (the callee has its own window). Execution continues at
+-  // the next instruction.
++  // Calls the C function at `target`. C parameters are positional whatever
++  // their type: parameter i < 8 is taken from f<i> if bit i of fp_mask is
++  // set, from a<i> otherwise; further ones are on the stack at sp. With
++  // num_results >= 1 the result is copied to a0 and f0, with 2 also to a1.
++  // All other registers survive the call (the callee has its own window).
++  // Execution continues at the next instruction.
+   //
+   // On e2k a register may hold a "diagnostic" value, the result of a failed
+   // speculative operation; using it in any non-speculative operation, a store
+   // included, raises SIGILL. A C function that returns nothing may leave one
+-  // in its result register. The results are therefore copied speculatively,
+-  // and must not be requested from functions known to return nothing: the
+-  // code that saves all caller-saved registers would trap on them.
+-  void CallC(Register target, int num_gp, int num_fp, int num_results);
++  // in its result register, so the results are passed through memory by a
++  // speculative store, which turns such a value into a plain number.
++  void CallC(Register target, int fp_mask, int num_results);
++  // The whole body of a function called by C++ that jumps to the C++ function
++  // whose address is at [C parameter `arg` + offset], parameters untouched.
++  void TailCallC(int arg, int32_t offset);
+   // rd = imm in one instruction whose value can be read and replaced
+   // (target_address_at, set_target_value_at).
+   void li64(Register rd, int64_t imm);
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 0cb28f071f..f323a1445d 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -180,38 +180,53 @@ class Assembler : private e2k::Assembler {
+   }
+   // Return to the C caller of enter() with the value of a0.
+   void leave() { C(addd(0, R(a0), 0, e2k::r(0)); return_(e2k::ctpr3)); LF(ct(e2k::ctpr3)); }
+-  // Call of the C function at `target` with ngp integer arguments in a0.. and
+-  // then nfp floating point ones in f0..; the result comes back in a0 and f0
+-  // (results >= 1) and a1 (results == 2).  The results are moved
+-  // speculatively: a function that returns nothing leaves anything in its
+-  // %r0, a diagnostic value too.  Such a value then sits in a0 and f0 until
+-  // they are written; using it traps.  C parameters are the first eight registers of the callee whatever
+-  // their type.  The callee's window starts at %b[4]: `call` raises SIGILL
+-  // unless the caller's window ends at most 8 registers above that start, so
+-  // the argument area is the top of the window (measured: wsz - wbs <= 4).  The hardware
+-  // stack pointer is first set to 64 bytes below sp (the callee owns that
+-  // area), so C frames go right under the frames of this code. It is moved up
+-  // as well as down: C++ measures its stack depth by it, and left low after a
+-  // deep recursion it would make V8 report stack overflows.  Every register of the layer survives the call.
+-  // ponytail: integer arguments first, then floating point ones; a C function
+-  // that mixes them in another order needs the real signature here.
+-  void ccall(Register target, int ngp, int nfp, int results) {
+-    assert(ngp >= 0 && nfp >= 0 && ngp + nfp <= 8 && results >= 0 && results <= 2);
++  // Call of the C function at `target`.  C parameters are the first eight
++  // registers of the callee whatever their type (the ninth and further ones
++  // are on the stack at sp): parameter i is taken from f<i> if bit i of
++  // fp_mask is set, from a<i> otherwise.  The result comes back in a0 and f0
++  // (results >= 1) and a1 (results == 2).
++  // A function that returns nothing leaves anything in its %r0, a diagnostic
++  // value (of a failed speculative operation) too, and any non-speculative use
++  // of one is SIGILL.  So the results go through memory: a speculative store
++  // writes a diagnostic value as plain bits and does not trap (measured), and
++  // what is loaded back is an ordinary number.
++  // The callee's window starts at %b[4]: `call` raises SIGILL unless the
++  // caller's window ends at most 8 registers above that start, so the
++  // argument area is the top of the window (measured: wsz - wbs <= 4).  The
++  // hardware stack pointer is first set to 64 bytes below sp (the callee owns
++  // that area), so C frames go right under the frames of this code.  It is
++  // moved up as well as down: C++ measures its stack depth by it, and left low
++  // after a deep recursion it would make V8 report stack overflows.  Every
++  // register of the layer survives the call.
++  void ccall(Register target, int fp_mask, int results) {
++    assert(fp_mask >= 0 && fp_mask < 256 && results >= 0 && results <= 2);
+     C(rrd(0, Sreg::usd_lo, T0));
+     C(andd(0, T0, 0xffffffffffffll, T0));        // usd.base
+     C(subd(0, R(sp), T0, T0));
+     C(subd(0, T0, 64, T0));
+     C(andd(0, T0, -16, T0));                     // down to sp - 64, or back up to it
+     C(getsp(0, T0, T1));
+-    auto arg = [&](int i) { return i >= ngp && i < ngp + nfp ? e2k::r(32 + i - ngp) : e2k::r(4 + i); };
++    auto arg = [&](int i) { return fp_mask >> i & 1 ? e2k::r(32 + i) : e2k::r(4 + i); };
+     C(for (int i = 0; i < 6; i++) addd(i, arg(i), 0, e2k::b(4 + i)));
+     C(movtd(R(target), e2k::ctpr1); addd(1, arg(6), 0, e2k::b(10)); addd(2, arg(7), 0, e2k::b(11)));
+     C(call(e2k::ctpr1, kWindow - 4));
++    if (results >= 1) C(std_(2, R(sp), -8, e2k::b(4)); sm(2); if (results == 2) { std_(5, R(sp), -16, e2k::b(5)); sm(5); });
+     cmd();
+-    if (results >= 1) { addd(0, e2k::b(4), 0, R(a0)); sm(0); addd(2, e2k::b(4), 0, e2k::r(32)); sm(2); }
+-    if (results == 2) { addd(1, e2k::b(5), 0, R(a1)); sm(1); }
++    if (results >= 1) { ldd(0, R(sp), -8, R(a0)); ldd(2, R(sp), -8, e2k::r(32)); }
++    if (results == 2) ldd(3, R(sp), -16, R(a1));
+     finish();
+   }
++  // The whole body of a function called by C that does nothing but jump to
++  // the C function whose address is at [parameter `arg` + offset]: the
++  // parameters and the window stay as they are, the callee returns to our
++  // caller.  %g16 is a scratch register of the C ABI (lcc computes in
++  // %g16.. in leaf functions).
++  void tail_c(int arg, int32_t offset) {
++    assert(arg >= 0 && arg < 8);
++    C(ldd(0, e2k::r(arg), offset, e2k::g(16)));
++    C(movtd(e2k::g(16), e2k::ctpr1));
++    LF(ct(e2k::ctpr1));
++  }
+   // rd = a 64-bit value that can be read back and replaced (li64_at).
+   void li64(Register rd, int64_t value) { L(addd(0, 0, e2k::Src2::lit64(value), D(rd))); }
+ 
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+index b6acd68dc7..79c9b20cef 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+@@ -4005,7 +4005,7 @@ void MacroAssembler::StoreReturnAddressAndCall(Register target,
+   St_d(ra, MemOperand(sp, 0));
+   // Stack is still aligned.
+ 
+-  CallC(target, kRegisterPassedArguments, 0, num_results);
++  CallC(target, 0, num_results);
+   bind(&after_call);
+ }
+ 
+@@ -4721,7 +4721,7 @@ void MacroAssembler::Abort(AbortReason reason) {
+     li(a1, ExternalReference::abort_with_reason());
+     // Use Call directly to avoid any unneeded overhead. The function won't
+     // return anyway.
+-    CallC(a1, 1, 0, 0);
++    CallC(a1, 0, 0);
+     return;
+   }
+ 
+@@ -5440,22 +5440,9 @@ void MacroAssembler::Float64MinOutOfLine(FPURegister dst, FPURegister src1,
+ 
+ int MacroAssembler::CalculateStackPassedWords(int num_reg_arguments,
+                                               int num_double_arguments) {
+-  int stack_passed_words = 0;
+-
+-  // Up to eight simple arguments are passed in registers a0..a7.
+-  if (num_reg_arguments > kRegisterPassedArguments) {
+-    stack_passed_words += num_reg_arguments - kRegisterPassedArguments;
+-  }
+-  if (num_double_arguments > kFPRegisterPassedArguments) {
+-    int num_count = num_double_arguments - kFPRegisterPassedArguments;
+-    if (num_reg_arguments >= kRegisterPassedArguments) {
+-      stack_passed_words += num_count;
+-    } else if (num_count > kRegisterPassedArguments - num_reg_arguments) {
+-      stack_passed_words +=
+-          num_count - (kRegisterPassedArguments - num_reg_arguments);
+-    }
+-  }
+-  return stack_passed_words;
++  // The first eight parameters are passed in registers whatever their type.
++  return std::max(
++      0, num_reg_arguments + num_double_arguments - kRegisterPassedArguments);
+ }
+ 
+ void MacroAssembler::PrepareCallCFunction(int num_reg_arguments,
+@@ -5490,23 +5477,27 @@ int MacroAssembler::CallCFunction(ExternalReference function,
+                                   int num_reg_arguments,
+                                   int num_double_arguments,
+                                   SetIsolateDataSlots set_isolate_data_slots,
+-                                  Label* return_location) {
++                                  Label* return_location, int fp_mask,
++                                  int num_results) {
+   ASM_CODE_COMMENT(this);
+   BlockTrampolinePoolScope block_trampoline_pool(this);
+   UseScratchRegisterScope temps(this);
+   Register scratch = temps.Acquire();
+   li(scratch, function);
+   return CallCFunctionHelper(scratch, num_reg_arguments, num_double_arguments,
+-                             set_isolate_data_slots, return_location);
++                             set_isolate_data_slots, return_location, fp_mask,
++                             num_results);
+ }
+ 
+ int MacroAssembler::CallCFunction(Register function, int num_reg_arguments,
+                                   int num_double_arguments,
+                                   SetIsolateDataSlots set_isolate_data_slots,
+-                                  Label* return_location) {
++                                  Label* return_location, int fp_mask,
++                                  int num_results) {
+   ASM_CODE_COMMENT(this);
+   return CallCFunctionHelper(function, num_reg_arguments, num_double_arguments,
+-                             set_isolate_data_slots, return_location);
++                             set_isolate_data_slots, return_location, fp_mask,
++                             num_results);
+ }
+ 
+ int MacroAssembler::CallCFunction(ExternalReference function, int num_arguments,
+@@ -5525,9 +5516,19 @@ int MacroAssembler::CallCFunction(Register function, int num_arguments,
+ 
+ int MacroAssembler::CallCFunctionHelper(
+     Register function, int num_reg_arguments, int num_double_arguments,
+-    SetIsolateDataSlots set_isolate_data_slots, Label* return_location) {
++    SetIsolateDataSlots set_isolate_data_slots, Label* return_location,
++    int fp_mask, int num_results) {
+   DCHECK_LE(num_reg_arguments + num_double_arguments, kMaxCParameters);
+   DCHECK(has_frame());
++  if (fp_mask < 0) {
++    // Callers that give only the counts keep the integer arguments in a0..
++    // and the floating point ones in f0..; that is where a C function takes
++    // them from only if all its parameters are of one kind.
++    CHECK(num_reg_arguments == 0 || num_double_arguments == 0);
++    fp_mask = num_reg_arguments == 0
++                  ? (1 << std::min(num_double_arguments, 8)) - 1
++                  : 0;
++  }
+ 
+   Label get_pc;
+   UseScratchRegisterScope temps(this);
+@@ -5587,9 +5588,7 @@ int MacroAssembler::CallCFunctionHelper(
+     int call_pc_offset;
+     {
+       BlockTrampolinePoolScope block_trampoline_pool(this);
+-      // ponytail: whether the function returns anything is not known here;
+-      // see Assembler::CallC for what a function that does not can cause.
+-      CallC(function, num_reg_arguments, num_double_arguments, 1);
++      CallC(function, fp_mask, num_results);
+       call_pc_offset = pc_offset();
+       bind(&get_pc);
+       if (return_location) bind(return_location);
+@@ -5626,6 +5625,17 @@ int MacroAssembler::CallCFunctionHelper(
+   }
+ }
+ 
++void MacroAssembler::TailCallCFunctionFromC(ExternalReference function,
++                                            int isolate_parameter) {
++  // The code runs in the window of a C function: none of the registers of
++  // generated code (kRootRegister) is there. The address comes from the
++  // external reference table of the isolate.
++  TailCallC(isolate_parameter,
++            RootRegisterOffsetForExternalReferenceTableEntry(isolate(),
++                                                             function) +
++                static_cast<int32_t>(Isolate::isolate_root_bias()));
++}
++
+ #undef BRANCH_ARGS_CHECK
+ 
+ void MacroAssembler::CheckPageFlag(Register object, int mask, Condition cc,
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h
+index d4a78dd01c..1c7051817b 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h
+@@ -693,15 +693,24 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
+       Register function, int num_arguments,
+       SetIsolateDataSlots set_isolate_data_slots = SetIsolateDataSlots::kYes,
+       Label* return_location = nullptr);
++  // C parameters are positional on e2k (see Assembler::CallC): fp_mask says
++  // which of the first eight are floating point, taken from f<i> and not
++  // a<i>. Without it (-1) all the arguments must be of one kind.
++  // num_results is 0 for a function known to return nothing.
+   int CallCFunction(
+       ExternalReference function, int num_reg_arguments,
+       int num_double_arguments,
+       SetIsolateDataSlots set_isolate_data_slots = SetIsolateDataSlots::kYes,
+-      Label* return_location = nullptr);
++      Label* return_location = nullptr, int fp_mask = -1, int num_results = 1);
+   int CallCFunction(
+       Register function, int num_reg_arguments, int num_double_arguments,
+       SetIsolateDataSlots set_isolate_data_slots = SetIsolateDataSlots::kYes,
+-      Label* return_location = nullptr);
++      Label* return_location = nullptr, int fp_mask = -1, int num_results = 1);
++  // The whole body of a builtin that is called as a C function and only
++  // forwards to the C++ function `function` with the same parameters;
++  // parameter number isolate_parameter (from 0) is the Isolate*.
++  void TailCallCFunctionFromC(ExternalReference function,
++                              int isolate_parameter);
+ 
+   // See comments at the beginning of Builtins::Generate_CEntry.
+   inline void PrepareCEntryArgs(int num_args) { li(a0, num_args); }
+@@ -1499,10 +1508,11 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
+   void CompareIsNanF(FPURegister cmp1, FPURegister cmp2, CFRegister cd,
+                      bool f32 = true);
+ 
+-  int CallCFunctionHelper(
+-      Register function, int num_reg_arguments, int num_double_arguments,
+-      SetIsolateDataSlots set_isolate_data_slots = SetIsolateDataSlots::kYes,
+-      Label* return_location = nullptr);
++  int CallCFunctionHelper(Register function, int num_reg_arguments,
++                          int num_double_arguments,
++                          SetIsolateDataSlots set_isolate_data_slots,
++                          Label* return_location, int fp_mask,
++                          int num_results);
+ 
+   void RoundDouble(FPURegister dst, FPURegister src, FPURoundingMode mode);
+ 
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index 5fcc4a12d1..f0c1d5545e 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -963,6 +963,8 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       uint32_t param_counts = i.InputUint32(instr->InputCount() - 1);
+       int const num_gp_parameters = ParamField::decode(param_counts);
+       int const num_fp_parameters = FPParamField::decode(param_counts);
++      int const fp_mask = E2kCallFPMaskField::decode(param_counts);
++      int const num_results = E2kCallResultsField::decode(param_counts);
+       SetIsolateDataSlots set_isolate_data_slots = SetIsolateDataSlots::kYes;
+       Label return_location;
+ #if V8_ENABLE_WEBASSEMBLY
+@@ -981,13 +983,38 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       if (instr->InputAt(0)->IsImmediate()) {
+         ExternalReference ref = i.InputExternalReference(0);
+         pc_offset = __ CallCFunction(ref, num_gp_parameters, num_fp_parameters,
+-                                     set_isolate_data_slots, &return_location);
++                                     set_isolate_data_slots, &return_location,
++                                     fp_mask, num_results);
+       } else {
+         Register func = i.InputRegister(0);
+         pc_offset = __ CallCFunction(func, num_gp_parameters, num_fp_parameters,
+-                                     set_isolate_data_slots, &return_location);
++                                     set_isolate_data_slots, &return_location,
++                                     fp_mask, num_results);
+       }
+       RecordSafepoint(instr->reference_map(), pc_offset);
++      // A result narrower than a register: see the instruction selector.
++      // Word32 values are kept sign-extended whatever their signedness.
++      switch (E2kCallNarrowResultField::decode(param_counts)) {
++        case 0:
++          break;
++        case 1:
++          if (E2kCallSignedResultField::decode(param_counts)) {
++            __ ext_w_b(a0, a0);
++          } else {
++            __ andi(a0, a0, 0xff);
++          }
++          break;
++        case 2:
++          if (E2kCallSignedResultField::decode(param_counts)) {
++            __ ext_w_h(a0, a0);
++          } else {
++            __ bstrpick_d(a0, a0, 15, 0);
++          }
++          break;
++        default:
++          __ slli_w(a0, a0, 0);
++          break;
++      }
+ 
+       if (instr->HasCallDescriptorFlag(CallDescriptor::kHasExceptionHandler)) {
+         handlers_.push_back({nullptr, pc_offset});
+diff --git a/chromium/v8/src/compiler/backend/instruction-codes.h b/chromium/v8/src/compiler/backend/instruction-codes.h
+index e2ded18435..978d89179c 100644
+--- a/chromium/v8/src/compiler/backend/instruction-codes.h
++++ b/chromium/v8/src/compiler/backend/instruction-codes.h
+@@ -497,6 +497,14 @@ using BranchHintField = StackCheckField::Next<bool, 1>;
+ // operand.
+ using ParamField = base::BitField<int, 0, 5>;
+ using FPParamField = ParamField::Next<int, 5>;
++// e2k, in the same operand of kArchCallCFunction: which of the first eight
++// parameters are floating point, the number of results, and the width of an
++// integer result narrower than a register (log2 of its size in bytes plus
++// one, 0 if it is not) with its signedness.
++using E2kCallFPMaskField = FPParamField::Next<int, 8>;
++using E2kCallResultsField = E2kCallFPMaskField::Next<int, 2>;
++using E2kCallNarrowResultField = E2kCallResultsField::Next<int, 2>;
++using E2kCallSignedResultField = E2kCallNarrowResultField::Next<bool, 1>;
+ #ifdef USE_SIMULATOR
+ static_assert(kMaxCParameters <= ParamField::kMax);
+ static_assert(kMaxCParameters <= FPParamField::kMax);
+diff --git a/chromium/v8/src/compiler/backend/instruction-selector.cc b/chromium/v8/src/compiler/backend/instruction-selector.cc
+index 6530d4fea2..94fc4111f0 100644
+--- a/chromium/v8/src/compiler/backend/instruction-selector.cc
++++ b/chromium/v8/src/compiler/backend/instruction-selector.cc
+@@ -2350,9 +2350,37 @@ void InstructionSelector::VisitCall(
+ #endif
+       // We store the param counts as a separate input because they need too
+       // many bits to be encoded in the opcode.
+-      buffer.instruction_args.push_back(
+-          g.UseImmediate(ParamField::encode(gp_param_count) |
+-                         FPParamField::encode(fp_param_count)));
++      int param_counts = ParamField::encode(gp_param_count) |
++                         FPParamField::encode(fp_param_count);
++#if V8_TARGET_ARCH_E2K
++      // C parameters are positional whatever their type: the call needs to
++      // know which of the first eight are floating point, and whether there
++      // is a result to take.
++      int fp_mask = 0;
++      for (size_t i = 0; i < call_descriptor->ParameterCount() && i < 8; i++) {
++        if (IsFloatingPoint(
++                call_descriptor->GetParameterType(i).representation())) {
++          fp_mask |= 1 << i;
++        }
++      }
++      param_counts |= E2kCallFPMaskField::encode(fp_mask) |
++                      E2kCallResultsField::encode(
++                          static_cast<int>(call_descriptor->ReturnCount()));
++      // The C++ compiler leaves the upper bits of a narrow result as they
++      // come (zeros after a 32-bit operation), the code generator expects
++      // Word32 values sign-extended.
++      if (call_descriptor->ReturnCount() > 0) {
++        MachineType type = call_descriptor->GetReturnType(0);
++        if (IsIntegral(type.representation()) &&
++            ElementSizeLog2Of(type.representation()) < 3) {
++          param_counts |=
++              E2kCallNarrowResultField::encode(
++                  ElementSizeLog2Of(type.representation()) + 1) |
++              E2kCallSignedResultField::encode(type.IsSigned());
++        }
++      }
++#endif
++      buffer.instruction_args.push_back(g.UseImmediate(param_counts));
+       opcode = EncodeCallDescriptorFlags(kArchCallCFunction, flags);
+       break;
+     }
+diff --git a/chromium/v8/src/compiler/c-linkage.cc b/chromium/v8/src/compiler/c-linkage.cc
+index 17ae1a7b34..8f6e0105dc 100644
+--- a/chromium/v8/src/compiler/c-linkage.cc
++++ b/chromium/v8/src/compiler/c-linkage.cc
+@@ -134,7 +134,10 @@ namespace {
+ }  // namespace
+ 
+ #if (defined(V8_TARGET_OS_WIN) && defined(V8_TARGET_ARCH_X64)) || \
+-    defined(V8_TARGET_ARCH_MIPS64)
++    defined(V8_TARGET_ARCH_MIPS64) || defined(V8_TARGET_ARCH_E2K)
++// e2k: a C parameter takes the register (or the stack slot) of its position
++// whatever its type; the call (Assembler::CallC) takes parameter i from f<i>
++// or a<i>.
+ // As defined in
+ // https://docs.microsoft.com/en-us/cpp/build/x64-calling-convention?view=vs-2019#parameter-passing,
+ // Windows calling convention doesn't differentiate between GP and FP params
+@@ -173,56 +176,6 @@ void BuildParameterLocations(const MachineSignature* msig,
+     }
+   }
+ }
+-#elif defined(V8_TARGET_ARCH_E2K)
+-// As defined in
+-// https://loongson.github.io/LoongArch-Documentation/LoongArch-ELF-ABI-EN.html#_procedure_calling_convention
+-// Loongarch calling convention uses GP to pass floating-point arguments when no
+-// FP is available.
+-void BuildParameterLocations(const MachineSignature* msig,
+-                             size_t kFPParamRegisterCount,
+-                             size_t kParamRegisterCount,
+-                             const DoubleRegister* kFPParamRegisters,
+-                             const v8::internal::Register* kParamRegisters,
+-                             LocationSignature::Builder* out_locations) {
+-#ifdef STACK_SHADOW_WORDS
+-  int stack_offset = STACK_SHADOW_WORDS;
+-#else
+-  int stack_offset = 0;
+-#endif
+-  size_t num_params = 0;
+-  size_t num_fp_params = 0;
+-  for (size_t i = 0; i < msig->parameter_count(); i++) {
+-    MachineType type = msig->GetParam(i);
+-    if (IsFloatingPoint(type.representation())) {
+-      if (num_fp_params < kFPParamRegisterCount) {
+-        out_locations->AddParam(LinkageLocation::ForRegister(
+-            kFPParamRegisters[num_fp_params].code(), type));
+-        ++num_fp_params;
+-      } else if (num_params < kParamRegisterCount) {
+-        // ForNullRegister represents a floating-point param that should be put
+-        // into the GPR, and reg_code is the negative of encoding of the
+-        // GPR, and the maximum is -4.
+-        out_locations->AddParam(LinkageLocation::ForNullRegister(
+-            -kParamRegisters[num_params].code(), type));
+-        ++num_params;
+-      } else {
+-        out_locations->AddParam(
+-            LinkageLocation::ForCallerFrameSlot(-1 - stack_offset, type));
+-        stack_offset++;
+-      }
+-    } else {
+-      if (num_params < kParamRegisterCount) {
+-        out_locations->AddParam(LinkageLocation::ForRegister(
+-            kParamRegisters[num_params].code(), type));
+-        ++num_params;
+-      } else {
+-        out_locations->AddParam(
+-            LinkageLocation::ForCallerFrameSlot(-1 - stack_offset, type));
+-        stack_offset++;
+-      }
+-    }
+-  }
+-}
+ #elif defined(V8_TARGET_ARCH_LOONG64)
+ // As defined in
+ // https://loongson.github.io/LoongArch-Documentation/LoongArch-ELF-ABI-EN.html#_procedure_calling_convention

@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 21:09:57 +0100
+Subject: [PATCH 65/99] v8: e2k: a branch on the equality of tagged values
+ takes the compare
+
+The selector fused a comparison into the branch on it for Word32, Word64
+and floating point, and a comparison of tagged values fell through to the
+general case: the 0/1 result made in a register (xor, compare, merge) and
+then compared with zero - six wide commands for every map check and every
+check against a root in CSA code. Without pointer compression two tagged
+values are equal as words, so the branch takes the compare itself: two
+commands. A comparison of words that the branch does not own (another
+user, another block) is made again from its operands for the same reason:
+it reads two registers and nothing else.
+
+The code of the embedded builtins is 3.4 % smaller, 9245 of its 15591
+merge operations are gone.
+---
+ .../backend/e2k/instruction-selector-e2k.cc   | 34 +++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+index 0054d0286e..66311da49a 100644
+--- a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+@@ -2764,6 +2764,29 @@ void InstructionSelector::VisitWordCompareZero(OpIndex user, OpIndex value,
+     }
+ 
+     const Operation& value_op = Get(value);
++    // A comparison of words reads two registers and nothing else. When the
++    // branch does not own it (it has another user, or sits in another
++    // block), the branch makes it again from its operands: one command, where
++    // a branch on the 0/1 result is that result made (compare, merge) and
++    // compared with zero. The comparison itself is still emitted for its
++    // other users, and not at all when there are none.
++    if (!CanCover(user, value)) {
++      if (const ComparisonOp* comparison = value_op.TryCast<ComparisonOp>()) {
++        if (comparison->rep == RegisterRepresentation::Word32()) {
++          cont->OverwriteAndNegateIfEqual(
++              GetComparisonFlagCondition(*comparison));
++          return VisitWord32Compare(this, value, cont);
++        }
++        if (comparison->rep == RegisterRepresentation::Word64() ||
++            (!COMPRESS_POINTERS_BOOL &&
++             comparison->rep == RegisterRepresentation::Tagged() &&
++             comparison->kind == ComparisonOp::Kind::kEqual)) {
++          cont->OverwriteAndNegateIfEqual(
++              GetComparisonFlagCondition(*comparison));
++          return VisitWord64Compare(this, value, cont);
++        }
++      }
++    }
+     if (CanCover(user, value)) {
+       if (const ComparisonOp* comparison = value_op.TryCast<ComparisonOp>()) {
+         switch (comparison->rep.value()) {
+@@ -2777,6 +2800,17 @@ void InstructionSelector::VisitWordCompareZero(OpIndex user, OpIndex value,
+                 GetComparisonFlagCondition(*comparison));
+             return VisitWord64Compare(this, value, cont);
+ 
++          case RegisterRepresentation::Tagged():
++            // Without pointer compression two tagged values are equal as
++            // words: the branch takes the compare, as it does for words,
++            // and not its 0/1 result (map checks of CSA code).
++            if (COMPRESS_POINTERS_BOOL ||
++                comparison->kind != ComparisonOp::Kind::kEqual) {
++              break;
++            }
++            cont->OverwriteAndNegateIfEqual(kEqual);
++            return VisitWord64Compare(this, value, cont);
++
+           case RegisterRepresentation::Float32():
+             switch (comparison->kind) {
+               case ComparisonOp::Kind::kEqual:

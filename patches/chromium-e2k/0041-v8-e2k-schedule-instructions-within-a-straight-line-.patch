@@ -1,0 +1,725 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 06:24:10 +0100
+Subject: [PATCH 41/99] v8: e2k: schedule instructions within a straight-line
+ window
+
+The instructions since the last point where the code position was asked
+are a window of wide commands. Each wide command of an instruction now
+goes into the earliest command of the window that its operands, the
+registers it overwrites and memory allow, and not earlier than the
+measured delays say: a result used too early costs 4 cycles (8 at the
+worst), a command that does nothing costs 1, so the user waits and the
+commands in between are left for later instructions. The delays (load 3,
+multiply 4 to 6, floating point 4 to 6, one more in the other lane of
+channels, a 32-bit result read as 64 bits 4) and the store to load rule
+are in la_asm.h. That was the reason joining made loops slower: it
+brought a floating-point operation one command closer to its user.
+
+A transfer of control stays last, its compare and its target go as
+early as they can; a rare branch, an operation on a state register and
+predicate logic end the window. A branch is therefore linked to its
+label after it has been assembled, by the slot that holds its
+displacement, instead of by the position asked before it.
+
+E2K_NO_SCHED=1 gives the old joining, E2K_FUSE_STATS=1 also prints the
+lengths of the windows and what ended them.
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc |  70 +++--
+ chromium/v8/src/codegen/e2k/e2k_asm.h        | 102 ++++++--
+ chromium/v8/src/codegen/e2k/la_asm.h         | 256 +++++++++++++++++--
+ 3 files changed, 366 insertions(+), 62 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index c7a8ea76b8..fdce0bb62a 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -943,29 +943,6 @@ uint64_t Assembler::branch_long_offset(Label* L) {
+   return static_cast<uint64_t>(offset);
+ }
+ 
+-int32_t Assembler::branch_offset_helper(Label* L, OffsetSize bits) {
+-  int32_t target_pos;
+-
+-  if (L->is_bound()) {
+-    target_pos = L->pos();
+-  } else {
+-    if (L->is_linked()) {
+-      target_pos = L->pos();
+-      L->link_to(pc_offset());
+-    } else {
+-      L->link_to(pc_offset());
+-      unbound_labels_count_++;
+-      return kEndOfChain;
+-    }
+-  }
+-
+-  int32_t offset = target_pos - pc_offset();
+-  // Fails for a label that is also the target of dd(Label*) while unbound: its
+-  // link chain then goes through data, which is not on a slot boundary.
+-  CHECK_EQ(offset % kInstrSize, 0);
+-
+-  return offset;
+-}
+ 
+ void Assembler::label_at_put(Label* L, int at_offset) {
+   // Label constants are not ported (a 4-byte constant cannot be told from an
+@@ -992,11 +969,14 @@ struct Layer {
+   int settled = 0;  // layer offset the current instruction may rewrite from
+   int start = 0;    // how the current instruction found the code: a kStart*
+   la::Assembler::Counts counted = {0, 0, 0, 0, 0};
++  Label* label = nullptr;  // the next instruction branches to it
+ };
+ 
+-// E2K_NO_FUSE=1: a slot per instruction. E2K_FUSE_STATS=1: totals at exit;
+-// =2: also who emitted the instructions that could not use an open slot
+-// because the position had been asked for (return addresses, see nm).
++// E2K_NO_FUSE=1: a slot per instruction. E2K_NO_SCHED=1: instructions join
++// the last wide command in the order given, no scheduling.
++// E2K_FUSE_STATS=1: totals at exit; =2: also who emitted the instructions
++// that could not use an open slot because the position had been asked for
++// (return addresses, see nm).
+ enum {
+   kInstructions, kOwn, kCommands, kJoined, kBytes,
+   kStartOpen, kStartAsked, kStartBlocked, kStartMoved,  // of all instructions
+@@ -1012,6 +992,13 @@ void PrintStats() {
+   long n[kNumStats];
+   for (int i = 0; i < kNumStats; i++) n[i] = stats[i].load();
+   if (!n[kCommands]) return;
++  const long* w = la::Assembler::windows;
++  fprintf(stderr, "e2k sched: windows by wide commands, 1 to 16:");
++  for (int i = 1; i <= 16; i++) fprintf(stderr, " %ld", w[i]);
++  fprintf(stderr,
++          "\ne2k sched: windows ended by a rare branch %ld, a transfer %ld, a "
++          "state register %ld, their length %ld, from outside %ld\n",
++          w[17], w[18], w[19], w[20], w[21]);
+   fprintf(stderr,
+           "e2k fuse: %ld instructions (%ld with slots of their own), %ld "
+           "commands (%ld joins), %ld slots: %.2f per command, %.2f per slot\n"
+@@ -1049,13 +1036,28 @@ Layer& TheLayer() {
+       return getenv("E2K_NO_FUSE") == nullptr;
+     }();
+     Layer* l = new Layer;
+-    l->la.set_fuse(fuse);
++    if (fuse && getenv("E2K_NO_SCHED")) {
++      l->la.set_fuse(true);
++    } else {
++      l->la.set_sched(fuse);
++    }
+     return l;
+   }();
+   return *layer;
+ }
+ }  // namespace
+ 
++// The branch (or pcaddi) that takes this offset is linked to the label when
++// it has been assembled, in EmitSlots: scheduled among the instructions
++// before it, it is not where the code ends now, and asking where that is
++// would end the window it is scheduled in.
++int32_t Assembler::branch_offset_helper(Label* L, OffsetSize bits) {
++  Layer& l = TheLayer();
++  CHECK_NULL(l.label);
++  l.label = L;
++  return 0;
++}
++
+ #define LA(call)                       \
+   do {                                 \
+     la::Assembler& la_ = OpenSlots();  \
+@@ -1083,6 +1085,8 @@ la::Assembler& Assembler::OpenSlots() {
+                          : kStartAsked;
+   l.settled = static_cast<int>(l.la.settled());
+   l.la.set_rare(rare_branch_);
++  // An instruction of a counted sequence keeps its slots.
++  if (l.label && !blocked) l.la.defer_link();
+   return l.la;
+ }
+ 
+@@ -1097,6 +1101,18 @@ void Assembler::EmitSlots(const la::Assembler& la) {
+   pc_ += size;
+   slot_open_ = !is_trampoline_pool_blocked() &&
+                pc_ - buffer_start_ >= no_trampoline_pool_before_;
++  if (Label* L = l.label) {
++    l.label = nullptr;
++    CHECK_GE(la.link_pos(), 0);
++    int pos = l.base + static_cast<int>(la.link_pos());
++    int target = pos;  // the end of the chain
++    if (L->is_bound() || L->is_linked()) target = L->pos();
++    if (!L->is_bound()) {
++      if (!L->is_linked()) unbound_labels_count_++;
++      L->link_to(pos);
++    }
++    target_at_put(pos, target, false);
++  }
+   if (stats_level) {
+     const la::Assembler::Counts& c = la.counts();
+     bool own = c.own != l.counted.own;
+diff --git a/chromium/v8/src/codegen/e2k/e2k_asm.h b/chromium/v8/src/codegen/e2k/e2k_asm.h
+index 5ef3ae543c..321e6d581f 100644
+--- a/chromium/v8/src/codegen/e2k/e2k_asm.h
++++ b/chromium/v8/src/codegen/e2k/e2k_asm.h
+@@ -64,7 +64,22 @@ struct Src2 {
+   static Src2 lit64(int64_t v) { Src2 s(v); s.cls = 2; return s; }
+ };
+ 
+-struct Op { uint8_t cop, opce, opc2, opce2; bool w32; uint8_t plain, ales; };
++struct Op { uint8_t cop, opce, opc2, opce2; bool w32; uint8_t plain, ales, kind; };
++// For a scheduler: how long the result of an operation takes to reach its
++// user depends on what made it (kMade) and on what uses it (kFor*); see
++// la_asm.h for the figures.  kR32: only the low 32 bits of the operands are
++// read.  Bits 6-7: log2 of the size of a load or a store.
++enum : uint8_t { kInt, kInt32, kLoad, kMul, kFp, kFpToInt, kMade = 7, kForInt = 0, kForFp = 8, kForMul = 16, kFor = 24, kR32 = 32 };
++constexpr bool starts(const char* s, const char* p) { return !*p || (*s == *p && starts(s + 1, p + 1)); }
++constexpr bool within(const char* s, const char* p) { return *s && (starts(s, p) || within(s + 1, p)); }
++constexpr uint8_t kind_of(const char* n, bool w32) {
++  bool load = starts(n, "ld"), store = starts(n, "st"), fp = *n == 'f', to_fp = starts(n, "isto") || starts(n, "idto");
++  bool mul = !fp && (within(n, "mul") || within(n, "div") || within(n, "mod")), to_int = fp && within(n, "toi") && !within(n, "toif");
++  return uint8_t((load ? kLoad : mul ? kMul : to_int ? kFpToInt : fp || to_fp ? kFp : w32 && !starts(n, "sxt") ? kInt32 : kInt) |
++                 (fp ? kForFp : mul || to_fp ? kForMul : kForInt) |
++                 (w32 || starts(n, "sxt") || (store && n[2] != 'd') ? kR32 : 0) |
++                 (load || store ? (n[2] == 'b' ? 0 : n[2] == 'h' ? 1 : n[2] == 'w' ? 2 : 3) << 6 : 0));
++}
+ struct Lit { int64_t v; Label* label; uint8_t cls; int8_t ch; };   // cls: 0/1/2 = 16/32/64 bits; ch < 0: setwd
+ 
+ // One wide command while it is built.  It is a plain copyable value: end()
+@@ -88,6 +103,20 @@ struct Command {
+   int8_t map_[6];                                      // channel named by the caller -> channel taken
+ };
+ 
++// What the operations given since Assembler::note() read and write, for a
++// scheduler.  `op` numbers the operations in the order given; `kind` is the
++// reader's for a use and the maker's for a definition.
++struct Note {
++  struct Ref { uint8_t code, kind, op; bool data; };                 // data: the value a store writes
++  struct Mem { uint8_t base, op, size; bool store, known; int64_t disp; };   // known: [base + disp], no index register
++  Ref use[16], def[8]; Mem mem[4];
++  int nuse, ndef, nmem, nop;
++  uint32_t puse, pdef;                                               // predicates
++  uint8_t ctuse, ctdef;                                              // %ctpr
++  bool ss, cs0, rare, solo;                                          // solo: state registers, CS1, local predicates
++  int8_t ch[8];                                                      // channel each operation took
++};
++
+ class Assembler : public Command {
+  public:
+   // `base` is the address the first byte will have at run time.
+@@ -109,7 +138,7 @@ class Assembler : public Command {
+   }
+ 
+   // ---- wide command ------------------------------------------------------
+-  void begin() { assert(!open_); reset(); open_ = true; }
++  void begin() { assert(!open_); reset(); open_ = true; lanes_ = nullptr; }
+   void nop(int n) { assert(open_ && n >= 0 && n <= 7); nop_ = n; }
+   // `min_words` stretches the command with zero words (placed where as puts
+   // its alignment word) so that it is at least that long; they cost no time.
+@@ -134,13 +163,26 @@ class Assembler : public Command {
+     reopen(at);
+     for (int i = 0; i < 4; i++) { def_[i] |= gdef_[i]; gdef_[i] = 0; }
+     pdef_ |= gpdef_; gpdef_ = 0; store_ |= gstore_; gstore_ = false;
+-    memset(map_, -1, sizeof map_); join_ = true; bad_ = false;
++    memset(map_, -1, sizeof map_); join_ = true; bad_ = false; lanes_ = nullptr;
+   }
+   bool joined() const { return !bad_ && fits(); }
+   // A command with a control transfer (the code after it may be entered from
+   // elsewhere), a CS1 syllable (window, call, mas, wait) or a write to a
+   // state register takes nothing more.
+   bool joinable() const { return !alone_ && !has_ss_ && !has_cs1_; }
++  // The same for a caller that keeps the commands itself and orders them
++  // (la_asm.h): the current state is the command, nothing is cut or written.
++  // Transfers of control and reads of state registers join as well, and
++  // lanes[i] limits operation i to channels 0-2 (1), 3-5 (2) or neither (3).
++  void extend(const uint8_t* lanes) {
++    for (int i = 0; i < 4; i++) { def_[i] |= gdef_[i]; gdef_[i] = 0; }
++    pdef_ |= gpdef_; gpdef_ = 0; store_ |= gstore_; gstore_ = false;
++    memset(map_, -1, sizeof map_); join_ = true; bad_ = false; lanes_ = lanes; open_ = true;
++  }
++  void drop() { open_ = false; join_ = false; }
++  void set_sched(bool on) { sched_ = on; }
++  void note() { memset(&note_, 0, sizeof note_); npend_ = 0; pend_def_ = -1; }
++  const Note& noted() const { return note_; }
+   // The code is cut at `at` and the current state is the command to write there.
+   void reopen(size_t at) { assert(at <= buf_.size()); buf_.resize(at); open_ = true; }
+ 
+@@ -155,7 +197,7 @@ class Assembler : public Command {
+   //   ALOPF16     name(ch, state_register, dst)           rrs/rrd
+ #define E2K_SREG(...)
+ #define E2K_OP(name, fmt, cop, opce, opc2, opce2, w32, plain, ales) \
+-  E2K_##fmt(name, (Op{cop, opce, opc2, opce2, bool(w32), plain, ales}))
++  E2K_##fmt(name, (Op{cop, opce, opc2, opce2, bool(w32), plain, ales, kind_of(#name, w32)}))
+ #define E2K_ALOPF1(name, op) \
+   void name(int ch, Src1 s1, Src2 s2, Reg d) { use(s1.code); def(d.code); alop(op, ch, s1.code, s2, d.code); }
+ #define E2K_ALOPF11 E2K_ALOPF1
+@@ -210,13 +252,13 @@ class Assembler : public Command {
+   void movep(Lp a, Lp b, Lp dst) { clp(3, a, b, dst); }
+ 
+   // ---- control transfer --------------------------------------------------
+-  void disp(Ctpr c, Label* l) { cs0(uint32_t(c) << 30, l); }
+-  void ldisp(Ctpr c, Label* l) { assert(c == ctpr2); cs0(uint32_t(c) << 30 | 1u << 28, l); }
+-  void sdisp(Ctpr c, int n) { assert(n >= 0 && n < 32); cs0(uint32_t(c) << 30 | 2u << 28 | uint32_t(n), nullptr); }
+-  void return_(Ctpr c) { assert(c == ctpr3); cs0(0xf0000000u, nullptr); }
+-  void movtd(Src2 src, Ctpr c) { alop(Op{0x61, 0xc0, 0, 0, false, 0x01, 0}, 0, 0xc0, src, uint8_t(0xd0 | c)); }
+-  void ct(Ctpr c) { ss(0xc0000000u | uint32_t(c) << 10 | 0x20); }
+-  void ct(Ctpr c, Pred p) { usep(p); ss(0xc0000000u | uint32_t(c) << 10 | cond(p)); }
++  void disp(Ctpr c, Label* l) { note_.ctdef |= 1 << c; cs0(uint32_t(c) << 30, l); }
++  void ldisp(Ctpr c, Label* l) { assert(c == ctpr2); note_.ctdef |= 1 << c; cs0(uint32_t(c) << 30 | 1u << 28, l); }
++  void sdisp(Ctpr c, int n) { assert(n >= 0 && n < 32); note_.ctdef |= 1 << c; cs0(uint32_t(c) << 30 | 2u << 28 | uint32_t(n), nullptr); }
++  void return_(Ctpr c) { assert(c == ctpr3); note_.ctdef |= 1 << c; cs0(0xf0000000u, nullptr); }
++  void movtd(Src2 src, Ctpr c) { note_.ctdef |= 1 << c; alop(Op{0x61, 0xc0, 0, 0, false, 0x01, 0, 0}, 0, 0xc0, src, uint8_t(0xd0 | c)); }
++  void ct(Ctpr c) { note_.ctuse |= 1 << c; ss(0xc0000000u | uint32_t(c) << 10 | 0x20); }
++  void ct(Ctpr c, Pred p) { note_.ctuse |= 1 << c; usep(p); ss(0xc0000000u | uint32_t(c) << 10 | cond(p)); }
+   void call(Ctpr c, int wbs) { ct(c); cs1(0x50000000u | uint32_t(wbs)); }
+   void call(Ctpr c, int wbs, Pred p) { ct(c, p); cs1(0x50000000u | uint32_t(wbs)); }
+   void ibranch(Label* l) { ss(0xc0000020u); cs0(0, l); }
+@@ -227,6 +269,8 @@ class Assembler : public Command {
+   // cycle where a branch on a predicate costs four, taken 14 instead of 6.
+   void rbranch(Label* l, int ch, bool negated) {
+     static const int8_t n[6] = {0, 1, -1, 2, 3, -1};
++    note_.rare = true;
++    if ((ch = taken(ch)) < 0) return;
+     assert(n[ch] >= 0);
+     ss(0xc0000120u | uint32_t(n[ch]) << 1 | uint32_t(negated)); cs0(0, l);
+   }
+@@ -278,16 +322,17 @@ class Assembler : public Command {
+   // Operand codes 0xc0..0xdf are literals and %empty.
+   static bool has(const uint64_t* set, int k) { return set[(k & 0xff) >> 6] >> (k & 63) & 1; }
+   static bool is_reg(int code) { return code < 0xc0 || code >= 0xe0; }
+-  void use(int code) { if (is_reg(code) && has(def_, code)) bad_ = true; }
++  void use(int code) { if (npend_ < 4) pend_[npend_++] = uint8_t(code); if (is_reg(code) && has(def_, code)) bad_ = true; }
+   void use(const Src2& s) { if (s.kind == Src2::kReg) use(s.code); }
+   void def(int code) {
+     if (!is_reg(code)) return;
++    pend_def_ = code;
+     if (has(def_, code)) bad_ = true;
+     gdef_[(code & 0xff) >> 6] |= uint64_t(1) << (code & 63);
+   }
+-  void usep(Pred p) { if (pdef_ >> p.n & 1) bad_ = true; }
+-  void defp(Pred p) { if (pdef_ >> p.n & 1) bad_ = true; gpdef_ |= 1u << p.n; }
+-  void first() { if (join_) bad_ = true; }           // only in the operations a command starts with
++  void usep(Pred p) { note_.puse |= 1u << p.n; if (pdef_ >> p.n & 1) bad_ = true; }
++  void defp(Pred p) { note_.pdef |= 1u << p.n; if (pdef_ >> p.n & 1) bad_ = true; gpdef_ |= 1u << p.n; }
++  void first() { note_.solo = true; if (join_ && !sched_) bad_ = true; }   // only in the operations a command starts with
+   void alone() { first(); alone_ = true; }           // and nothing joins them either
+   int taken(int ch) {
+     if (join_) ch = bad_ ? -1 : map_[ch];
+@@ -325,9 +370,12 @@ class Assembler : public Command {
+   // memory; loads keep below the store channels), else the channel of an
+   // operation that can step aside.
+   int place(const Op& op, int wish, int mem) {
+-    static const int8_t simple[6] = {5, 2, 4, 1, 3, 0}, loads[6] = {3, 2, 0, 5, 1, 4};
+-    const int8_t* pref = mem == 1 ? loads : simple;
++    // A scheduler keeps the users of a result in its lane (channels 0-2 or
++    // 3-5), so everything starts in the first lane.
++    static const int8_t simple[6] = {5, 2, 4, 1, 3, 0}, loads[6] = {3, 2, 0, 5, 1, 4}, lane[6] = {1, 2, 0, 4, 5, 3}, lane_loads[6] = {0, 2, 3, 5, 1, 4};
++    const int8_t* pref = sched_ ? (mem == 1 ? lane_loads : lane) : mem == 1 ? loads : simple;
+     unsigned can = op.plain | op.ales;
++    if (lanes_ && note_.nop < 8) can &= lanes_[note_.nop] == 1 ? 0x07u : lanes_[note_.nop] == 2 ? 0x38u : lanes_[note_.nop] == 3 ? 0u : 0x3fu;
+     for (int i = 0; i < 6; i++)
+       if (int ch = pref[i]; can >> ch & 1 && !(als_mask_ >> ch & 1) && mem_ok(mem, ch)) return map_[wish] = int8_t(ch);
+     for (int i = 0; i < 6; i++) {
+@@ -335,6 +383,7 @@ class Assembler : public Command {
+       if (!(can >> ch & 1) || !(als_mask_ >> ch & 1)) continue;
+       for (int to = 5; to >= 0; to--) {
+         if (als_mask_ >> to & 1 || !((op_[ch].plain | op_[ch].ales) >> to & 1)) continue;
++        if (sched_ && to / 3 != ch / 3) continue;     // its users count on the lane
+         int m = mem_[ch]; mem_[ch] = 0;
+         bool ok = mem_ok(m, to);
+         if (ok) { mem_[to] = uint8_t(m); ok = mem_ok(mem, ch); mem_[to] = 0; }
+@@ -376,10 +425,22 @@ class Assembler : public Command {
+     if (bad_) return -1;
+     put(op, ch, uint32_t(op.cop) << 24 | uint32_t(b2) << 16 | uint32_t(b1) << 8 | b0, src3, mem);
+     order_[norder_++] = ch;
++    Note& n = note_;
++    if (n.nop < 8) {
++      for (int i = 0; i < npend_; i++)
++        if (is_reg(pend_[i]) && n.nuse < 16)   // the address of a store is read whole
++          n.use[n.nuse++] = {pend_[i], uint8_t(op.kind & (mem == 2 && i != 1 ? kFor : kFor | kR32)), uint8_t(n.nop), mem == 2 && i == 1};
++      if (pend_def_ >= 0 && n.ndef < 8) n.def[n.ndef++] = {uint8_t(pend_def_), uint8_t(op.kind & kMade), uint8_t(n.nop), false};
++      if (mem && n.nmem < 4) n.mem[n.nmem++] = {b2, uint8_t(n.nop), uint8_t(1 << (op.kind >> 6)), mem == 2, s2.kind == Src2::kImm, s2.imm};
++      else if (mem) n.solo = true;
++      n.ch[n.nop++] = int8_t(ch);
++    } else n.solo = true;
++    npend_ = 0; pend_def_ = -1;
+     return ch;
+   }
+-  void ss(uint32_t w) { first(); if (bad_) return; assert(open_ && !has_ss_); has_ss_ = true; ss_ = w; }
++  void ss(uint32_t w) { note_.ss = true; if (join_ && !sched_) bad_ = true; if (bad_) return; assert(open_ && !has_ss_); has_ss_ = true; ss_ = w; }
+   void cs0(uint32_t w, Label* l) {
++    note_.cs0 = true;
+     if (has_cs0_ && join_) bad_ = true;
+     if (bad_) return;
+     assert(open_ && !has_cs0_); has_cs0_ = true; cs0_ = w; cs0_label_ = l;
+@@ -463,7 +524,10 @@ class Assembler : public Command {
+ 
+   std::vector<uint8_t> buf_;
+   uint64_t base_;
+-  bool open_ = false;
++  bool open_ = false, sched_ = false;
++  Note note_;
++  const uint8_t* lanes_ = nullptr;
++  uint8_t pend_[4]; int npend_ = 0, pend_def_ = -1;         // operands of the operation being given
+ };
+ 
+ inline bool Assembler::plan(Plan& p) const {
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index d6e65c3f1a..2fbeddb4c8 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -15,6 +15,11 @@
+ // return address, code that is patched or read back, a count of slots).
+ // Instructions that take their own address or jump seal by themselves.
+ //
++// With set_sched(true) the instructions given since the last seal() are a
++// window of wide commands, and each wide command of an instruction goes into
++// the earliest command of the window that its operands, the registers it
++// overwrites, memory and the measured delays allow: see "scheduling" below.
++//
+ //   LA r0..r31    %r0..%r31    (%r0 must hold 0: the entry code sets it, the
+ //                               layer never writes it)
+ //   LA f0..f31    %r32..%r63
+@@ -30,6 +35,7 @@
+ #define LA_ASM_H_
+ 
+ #include <algorithm>
++#include <cstdlib>
+ 
+ #ifdef LA_ASM_V8
+ #include "src/codegen/e2k/e2k_asm.h"
+@@ -115,7 +121,7 @@ class Assembler : private e2k::Assembler {
+   typedef void (E::*Un)(int, e2k::Src2, Reg);
+ 
+  public:
+-  explicit Assembler(uint64_t base = 0) : E(base) {}
++  explicit Assembler(uint64_t base = 0) : E(base) { begin(); empty_ = *this; drop(); }
+   using E::code;
+   using E::pc_offset;
+   using E::data;
+@@ -125,11 +131,29 @@ class Assembler : private e2k::Assembler {
+   // Entry and exit code is not LoongArch: it is written with the e2k encoder.
+   E& raw() { seal(); return *this; }
+ 
+-  void set_fuse(bool on) { fuse_ = on; seal(); }
++  void set_fuse(bool on) { mode_ = on ? kFuse : kPlain; E::set_sched(false); seal(); }
++  void set_sched(bool on) { mode_ = on ? kSched : kPlain; E::set_sched(on); seal(); }
+   // The next instruction starts on the slot boundary the code ends at.
+-  void seal() { sealed_ = true; }
++  void seal() {
++    sealed_ = true; now_ += int(win_.size());
++    if (!win_.empty()) { windows[std::min(win_.size(), kMaxWindow)]++; windows[ends_ ? ends_ : kOutside]++; }
++    win_.clear(); ends_ = 0;
++  }
++  // How many windows of 1..16 wide commands there have been, then how many
++  // were ended by a rare branch, a transfer of control, an operation on a
++  // state register, their length, a seal() from outside.
++  enum { kRare = 17, kTransfer, kState, kLength, kOutside };
++  static inline long windows[22] = {};
+   // Everything before this offset stays as it is whatever comes next.
+-  size_t settled() const { return sealed_ ? pc_offset() : size_t(cmd_); }
++  size_t settled() const { return sealed_ ? pc_offset() : size_t(mode_ == kSched ? window_ : cmd_); }
++  // The slot of the last branch (b, bl, beq..bnez, bceqz, bcnez) or pcaddi:
++  // where its offset is read and set.  A scheduled branch is not where the
++  // code ended when it was given, so its offset cannot be given with it:
++  // defer_link() before the branch says that the caller sets the offset
++  // itself (set_branch_offset_at) once the branch has been given.  Without it
++  // a branch keeps its slots to itself.
++  int64_t link_pos() const { return link_; }
++  void defer_link() { defer_ = true; }
+   // Instructions (those that keep their slots apart), wide commands, commands
+   // joined to and bytes so far; clear() does not reset them.
+   struct Counts { long instructions, own, commands, joined, bytes; };
+@@ -265,8 +289,14 @@ class Assembler : private e2k::Assembler {
+   // beq..bnez given while set_rare(true) are one command, the compare and a
+   // branch on its result: for branches that are almost never taken.
+   void set_rare(bool on) { rare_ = on; }
+-  void b(int32_t offset) { Own own(this); C(disp(e2k::ctpr1, to(offset))); L(ct(e2k::ctpr1)); }
+-  void bl(int32_t offset) { Own own(this); C(disp(e2k::ctpr1, to(offset))); L(rrd(0, Sreg::nip, D(ra)); ct(e2k::ctpr1)); }
++  void b(int32_t offset) {
++    if (later()) { C(disp(e2k::ctpr1, &target_)); L(ct(e2k::ctpr1)); return; }
++    Own own(this); C(disp(e2k::ctpr1, to(offset))); L(ct(e2k::ctpr1));
++  }
++  void bl(int32_t offset) {
++    if (later()) { C(disp(e2k::ctpr1, &target_)); L(rrd(0, Sreg::nip, D(ra)); ct(e2k::ctpr1)); return; }
++    Own own(this); C(disp(e2k::ctpr1, to(offset))); L(rrd(0, Sreg::nip, D(ra)); ct(e2k::ctpr1));
++  }
+   void beq(Register rj, Register rd, int32_t offset) { br(&E::cmpedb, false, R(rj), R(rd), offset); }
+   void bne(Register rj, Register rd, int32_t offset) { br(&E::cmpedb, true, R(rj), R(rd), offset); }
+   void blt(Register rj, Register rd, int32_t offset) { br(&E::cmpldb, false, R(rj), R(rd), offset); }
+@@ -275,8 +305,8 @@ class Assembler : private e2k::Assembler {
+   void bgeu(Register rj, Register rd, int32_t offset) { br(&E::cmpbdb, true, R(rj), R(rd), offset); }
+   void beqz(Register rj, int32_t offset) { br(&E::cmpedb, false, R(rj), 0, offset); }
+   void bnez(Register rj, int32_t offset) { br(&E::cmpedb, true, R(rj), 0, offset); }
+-  void bceqz(CFRegister cj, int32_t offset) { Own own(this); L(ibranch(to(offset), ~P(cj))); }
+-  void bcnez(CFRegister cj, int32_t offset) { Own own(this); L(ibranch(to(offset), P(cj))); }
++  void bceqz(CFRegister cj, int32_t offset) { brc(~P(cj), offset); }
++  void bcnez(CFRegister cj, int32_t offset) { brc(P(cj), offset); }
+   // pc = rj + offset instructions, rd = address of the next instruction,
+   // which starts a slot.  Two slots when offset != 0 (and not fused).
+   void jirl(Register rd, Register rj, int32_t offset) {
+@@ -571,7 +601,13 @@ class Assembler : private e2k::Assembler {
+   // sealed it is kept in saved_ and can be written again, longer or shorter.
+   bool group() {
+     end_ = int64_t(pc_offset());
+-    if (fuse_ && !sealed_) {
++    note();
++    if (mode_ == kSched) {
++      if (sealed_) { sealed_ = false; window_ = end_; dirty_ = 0; branch_ = -1; }
++      begin(); at_ = -1;
++      return false;
++    }
++    if (mode_ == kFuse && !sealed_) {
+       static_cast<e2k::Command&>(*this) = saved_;
+       if (takes()) { join(size_t(cmd_)); return true; }
+     }
+@@ -579,8 +615,9 @@ class Assembler : private e2k::Assembler {
+     return false;
+   }
+   bool close(bool joining) {
++    if (mode_ == kSched) return schedule();
+     if (joining) {
+-      if (joined() && size() <= kMaxCommand) { counts_.joined++; finish(); return true; }
++      if (joined() && size() <= kMaxCommand) { counts_.joined++; seen(noted(), now_ - 1); finish(); return true; }
+       static_cast<e2k::Command&>(*this) = saved_;       // it does not join: the old command back
+       reopen(size_t(cmd_)); pad();
+       begin();
+@@ -598,6 +635,7 @@ class Assembler : private e2k::Assembler {
+     }
+     cmd_ = int64_t(pc_offset());
+     counts_.commands++;
++    seen(noted(), now_++);
+     finish();
+     return true;
+   }
+@@ -619,19 +657,177 @@ class Assembler : private e2k::Assembler {
+   // after it is entered from elsewhere.
+   void done() {
+     counts_.instructions++;
++    defer_ = false;
+     if (fix_) { set_branch_offset_at(data() + slot_, fix_); fix_ = 0; }
+-    if (!fuse_ || has_ss_) seal();
++    if (mode_ == kSched) {
++      layout();
++      if (!ends_ && win_.size() >= kMaxWindow) ends_ = kLength;
++      if (ends_) seal();
++    } else if (mode_ == kPlain || has_ss_) seal();
+   }
+   // An instruction that keeps its slots to itself, as all do without fusing:
+   // it uses its own address, or its code is found and patched later.
+   struct Own {
+-    Assembler* a; bool fuse;
+-    explicit Own(Assembler* as, int slots = 1) : a(as), fuse(as->fuse_) {
+-      a->fuse_ = false; a->seal(); a->slot_ = int64_t(a->pc_offset()); a->floor_ = a->slot_ + slots * kSlot;
++    Assembler* a; int mode;
++    explicit Own(Assembler* as, int slots = 1) : a(as), mode(as->mode_) {
++      a->mode_ = kPlain; a->seal(); a->link_ = a->slot_ = int64_t(a->pc_offset()); a->floor_ = a->slot_ + slots * kSlot;
+       a->counts_.own++;
+     }
+-    ~Own() { a->fuse_ = fuse; a->seal(); a->floor_ = 0; }
++    ~Own() { a->mode_ = mode; a->seal(); a->floor_ = 0; }
+   };
++
++  // ---- scheduling -----------------------------------------------------------
++  // The window is the wide commands since the last seal(); command i runs at
++  // time now_ + i.  A group (one C(...)) is first built alone, which tells
++  // what it reads and writes, then offered to the commands of the window
++  // from the earliest time it may run at, then to a new command at the end.
++  // The state at the end of the window is that of the instructions run in
++  // order:
++  // - a group runs after the last write of every register and predicate it
++  //   reads (operations of one command read the state before the command)
++  //   and not before the last reader of what it overwrites, the write before
++  //   its own counting as one: a command does not write a register twice
++  //   (e2k_asm.h);
++  // - a store runs after the stores before it and not before the loads; a
++  //   load runs after every store before it that may write its cell: any
++  //   store but one through the same base register at a known different
++  //   offset (had the register changed in between, the load would follow the
++  //   change and the change the store).  Within a command memory is accessed
++  //   in channel order (e2k_asm.h, mem_ok);
++  // - a transfer of control runs last and ends the window; so does a rare
++  //   branch (everything before it has run when it is taken, nothing after
++  //   it has: which registers are live at its target is not known here), an
++  //   operation on a state register or with CS1, and logic on predicates.
++  // Times are kept after the window is sealed: the code usually runs on, and
++  // a wrong guess costs time only.
++  //
++  // Delays, in commands from an operation to the user of its result, measured
++  // (ideas/86-latency-matrix): a user that comes earlier costs 4 cycles (8 at
++  // the worst), a command that does nothing costs 1, so the group waits and
++  // the commands in between are left for later groups to fill.  The two
++  // lanes are channels 0-2 and 3-5.
++  //   made by            used by: integer   floating point   multiply, int -> fp   stored value
++  //   integer, 1 cycle           1 (2 in the other lane)                           1
++  //   the same, 32 bits          4, or as above when the user reads 32 bits
++  //   load                       3 (4 in the other lane)                           3
++  //   multiply, divide           6         5                4                     4
++  //   floating point             6         4                5                     4       (6 in the other lane)
++  //   floating point -> int      6
++  //   compare -> operation under the predicate, merge: 2; -> ct: 1 at least, 3 not to wait
++  //   disp -> ct: 1 at least, 5 not to wait (the wait is what is missing, so the target is prepared first)
++  //   store -> load of the same cell: 2; of a cell that may be in the same 32 bytes: 4 (ideas/65)
++  static int need(int made, const e2k::Note::Ref& u, bool other_lane) {
++    static const int8_t same[6][4] = {{1, 1, 1, 1}, {4, 4, 4, 4}, {3, 3, 3, 3}, {6, 5, 4, 4}, {6, 4, 5, 4}, {6, 6, 6, 6}};
++    int to = u.data ? 3 : (u.kind & e2k::kFor) >> 3;
++    if (made == e2k::kInt32 && u.kind & e2k::kR32) made = e2k::kInt;
++    int d = same[made][to];
++    if (!other_lane) return d;
++    return made == e2k::kFp ? 6 : (made == e2k::kInt || made == e2k::kLoad) && to != 3 ? d + 1 : d;
++  }
++  struct Seen { int def, use; uint8_t kind, lane; };       // times of the last write and of the last read of what it wrote
++  struct Store { int t; uint8_t base, size; bool known; int64_t disp; };
++  // 0: may be the same cell; 1: it is; 2: another cell that may share 32 bytes with it; 3: another cell further away.
++  int apart(const e2k::Note::Mem& m, const Store& s) const {
++    if (!m.known || !s.known || m.base != s.base) return 0;
++    if (m.disp < s.disp + s.size && s.disp < m.disp + m.size) return 1;
++    return std::abs(m.disp - s.disp) < kSlot ? 2 : 3;
++  }
++  int earliest(const e2k::Note& g) const {
++    int t = now_;
++    for (int i = 0; i < g.nuse; i++) t = std::max(t, reg_[g.use[i].code].def + need(reg_[g.use[i].code].kind, g.use[i], false));
++    for (int i = 0; i < g.ndef; i++) t = std::max(t, reg_[g.def[i].code].use);
++    for (int p = 0; p < 32; p++) {
++      if (g.puse >> p & 1) t = std::max(t, t_pdef_[p] + (g.ss ? 1 : 2));
++      if (g.pdef >> p & 1) t = std::max(t, t_puse_[p]);
++    }
++    for (int c = 1; c < 4; c++) if (g.ctuse >> c & 1) t = std::max(t, t_ctdef_[c] + 1);
++    for (int i = 0; i < g.nmem; i++) {
++      if (g.mem[i].store) { t = std::max({t, t_load_, t_store_ + 1}); continue; }
++      t = std::max(t, t_old_store_ + 1);
++      for (const Store& s : stores_) if (int a = apart(g.mem[i], s); a < 2) t = std::max(t, s.t + 1 + a);
++    }
++    return t;
++  }
++  // What time `t` adds to the above: the lane of an operation whose operand
++  // is ready in its own lane only, and no load right after a store next to it.
++  bool fits_at(const e2k::Note& g, int t) {
++    memset(lanes_, 0, sizeof lanes_);
++    for (int i = 0; i < g.nuse; i++) {
++      const Seen& r = reg_[g.use[i].code];
++      if (t - r.def < need(r.kind, g.use[i], true)) lanes_[g.use[i].op] |= uint8_t(1 << r.lane);
++    }
++    for (int i = 0; i < g.nop; i++) if (lanes_[i] == 3) return false;
++    for (int i = 0; i < g.nmem; i++)
++      for (const Store& s : stores_) if (!g.mem[i].store && apart(g.mem[i], s) == 2 && t >= s.t && t < s.t + 4) return false;
++    return true;
++  }
++  void seen(const e2k::Note& g, int t) {
++    for (int i = 0; i < g.nuse; i++) reg_[g.use[i].code].use = std::max(reg_[g.use[i].code].use, t);
++    for (int p = 0; p < 32; p++) if (g.puse >> p & 1) t_puse_[p] = std::max(t_puse_[p], t);
++    for (int i = 0; i < g.nmem; i++) {
++      const e2k::Note::Mem& m = g.mem[i];
++      if (!m.store) { t_load_ = std::max(t_load_, t); continue; }
++      t_old_store_ = std::max(t_old_store_, stores_[0].t); t_store_ = std::max(t_store_, t);
++      std::copy(stores_ + 1, stores_ + 4, stores_);
++      stores_[3] = Store{t, m.base, m.size, m.known, m.disp};
++    }
++    for (int i = 0; i < g.ndef; i++) reg_[g.def[i].code] = Seen{t, t, g.def[i].kind, uint8_t(g.ch[g.def[i].op] / 3)};
++    for (int p = 0; p < 32; p++) if (g.pdef >> p & 1) t_pdef_[p] = t_puse_[p] = t;
++    for (int c = 1; c < 4; c++) if (g.ctdef >> c & 1) t_ctdef_[c] = t;
++  }
++  bool schedule() {
++    int n = int(win_.size());
++    if (at_ < 0) {                 // built alone
++      lone_ = *this; group_ = noted(); first_new_ = n;
++      const e2k::Note& g = group_;
++      solo_ = g.solo && !g.ss;
++      int t = earliest(g) - now_;
++      at_ = solo_ ? n : g.ss ? std::max(t, n - 1) : t;
++      if (solo_ || g.ss) ends_ = g.rare ? kRare : g.ss ? kTransfer : kState;
++    } else if (joined() && size() <= kMaxCommand) {
++      return put(*this, noted());
++    } else if (at_ >= first_new_) {
++      return put(lone_, group_);  // it does not go into an empty command either
++    } else {
++      at_++;
++    }
++    drop();
++    while (!solo_ && !fits_at(group_, now_ + at_)) at_++;
++    while (int(win_.size()) <= at_) { win_.push_back(Placed{empty_, 8, 0}); counts_.commands++; }
++    if (solo_) return put(lone_, group_);
++    static_cast<e2k::Command&>(*this) = win_[at_].c;
++    extend(lanes_); note();
++    return false;
++  }
++  bool put(const e2k::Command& c, const e2k::Note& g) {
++    static_cast<e2k::Command&>(*this) = c;
++    counts_.joined += at_ < first_new_;
++    win_[at_] = Placed{c, size(), 0};
++    drop();
++    seen(g, now_ + at_);
++    if (g.cs0) branch_ = at_;
++    if (g.ss && !g.puse) now_ += 8;          // the code after it is reached from elsewhere
++    dirty_ = std::min(dirty_, at_);
++    return true;
++  }
++  // Writes the commands that changed.  A command with a displacement starts
++  // a slot, where the branch is looked for, and so does a long one; the
++  // command before is stretched up to there, the last one to the end of its slot.
++  void layout() {
++    int n = int(win_.size()), i = std::max(dirty_ - 1, 0);
++    if (dirty_ >= n) return;
++    int64_t at = i ? win_[i].pos : window_;
++    for (; i < n; i++) {
++      bool edge = i == n - 1 || win_[i + 1].c.has_cs0_ || win_[i + 1].size > kSlot;
++      int64_t next = edge ? up(at + win_[i].size) : at + win_[i].size;
++      static_cast<e2k::Command&>(*this) = win_[i].c;
++      reopen(size_t(at)); end(int(next - at) / 4);
++      win_[i].pos = at; at = next;
++    }
++    dirty_ = n;
++    counts_.bytes += long(at - end_);
++    if (branch_ >= 0) link_ = win_[branch_].pos;
++  }
+   // Branch target `offset` instructions from the current one (an Own one).
+   // A target before the start of the buffer (V8 gives the layer one
+   // instruction at a time) is written when the instruction is complete.
+@@ -659,10 +855,22 @@ class Assembler : private e2k::Assembler {
+   void alu_w(Alu f, Register rd, e2k::Src1 a, e2k::Src2 b) { C((this->*f)(0, a, b, T0)); L(sxt(0, 2, T0, D(rd))); }
+   void set(Cmp f, Register rd, e2k::Src1 a, e2k::Src2 b) { C((this->*f)(0, a, b, PT0)); L(merged(0, 0, 1, D(rd), PT0)); }
+   void br(Cmp f, bool negate, e2k::Src1 a, e2k::Src2 b, int32_t offset) {
++    // Scheduled, the compare and the target go as early as they can, the
++    // transfer stays last; a rare branch stays one command.
++    if (later()) {
++      if (rare_) { L((this->*f)(0, a, b, PT0); rbranch(&target_, 0, negate)); return; }
++      C((this->*f)(0, a, b, PT0)); C(disp(e2k::ctpr1, &target_)); L(ct(e2k::ctpr1, negate ? ~PT0 : PT0));
++      return;
++    }
+     Own own(this);
+     if (rare_) { L((this->*f)(0, a, b, PT0); rbranch(to(offset), 0, negate)); return; }
+     C((this->*f)(0, a, b, PT0); disp(e2k::ctpr1, to(offset))); L(ct(e2k::ctpr1, negate ? ~PT0 : PT0));
+   }
++  void brc(Pred p, int32_t offset) {
++    if (later()) { C(disp(e2k::ctpr1, &target_)); L(ct(e2k::ctpr1, p)); return; }
++    Own own(this); L(ibranch(to(offset), p));
++  }
++  bool later() { target_.pos = 0; return mode_ == kSched && defer_; }
+   void pcadd(Register rd, e2k::Src2 bytes) { Own own(this); C(rrd(0, Sreg::ip, T0)); L(addd(0, T0, bytes, D(rd))); }
+   void mod(Alu div, Register rd, Register rj, Register rk) {
+     C(cmpedb(0, R(rk), 0, PT0); (this->*div)(5, R(rj), R(rk), T0); sm(5));
+@@ -738,11 +946,27 @@ class Assembler : private e2k::Assembler {
+   static constexpr int kWindow = 38;   // setwd wsz: %r0..%r75
+   static constexpr int kStackReserve = 1536 * 1024;   // more than V8's --stack-size (984 KB) plus its slack
+   static constexpr int kMaxCommand = 32;   // bytes of a command that others joined
++  static constexpr size_t kMaxWindow = 16;   // commands in a window: it is sealed when it gets that long
+   int64_t slot_ = 0, cmd_ = 0, end_ = 0, floor_ = 0;   // floor_: an Own instruction ends there at the earliest
+   int psize_ = 0;
+   int32_t fix_ = 0;
+-  bool fuse_ = false, sealed_ = true, rare_ = false;
++  enum { kPlain, kFuse, kSched };
++  int mode_ = kPlain;
++  bool sealed_ = true, rare_ = false;
+   e2k::Command saved_;
++  struct Placed { e2k::Command c; int size; int64_t pos; };
++  std::vector<Placed> win_;
++  e2k::Command empty_, lone_;              // lone_: the current group as a command of its own
++  e2k::Note group_;
++  int64_t window_ = 0, link_ = -1;         // where the window starts
++  int now_ = 64;                           // time of the first command of the window
++  int at_ = 0, first_new_ = 0, dirty_ = 0, branch_ = -1;
++  int ends_ = 0;                           // why the window ends with this instruction: kRare..
++  bool solo_ = false, defer_ = false;
++  uint8_t lanes_[8];
++  Seen reg_[256] = {};
++  int t_pdef_[32] = {}, t_puse_[32] = {}, t_ctdef_[4] = {}, t_load_ = 0, t_store_ = 0, t_old_store_ = 0;
++  Store stores_[4] = {};
+   Counts counts_ = {0, 0, 0, 0, 0};
+   e2k::Label target_;
+ };

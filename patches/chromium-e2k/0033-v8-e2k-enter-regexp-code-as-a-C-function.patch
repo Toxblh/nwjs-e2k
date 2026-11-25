@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 01:52:39 +0100
+Subject: [PATCH 33/99] v8: e2k: enter regexp code as a C function
+
+Irregexp code and the interpreter trampolines are called as C functions,
+by C++ and by the builtins, in a C register window. The generated code
+opens the window of generated code on entry and returns with a hardware
+return; the trampolines jump to the C++ function found through the
+isolate parameter. Backtrack targets are taken with LoadLabelRelative
+instead of label constants in the code.
+---
+ .../v8/src/builtins/builtins-regexp-gen.cc    | 10 ++++++
+ .../regexp/e2k/regexp-macro-assembler-e2k.cc  | 34 +++++++------------
+ 2 files changed, 22 insertions(+), 22 deletions(-)
+
+diff --git a/chromium/v8/src/builtins/builtins-regexp-gen.cc b/chromium/v8/src/builtins/builtins-regexp-gen.cc
+index 3275bb0c10..c600e2753d 100644
+--- a/chromium/v8/src/builtins/builtins-regexp-gen.cc
++++ b/chromium/v8/src/builtins/builtins-regexp-gen.cc
+@@ -33,7 +33,13 @@ namespace internal {
+ void Builtins::Generate_RegExpInterpreterTrampoline(MacroAssembler* masm) {
+   ExternalReference interpreter_code_entry =
+       ExternalReference::re_match_for_call_from_js();
++#if V8_TARGET_ARCH_E2K
++  // Called as a C function, in a C register window; the Isolate* is the
++  // eighth parameter.
++  masm->TailCallCFunctionFromC(interpreter_code_entry, 7);
++#else
+   masm->Jump(interpreter_code_entry);
++#endif
+ }
+ 
+ // Tail calls the experimental regular expression engine.
+@@ -41,7 +47,11 @@ void Builtins::Generate_RegExpInterpreterTrampoline(MacroAssembler* masm) {
+ void Builtins::Generate_RegExpExperimentalTrampoline(MacroAssembler* masm) {
+   ExternalReference interpreter_code_entry =
+       ExternalReference::re_experimental_match_for_call_from_js();
++#if V8_TARGET_ARCH_E2K
++  masm->TailCallCFunctionFromC(interpreter_code_entry, 7);
++#else
+   masm->Jump(interpreter_code_entry);
++#endif
+ }
+ 
+ TNode<Smi> RegExpBuiltinsAssembler::SmiZero() { return SmiConstant(0); }
+diff --git a/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc b/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc
+index c816b6d6a1..bc9a081677 100644
+--- a/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc
++++ b/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc
+@@ -673,6 +673,12 @@ DirectHandle<HeapObject> RegExpMacroAssemblerE2K::GetCode(
+     // Entry code:
+     __ bind(&entry_label_);
+ 
++    // The code is called as a C function, by C++ (Execute) and by the
++    // builtins (CallCFunction): open the register window generated code runs
++    // in. The eight register arguments land in a0..a7, sp is the top of the
++    // C stack; the ninth argument (regexp data) is not used.
++    __ EnterFromC(8);
++
+     // Tell the system that we have a stack frame.  Because the type is MANUAL,
+     // no is generated.
+     FrameScope scope(masm_.get(), StackFrame::MANUAL);
+@@ -973,7 +979,7 @@ DirectHandle<HeapObject> RegExpMacroAssemblerE2K::GetCode(
+     __ mov(sp, frame_pointer());
+     // Restore registers s0..s7 and return (restoring ra to pc).
+     __ MultiPop({ra}, {fp}, registers_to_retain);
+-    __ Ret();
++    __ ReturnToC();
+ 
+     // Backtrack code (branch target for conditional backtracks).
+     if (backtrack_label_.is_linked()) {
+@@ -1103,27 +1109,11 @@ void RegExpMacroAssemblerE2K::PopRegister(int register_index) {
+ }
+ 
+ void RegExpMacroAssemblerE2K::PushBacktrack(Label* label) {
+-  if (label->is_bound()) {
+-    int target = label->pos();
+-    __ li(a0,
+-          Operand(target + InstructionStream::kHeaderSize - kHeapObjectTag));
+-  } else {
+-    Assembler::BlockTrampolinePoolScope block_trampoline_pool(masm_.get());
+-    Label after_constant;
+-    __ Branch(&after_constant);
+-    int offset = masm_->pc_offset();
+-    int cp_offset = offset + InstructionStream::kHeaderSize - kHeapObjectTag;
+-    //__ emit(0);
+-    __ nop();
+-    masm_->label_at_put(label, offset);
+-    __ bind(&after_constant);
+-    if (is_int12(cp_offset)) {
+-      __ Ld_wu(a0, MemOperand(code_pointer(), cp_offset));
+-    } else {
+-      __ Add_d(a0, code_pointer(), cp_offset);
+-      __ Ld_wu(a0, MemOperand(a0, 0));
+-    }
+-  }
++  // The offset of the label from the code object, which is what Backtrack()
++  // adds code_pointer() to. Taken from the address of the label: a label
++  // constant in the code (label_at_put) is not needed.
++  __ LoadLabelRelative(a0, label);
++  __ Sub_d(a0, a0, code_pointer());
+   Push(a0);
+   CheckStackLimit();
+ }

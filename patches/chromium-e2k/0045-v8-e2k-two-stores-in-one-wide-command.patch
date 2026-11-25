@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 09:29:35 +0100
+Subject: [PATCH 45/99] v8: e2k: two stores in one wide command
+
+Of two stores of one command (channels 2 and 5) that write the same
+bytes the one in channel 5 is left in memory, whichever was given first
+(measured for every pair of sizes and offsets within a cell). So a store
+may join a command that already stores if it takes the channel above;
+the earlier store steps down to channel 2 when it has to. A load still
+does not join a command after its store.
+
+The scheduler lets a store run in the command of the store before it,
+not only after it: pushes and frame setup pair up by themselves.
+
+Also give the note of the operations a defined initial state: the
+encoder used alone (its tests) read it uninitialized.
+---
+ chromium/v8/src/codegen/e2k/e2k_asm.h | 16 ++++++++++------
+ chromium/v8/src/codegen/e2k/la_asm.h  |  5 +++--
+ 2 files changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/e2k_asm.h b/chromium/v8/src/codegen/e2k/e2k_asm.h
+index e2aaf424d6..e8e13ef3b8 100644
+--- a/chromium/v8/src/codegen/e2k/e2k_asm.h
++++ b/chromium/v8/src/codegen/e2k/e2k_asm.h
+@@ -153,7 +153,7 @@ class Assembler : public Command {
+   // command if that keeps the meaning "the old command, then these": they
+   // must not read a register or a predicate the command writes (all
+   // operations of a command read the state before it), must not write one it
+-  // writes, must not touch memory after its store; a write to what the
++  // writes, must not load after its store; a write to what the
+   // command only reads is fine.  The channel an operation names is a wish:
+   // it gets any free channel it can run in, an operation placed earlier
+   // moving aside if that helps; sm(), when() and MERGE follow.  When it does
+@@ -347,10 +347,14 @@ class Assembler : public Command {
+   // ideas/72-load-store-one-command).  Every load of a command with a store
+   // was given before the store or together with it and wants the old value.
+   // GNU as refuses a store in channel 5 with a load in 0 and a store in 2
+-  // with a load in 3.
++  // with a load in 3.  Of two stores to the same bytes the one in the
++  // channel above is left in memory, whichever was given first (measured,
++  // ideas/87-two-stores): the store that joins is the later one and goes above.
+   bool mem_ok(int mem, int ch) const {
+-    for (int c = 0; c < 6; c++)
++    for (int c = 0; c < 6; c++) {
+       if (mem && mem_[c] && mem_[c] != mem && (mem == 2) != (c < ch)) return false;
++      if (mem == 2 && mem_[c] == 2 && c > ch) return false;
++    }
+     if (mem == 2) return !(ch == 5 && mem_[0] == 1) && !(ch == 2 && mem_[3] == 1);
+     if (mem == 1) return !(ch == 0 && mem_[5] == 2) && !(ch == 3 && mem_[2] == 2);
+     return true;
+@@ -386,7 +390,7 @@ class Assembler : public Command {
+       if (!(can >> ch & 1) || !(als_mask_ >> ch & 1) || ch == pinned()) continue;
+       for (int to = 5; to >= 0; to--) {
+         if (als_mask_ >> to & 1 || !((op_[ch].plain | op_[ch].ales) >> to & 1)) continue;
+-        if (sched_ && to / 3 != ch / 3) continue;     // its users count on the lane
++        if (sched_ && to / 3 != ch / 3 && mem_[ch] != 2) continue;   // its users count on the lane; a store has none
+         int m = mem_[ch]; mem_[ch] = 0;
+         bool ok = mem_ok(m, to);
+         if (ok) { mem_[to] = uint8_t(m); ok = mem_ok(mem, ch); mem_[to] = 0; }
+@@ -405,7 +409,7 @@ class Assembler : public Command {
+   int alop(Op op, int ch, uint8_t b2, Src2 s2, uint8_t b0, int src3 = -1, int mem = 0) {
+     if (op.plain == 0x2d) mem = 1;                     // channels 0, 2, 3, 5: the loads
+     use(s2);
+-    if (mem && store_) bad_ = true;                    // a load would see the old memory; two stores: not proven
++    if (mem == 1 && store_) bad_ = true;               // a load would see the old memory
+     if (mem == 2) gstore_ = true;
+     if (join_ && !bad_) ch = place(op, ch, mem);
+     if (bad_) return -1;
+@@ -528,7 +532,7 @@ class Assembler : public Command {
+   std::vector<uint8_t> buf_;
+   uint64_t base_;
+   bool open_ = false, sched_ = false;
+-  Note note_;
++  Note note_ = {};
+   const uint8_t* lanes_ = nullptr;
+   uint8_t pend_[4]; int npend_ = 0, pend_def_ = -1;         // operands of the operation being given
+ };
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index d5d8c6347f..07b9c15031 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -700,7 +700,8 @@ class Assembler : private e2k::Assembler {
+   //   and not before the last reader of what it overwrites, the write before
+   //   its own counting as one: a command does not write a register twice
+   //   (e2k_asm.h);
+-  // - a store runs after the stores before it and not before the loads; a
++  // - a store runs not before the stores and the loads before it (in the
++  //   command of a store it takes the channel above); a
+   //   load runs after every store before it that may write its cell: any
+   //   store but one through the same base register at a known different
+   //   offset (had the register changed in between, the load would follow the
+@@ -761,7 +762,7 @@ class Assembler : private e2k::Assembler {
+     for (int c = 1; c < 4; c++) if (g.ctuse >> c & 1) t = std::max(t, t_ctdef_[c] + 1);
+     if (g.ss || g.solo) t = std::max(t, t_rare_);
+     for (int i = 0; i < g.nmem; i++) {
+-      if (g.mem[i].store) { t = std::max({t, t_load_, t_store_ + 1}); continue; }
++      if (g.mem[i].store) { t = std::max({t, t_load_, t_store_}); continue; }
+       if (!g.mem[i].known || (g.mem[i].base != R(sp).code && g.mem[i].base != R(fp).code)) t = std::max(t, t_rare_);
+       t = std::max(t, t_old_store_ + 1);
+       for (const Store& s : stores_) if (int a = apart(g.mem[i], s); a < 2) t = std::max(t, s.t + 1 + a);

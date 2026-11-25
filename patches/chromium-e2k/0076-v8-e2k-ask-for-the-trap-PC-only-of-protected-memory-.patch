@@ -1,0 +1,471 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Wed, 14 Oct 2026 22:37:00 +0100
+Subject: [PATCH 76/99] v8: e2k: ask for the trap PC only of protected memory
+ accesses
+
+Asking the instruction layer for the PC of an instruction closes its
+scheduling window. The code generator asked for it at every load and
+store, while only accesses with a protected access mode (wasm out of
+bounds and null checks by the trap handler) record it. With WebAssembly
+enabled this broke the windows of ordinary JS loads and stores: props
++6 % and alloc +12 % against the same tree without wasm (bench.js,
+Elbrus-8SV). Accesses with kMemoryAccessDirect now pass no PC pointer;
+without WebAssembly none does.
+---
+ .../backend/e2k/code-generator-e2k.cc         | 122 ++++++++++--------
+ 1 file changed, 66 insertions(+), 56 deletions(-)
+
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index 95910cfa16..4e535b0e0f 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -571,7 +571,7 @@ LSXSize LaneSizeToLSXSize(LaneSize size) {
+ 
+ #define ASSEMBLE_ATOMIC_LOAD_INTEGER(asm_instr)                    \
+   do {                                                             \
+-    __ asm_instr(i.OutputRegister(), i.MemoryOperand(), &trap_pc); \
++    __ asm_instr(i.OutputRegister(), i.MemoryOperand(), trap_pc_ptr); \
+     RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);  \
+     __ dbar(0);                                                    \
+   } while (0)
+@@ -580,7 +580,7 @@ LSXSize LaneSizeToLSXSize(LaneSize size) {
+ #define ASSEMBLE_ATOMIC_STORE_INTEGER(asm_instr)                         \
+   do {                                                                   \
+     __ dbar(0);                                                          \
+-    __ asm_instr(i.InputOrZeroRegister(2), i.MemoryOperand(), &trap_pc); \
++    __ asm_instr(i.InputOrZeroRegister(2), i.MemoryOperand(), trap_pc_ptr); \
+     RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);        \
+     __ dbar(0);                                                          \
+   } while (0)
+@@ -593,7 +593,7 @@ LSXSize LaneSizeToLSXSize(LaneSize size) {
+     __ dbar(0);                                                                \
+     __ bind(&binop);                                                           \
+     __ load_linked(i.OutputRegister(0), MemOperand(i.TempRegister(0), 0),      \
+-                   &trap_pc);                                                  \
++                   trap_pc_ptr);                                               \
+     RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);              \
+     __ bin_instr(i.TempRegister(1), i.OutputRegister(0),                       \
+                  Operand(i.InputRegister(2)));                                 \
+@@ -620,7 +620,7 @@ LSXSize LaneSizeToLSXSize(LaneSize size) {
+     __ dbar(0);                                                                \
+     __ bind(&binop);                                                           \
+     __ load_linked(i.TempRegister(1), MemOperand(i.TempRegister(0), 0),        \
+-                   &trap_pc);                                                  \
++                   trap_pc_ptr);                                               \
+     RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);              \
+     __ ExtractBits(i.OutputRegister(0), i.TempRegister(1), i.TempRegister(3),  \
+                    size, sign_extend);                                         \
+@@ -651,7 +651,7 @@ LSXSize LaneSizeToLSXSize(LaneSize size) {
+     __ dbar(0);                                                                \
+     __ bind(&exchange);                                                        \
+     __ load_linked(i.TempRegister(2), MemOperand(i.TempRegister(0), 0),        \
+-                   &trap_pc);                                                  \
++                   trap_pc_ptr);                                               \
+     RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);              \
+     __ ExtractBits(i.OutputRegister(0), i.TempRegister(2), i.TempRegister(1),  \
+                    size, sign_extend);                                         \
+@@ -674,7 +674,7 @@ LSXSize LaneSizeToLSXSize(LaneSize size) {
+     Label compareExchange;                                                     \
+     __ dbar(0);                                                                \
+     __ bind(&compareExchange);                                                 \
+-    __ load_linked(result_value, MemOperand(i.TempRegister(0), 0), &trap_pc);  \
++    __ load_linked(result_value, MemOperand(i.TempRegister(0), 0), trap_pc_ptr); \
+     RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);              \
+     __ SelectCmp(i.TempRegister(1), eq, expect_value, Operand(result_value),   \
+                  new_value, result_value);                                     \
+@@ -702,7 +702,7 @@ LSXSize LaneSizeToLSXSize(LaneSize size) {
+     __ dbar(0);                                                                \
+     __ bind(&compareExchange);                                                 \
+     __ load_linked(i.TempRegister(2), MemOperand(i.TempRegister(0), 0),        \
+-                   &trap_pc);                                                  \
++                   trap_pc_ptr);                                               \
+     RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);              \
+     __ ExtractBits(i.OutputRegister(0), i.TempRegister(2), i.TempRegister(1),  \
+                    size, sign_extend);                                         \
+@@ -841,7 +841,17 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+   E2kOperandConverter i(this, instr);
+   InstructionCode opcode = instr->opcode();
+   ArchOpcode arch_opcode = ArchOpcodeField::decode(opcode);
+-  int trap_pc;
++  int trap_pc = 0;
++  // Asking for an instruction's PC closes the instruction layer's scheduling
++  // window. Only protected accesses need that position; ordinary JS and wasm
++  // accesses with explicit bounds checks can stay in the same window.
++#if V8_ENABLE_WEBASSEMBLY
++  int* const trap_pc_ptr = AccessModeField::decode(opcode) == kMemoryAccessDirect
++                               ? nullptr
++                               : &trap_pc;
++#else
++  int* const trap_pc_ptr = nullptr;
++#endif
+   switch (arch_opcode) {
+     case kArchCallCodeObject: {
+       CodeEntrypointTag tag =
+@@ -1212,7 +1222,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+             this, object, Operand(i.InputInt64(1)), value, mode,
+             DetermineStubCallMode());
+         __ StoreTaggedField(value, MemOperand(object, i.InputInt64(1)),
+-                            &trap_pc);
++                            trap_pc_ptr);
+         RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+         if (mode > RecordWriteMode::kValueIsPointer) {
+           __ JumpIfSmi(value, ool->exit());
+@@ -1227,7 +1237,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+             this, object, Operand(i.InputRegister(1)), value, mode,
+             DetermineStubCallMode());
+         __ StoreTaggedField(value, MemOperand(object, i.InputRegister(1)),
+-                            &trap_pc);
++                            trap_pc_ptr);
+         RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+         if (mode > RecordWriteMode::kValueIsIndirectPointer) {
+           __ JumpIfSmi(value, ool->exit());
+@@ -1264,11 +1274,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+           masm());
+       if (addressing_mode == kMode_MRI) {
+         __ StoreTaggedField(value, MemOperand(object, i.InputInt32(1)),
+-                            &trap_pc);
++                            trap_pc_ptr);
+       } else {
+         DCHECK_EQ(addressing_mode, kMode_MRR);
+         __ StoreTaggedField(value, MemOperand(object, i.InputRegister(1)),
+-                            &trap_pc);
++                            trap_pc_ptr);
+       }
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+@@ -1288,9 +1298,9 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       MemOperand dst_op = MemOperand(object, offset);
+       __ dbar(0);
+       if (COMPRESS_POINTERS_BOOL) {
+-        __ St_w(value, dst_op, &trap_pc);
++        __ St_w(value, dst_op, trap_pc_ptr);
+       } else {
+-        __ St_d(value, dst_op, &trap_pc);
++        __ St_d(value, dst_op, trap_pc_ptr);
+       }
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       // Skip the write barrier if the value is a Smi. However, this is only
+@@ -1324,9 +1334,9 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       MacroAssemblerBase::BlockTrampolinePoolScope block_trampoline_pool(
+           masm());
+       if (COMPRESS_POINTERS_BOOL) {
+-        __ St_w(value, MemOperand(temp, 0), &trap_pc);
++        __ St_w(value, MemOperand(temp, 0), trap_pc_ptr);
+       } else {
+-        __ St_d(value, MemOperand(temp, 0), &trap_pc);
++        __ St_d(value, MemOperand(temp, 0), trap_pc_ptr);
+       }
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+@@ -1346,7 +1356,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+             this, object, Operand(i.InputInt32(1)), value, mode,
+             DetermineStubCallMode(), tag);
+         __ StoreIndirectPointerField(value, MemOperand(object, i.InputInt32(1)),
+-                                     &trap_pc);
++                                     trap_pc_ptr);
+         RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+         __ JumpIfMarking(ool->entry());
+         __ bind(ool->exit());
+@@ -1356,7 +1366,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+             this, object, Operand(i.InputRegister(1)), value, mode,
+             DetermineStubCallMode(), tag);
+         __ StoreIndirectPointerField(
+-            value, MemOperand(object, i.InputRegister(1)), &trap_pc);
++            value, MemOperand(object, i.InputRegister(1)), trap_pc_ptr);
+         RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+         __ CheckPageFlag(object,
+                          MemoryChunk::kPointersFromHereAreInterestingMask, ne,
+@@ -1387,11 +1397,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       Operand offset(0);
+       if (addressing_mode == kMode_MRI) {
+         __ StoreIndirectPointerField(value, MemOperand(object, i.InputInt32(1)),
+-                                     &trap_pc);
++                                     trap_pc_ptr);
+       } else {
+         DCHECK_EQ(addressing_mode, kMode_MRR);
+         __ StoreIndirectPointerField(
+-            value, MemOperand(object, i.InputRegister(1)), &trap_pc);
++            value, MemOperand(object, i.InputRegister(1)), trap_pc_ptr);
+       }
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+@@ -2123,72 +2133,72 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       __ ext_w_h(i.OutputRegister(), i.InputRegister(0));
+       break;
+     case kE2kLd_bu:
+-      __ Ld_bu(i.OutputRegister(), i.MemoryOperand(), &trap_pc);
++      __ Ld_bu(i.OutputRegister(), i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     case kE2kLd_b:
+-      __ Ld_b(i.OutputRegister(), i.MemoryOperand(), &trap_pc);
++      __ Ld_b(i.OutputRegister(), i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     case kE2kSt_b: {
+       size_t index = 0;
+       MemOperand mem = i.MemoryOperand(&index);
+-      __ St_b(i.InputOrZeroRegister(index), mem, &trap_pc);
++      __ St_b(i.InputOrZeroRegister(index), mem, trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     }
+     case kE2kLd_hu:
+-      __ Ld_hu(i.OutputRegister(), i.MemoryOperand(), &trap_pc);
++      __ Ld_hu(i.OutputRegister(), i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     case kE2kLd_h:
+-      __ Ld_h(i.OutputRegister(), i.MemoryOperand(), &trap_pc);
++      __ Ld_h(i.OutputRegister(), i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     case kE2kSt_h: {
+       size_t index = 0;
+       MemOperand mem = i.MemoryOperand(&index);
+-      __ St_h(i.InputOrZeroRegister(index), mem, &trap_pc);
++      __ St_h(i.InputOrZeroRegister(index), mem, trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     }
+     case kE2kLd_w:
+-      __ Ld_w(i.OutputRegister(), i.MemoryOperand(), &trap_pc);
++      __ Ld_w(i.OutputRegister(), i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     case kE2kLd_wu:
+-      __ Ld_wu(i.OutputRegister(), i.MemoryOperand(), &trap_pc);
++      __ Ld_wu(i.OutputRegister(), i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     case kE2kLd_d:
+-      __ Ld_d(i.OutputRegister(), i.MemoryOperand(), &trap_pc);
++      __ Ld_d(i.OutputRegister(), i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     case kE2kSt_w: {
+       size_t index = 0;
+       MemOperand mem = i.MemoryOperand(&index);
+-      __ St_w(i.InputOrZeroRegister(index), mem, &trap_pc);
++      __ St_w(i.InputOrZeroRegister(index), mem, trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     }
+     case kE2kSt_d: {
+       size_t index = 0;
+       MemOperand mem = i.MemoryOperand(&index);
+-      __ St_d(i.InputOrZeroRegister(index), mem, &trap_pc);
++      __ St_d(i.InputOrZeroRegister(index), mem, trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     }
+     case kE2kLoadDecompressTaggedSigned:
+       __ DecompressTaggedSigned(i.OutputRegister(), i.MemoryOperand(),
+-                                &trap_pc);
++                                trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     case kE2kLoadDecompressTagged:
+-      __ DecompressTagged(i.OutputRegister(), i.MemoryOperand(), &trap_pc);
++      __ DecompressTagged(i.OutputRegister(), i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     case kE2kLoadDecompressProtected:
+-      __ DecompressProtected(i.OutputRegister(), i.MemoryOperand(), &trap_pc);
++      __ DecompressProtected(i.OutputRegister(), i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+ #if V8_ENABLE_SANDBOX
+@@ -2206,7 +2216,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       Register destination = i.OutputRegister();
+       Register handle = i.TempRegister(0);
+ 
+-      __ Ld_wu(handle, MemOperand(base, offset), &trap_pc);
++      __ Ld_wu(handle, MemOperand(base, offset), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       __ srli_d(handle, handle, kTrustedPointerHandleShift);
+       __ Alsl_d(handle, handle, table, kTrustedPointerTableEntrySizeLog2);
+@@ -2238,7 +2248,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+     case kE2kStoreCompressTagged: {
+       size_t index = 0;
+       MemOperand mem = i.MemoryOperand(&index);
+-      __ StoreTaggedField(i.InputOrZeroRegister(index), mem, &trap_pc);
++      __ StoreTaggedField(i.InputOrZeroRegister(index), mem, trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     }
+@@ -2262,7 +2272,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       break;
+     case kE2kAtomicLoadDecompressTagged: {
+       __ AtomicDecompressTagged(i.OutputRegister(), i.MemoryOperand(),
+-                                &trap_pc);
++                                trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     }
+@@ -2273,7 +2283,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       break;
+     }
+     case kE2kFld_s: {
+-      __ Fld_s(i.OutputSingleRegister(), i.MemoryOperand(), &trap_pc);
++      __ Fld_s(i.OutputSingleRegister(), i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     }
+@@ -2281,19 +2291,19 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       size_t index = 0;
+       MemOperand operand = i.MemoryOperand(&index);
+       FPURegister ft = i.InputOrZeroSingleRegister(index);
+-      __ Fst_s(ft, operand, &trap_pc);
++      __ Fst_s(ft, operand, trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     }
+     case kE2kFld_d:
+-      __ Fld_d(i.OutputDoubleRegister(), i.MemoryOperand(), &trap_pc);
++      __ Fld_d(i.OutputDoubleRegister(), i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     case kE2kFst_d: {
+       size_t index = 0;
+       MemOperand operand = i.MemoryOperand(&index);
+       FPURegister ft = i.InputOrZeroDoubleRegister(index);
+-      __ Fst_d(ft, operand, &trap_pc);
++      __ Fst_d(ft, operand, trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     }
+@@ -2532,7 +2542,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+         expect_value = i.TempRegister(2);
+         __ slli_w(expect_value, i.InputRegister(2), 0);
+         __ bind(&compare_exchange);
+-        __ Ll_w(out_value, MemOperand(i.TempRegister(0), 0), &trap_pc);
++        __ Ll_w(out_value, MemOperand(i.TempRegister(0), 0), trap_pc_ptr);
+         RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+         // The locked load is closed by a store in any case (see
+         // ASSEMBLE_ATOMIC_COMPARE_EXCHANGE_INTEGER).
+@@ -2545,7 +2555,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       } else {
+         Label compare_exchange;
+         __ bind(&compare_exchange);
+-        __ Ll_d(out_value, MemOperand(i.TempRegister(0), 0), &trap_pc);
++        __ Ll_d(out_value, MemOperand(i.TempRegister(0), 0), trap_pc_ptr);
+         RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+         // The locked load is closed by a store in any case (see
+         // ASSEMBLE_ATOMIC_COMPARE_EXCHANGE_INTEGER).
+@@ -2582,13 +2592,13 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+     /* SIMDS128 */
+     case kE2kS128St: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+-      __ Vst(i.InputSimd128Register(2), i.MemoryOperand(), &trap_pc);
++      __ Vst(i.InputSimd128Register(2), i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     }
+     case kE2kS128Ld: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+-      __ Vld(i.OutputSimd128Register(), i.MemoryOperand(), &trap_pc);
++      __ Vld(i.OutputSimd128Register(), i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     }
+@@ -2651,7 +2661,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+     case kE2kS128LoadSplat: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+       LSXSize sz = LaneSizeToLSXSize(LaneSizeField::decode(instr->opcode()));
+-      __ LoadSplat(sz, i.OutputSimd128Register(), i.MemoryOperand(), &trap_pc);
++      __ LoadSplat(sz, i.OutputSimd128Register(), i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     }
+@@ -2661,7 +2671,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       Register TmpReg = temps.Acquire();
+       Simd128Register scratch = kSimd128ScratchReg;
+       Simd128Register dst = i.OutputSimd128Register();
+-      __ Ld_d(TmpReg, i.MemoryOperand(), &trap_pc);
++      __ Ld_d(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       __ vreplgr2vr_d(scratch, TmpReg);
+       __ vexth_h_b(dst, scratch);
+@@ -2673,7 +2683,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       Register TmpReg = temps.Acquire();
+       Simd128Register dst = i.OutputSimd128Register();
+       __ vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+-      __ Ld_d(TmpReg, i.MemoryOperand(), &trap_pc);
++      __ Ld_d(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       __ vreplgr2vr_d(dst, TmpReg);
+       __ vilvl_b(dst, kSimd128RegZero, dst);
+@@ -2685,7 +2695,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       Register TmpReg = temps.Acquire();
+       Simd128Register scratch = kSimd128ScratchReg;
+       Simd128Register dst = i.OutputSimd128Register();
+-      __ Ld_d(TmpReg, i.MemoryOperand(), &trap_pc);
++      __ Ld_d(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       __ vreplgr2vr_d(scratch, TmpReg);
+       __ vexth_w_h(dst, scratch);
+@@ -2697,7 +2707,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       Register TmpReg = temps.Acquire();
+       Simd128Register dst = i.OutputSimd128Register();
+       __ vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+-      __ Ld_d(TmpReg, i.MemoryOperand(), &trap_pc);
++      __ Ld_d(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       __ vreplgr2vr_d(dst, TmpReg);
+       __ vilvl_h(dst, kSimd128RegZero, dst);
+@@ -2709,7 +2719,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       Register TmpReg = temps.Acquire();
+       Simd128Register dst = i.OutputSimd128Register();
+       Simd128Register scratch = kSimd128ScratchReg;
+-      __ Ld_d(TmpReg, i.MemoryOperand(), &trap_pc);
++      __ Ld_d(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       __ vreplgr2vr_d(scratch, TmpReg);
+       __ vexth_d_w(dst, scratch);
+@@ -2721,7 +2731,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       Register TmpReg = temps.Acquire();
+       Simd128Register dst = i.OutputSimd128Register();
+       __ vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+-      __ Ld_d(TmpReg, i.MemoryOperand(), &trap_pc);
++      __ Ld_d(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       __ vreplgr2vr_d(dst, TmpReg);
+       __ vilvl_w(dst, kSimd128RegZero, dst);
+@@ -2733,7 +2743,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       Register TmpReg = temps.Acquire();
+       Simd128Register dst = i.OutputSimd128Register();
+       __ vxor_v(dst, dst, dst);
+-      __ Ld_wu(TmpReg, i.MemoryOperand(), &trap_pc);
++      __ Ld_wu(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       __ vinsgr2vr_w(dst, TmpReg, 0);
+       break;
+@@ -2744,7 +2754,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       Register TmpReg = temps.Acquire();
+       Simd128Register dst = i.OutputSimd128Register();
+       __ vxor_v(dst, dst, dst);
+-      __ Ld_d(TmpReg, i.MemoryOperand(), &trap_pc);
++      __ Ld_d(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       __ vinsgr2vr_d(dst, TmpReg, 0);
+       break;
+@@ -2754,7 +2764,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       Simd128Register dst = i.OutputSimd128Register();
+       DCHECK_EQ(dst, i.InputSimd128Register(0));
+       LSXSize sz = LaneSizeToLSXSize(LaneSizeField::decode(instr->opcode()));
+-      __ LoadLane(sz, dst, i.InputUint8(1), i.MemoryOperand(2), &trap_pc);
++      __ LoadLane(sz, dst, i.InputUint8(1), i.MemoryOperand(2), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     }
+@@ -2762,7 +2772,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       CpuFeatureScope lsx_scope(masm(), LSX);
+       Simd128Register src = i.InputSimd128Register(0);
+       LSXSize sz = LaneSizeToLSXSize(LaneSizeField::decode(instr->opcode()));
+-      __ StoreLane(sz, src, i.InputUint8(1), i.MemoryOperand(2), &trap_pc);
++      __ StoreLane(sz, src, i.InputUint8(1), i.MemoryOperand(2), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+       break;
+     }

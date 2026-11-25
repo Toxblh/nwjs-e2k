@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 00:26:52 +0100
+Subject: [PATCH 31/99] v8: e2k: emit a trap for LSX instructions, check label
+ chains
+
+Builtins contain LSX code on paths guarded by a run-time SIMD check;
+emitting it must not abort mksnapshot. A branch offset that is not a
+whole number of slots is now a CHECK failure.
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k-inl.h | 6 ++++--
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc    | 4 +++-
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k-inl.h b/chromium/v8/src/codegen/e2k/assembler-e2k-inl.h
+index c8e719acd8..9195ac537a 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k-inl.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k-inl.h
+@@ -253,8 +253,10 @@ void Assembler::CheckBuffer() {
+ }
+ 
+ void Assembler::EmitHelper(Instr x) {
+-  // A LoongArch encoding: only the LSX instructions still come here.
+-  UNIMPLEMENTED();
++  // A LoongArch encoding: only the LSX instructions still come here. They
++  // are emitted on paths taken when SIMD is supported, which it never is on
++  // e2k so far; the slot traps if it is ever executed.
++  break_(0x15c);
+ }
+ 
+ template <>
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index 581e77ac2c..875cdef179 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -949,7 +949,9 @@ int32_t Assembler::branch_offset_helper(Label* L, OffsetSize bits) {
+   }
+ 
+   int32_t offset = target_pos - pc_offset();
+-  DCHECK_EQ(offset % kInstrSize, 0);
++  // Fails for a label that is also the target of dd(Label*) while unbound: its
++  // link chain then goes through data, which is not on a slot boundary.
++  CHECK_EQ(offset % kInstrSize, 0);
+ 
+   return offset;
+ }

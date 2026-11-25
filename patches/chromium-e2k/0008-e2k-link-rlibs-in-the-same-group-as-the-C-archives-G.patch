@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Fri, 9 Oct 2026 03:16:03 +0100
+Subject: [PATCH 08/99] e2k: link rlibs in the same group as the C++ archives
+ (GNU ld)
+
+---
+ chromium/build/toolchain/gcc_toolchain.gni | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/chromium/build/toolchain/gcc_toolchain.gni b/chromium/build/toolchain/gcc_toolchain.gni
+index 7c46772964..8db02650b4 100644
+--- a/chromium/build/toolchain/gcc_toolchain.gni
++++ b/chromium/build/toolchain/gcc_toolchain.gni
+@@ -686,7 +686,14 @@ template("single_gcc_toolchain") {
+       # We need to specify link groups, at least, for single pass linkers. I.e.
+       # Rust libraries are alpha-sorted instead of by dependencies so they fail
+       # to link if not properly ordered or grouped.
+-      link_command += "$start_group_flag @\"$rspfile\" $end_group_flag {{solibs}} {{libs}} $start_group_flag {{rlibs}} $end_group_flag"
++      if (target_cpu == "e2k") {
++        # GNU ld (there is no lld for e2k) resolves archives in one pass and
++        # the Rust rlibs refer back to C++ static libraries listed in the rsp
++        # file, so they all have to share one group.
++        link_command += "$start_group_flag @\"$rspfile\" {{rlibs}} $end_group_flag {{solibs}} {{libs}}"
++      } else {
++        link_command += "$start_group_flag @\"$rspfile\" $end_group_flag {{solibs}} {{libs}} $start_group_flag {{rlibs}} $end_group_flag"
++      }
+ 
+       # Generate a map file to be used for binary size analysis.
+       # Map file adds ~10% to the link time on a z620.

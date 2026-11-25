@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Fri, 9 Oct 2026 11:17:27 +0100
+Subject: [PATCH 11/99] e2k: V8 runs: table-based cppgc GCInfo, heap assembler
+ buffer, non-executable embedded blob, no -Wa debug dir
+
+---
+ chromium/build/config/compiler/BUILD.gn                    | 5 +++--
+ chromium/v8/gni/v8.gni                                     | 4 +++-
+ chromium/v8/src/codegen/assembler.cc                       | 5 +++++
+ .../embedded/platform-embedded-file-writer-generic.cc      | 7 +++++++
+ 4 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/chromium/build/config/compiler/BUILD.gn b/chromium/build/config/compiler/BUILD.gn
+index c0f90c2fde..8ddf79ef3d 100644
+--- a/chromium/build/config/compiler/BUILD.gn
++++ b/chromium/build/config/compiler/BUILD.gn
+@@ -1424,8 +1424,9 @@ config("compiler_deterministic") {
+       "-file-prefix-map",
+       rebase_path("//.", "") + "=" + rebase_path("//.", root_build_dir),
+     ]
+-    if (!is_win) {
+-      # We don't use clang -cc1as on Windows (yet? https://crbug.com/762167)
++    if (!is_win && current_cpu != "e2k") {
++      # We don't use clang -cc1as on Windows (yet? https://crbug.com/762167),
++      # and there is no integrated assembler at all on e2k (GNU as is used).
+       asmflags = [ "-Wa,-fdebug-compilation-dir,." ]
+     }
+ 
+diff --git a/chromium/v8/gni/v8.gni b/chromium/v8/gni/v8.gni
+index bd0b891542..9fa01f4bc0 100644
+--- a/chromium/v8/gni/v8.gni
++++ b/chromium/v8/gni/v8.gni
+@@ -239,8 +239,10 @@ declare_args() {
+   # pointer compression, set cppgc_enable_caged_heap = false.
+   cppgc_enable_pointer_compression = false
+ 
++  # clang/lccrt on e2k ignores the section attribute on COMDAT variables, so
++  # GCInfo objects would not end up in gc_info_section there.
+   cppgc_enable_object_section_gcinfo =
+-      (is_linux || is_mac) && !is_component_build
++      (is_linux || is_mac) && !is_component_build && current_cpu != "e2k"
+ 
+   # Enable support for larger cages, up to 16GB.
+   # iOS cannot mmap above 8GB, so use the smaller cage.
+diff --git a/chromium/v8/src/codegen/assembler.cc b/chromium/v8/src/codegen/assembler.cc
+index 24865ac978..d55a5a7fdd 100644
+--- a/chromium/v8/src/codegen/assembler.cc
++++ b/chromium/v8/src/codegen/assembler.cc
+@@ -144,10 +144,15 @@ static thread_local bool tls_singleton_taken{false};
+ 
+ void* ExternalAssemblerBufferImpl::operator new(std::size_t count) {
+   DCHECK_EQ(count, sizeof(ExternalAssemblerBufferImpl));
++#if !defined(V8_HOST_ARCH_E2K)
++  // clang/lccrt on e2k miscompiles returning a thread-local address inside a
++  // register-passed aggregate (here: the trivial-ABI unique_ptr), so always
++  // use the heap there.
+   if (V8_LIKELY(!tls_singleton_taken)) {
+     tls_singleton_taken = true;
+     return tls_singleton_storage;
+   }
++#endif
+   return ::operator new(count);
+ }
+ 
+diff --git a/chromium/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.cc b/chromium/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.cc
+index 32b99ea21d..0e1c3842da 100644
+--- a/chromium/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.cc
++++ b/chromium/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.cc
+@@ -33,11 +33,18 @@ const char* DirectiveAsString(DataDirective directive) {
+ }  // namespace
+ 
+ void PlatformEmbeddedFileWriterGeneric::SectionText() {
++#if defined(V8_HOST_ARCH_E2K) && defined(USE_SIMULATOR)
++  // The e2k assembler inserts padding into executable sections, which breaks
++  // the blob layout. The embedded code is only interpreted by the simulator,
++  // so it does not have to be executable.
++  fprintf(fp_, ".section .rodata.v8.embedded,\"a\",@progbits\n");
++#else
+   if (target_os_ == EmbeddedTargetOs::kChromeOS) {
+     fprintf(fp_, ".section .text.hot.embedded\n");
+   } else {
+     fprintf(fp_, ".section .text\n");
+   }
++#endif
+ }
+ 
+ void PlatformEmbeddedFileWriterGeneric::SectionRoData() {

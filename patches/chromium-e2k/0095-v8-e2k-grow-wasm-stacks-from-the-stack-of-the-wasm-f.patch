@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Sat, 17 Oct 2026 02:01:36 +0100
+Subject: [PATCH 95/99] v8: e2k: grow wasm stacks from the stack of the wasm
+ frame
+
+With --wasm-growable-stacks a wasm function whose stack check fails on a
+secondary stack calls wasm_grow_stack (WasmHandleStackOverflow), which
+decides by the C stack pointer whether it runs on the central stack and
+whether the active stack has overflowed.  On e2k C called from a
+secondary stack runs on the main stack (the hardware stack pointer stays
+parked there, la_asm.h ccall), so both answers were wrong and the stack
+never grew: RangeError at the first segment.  On e2k the active stack is
+the central one when it has no parent (as shrink_stack decides), and the
+overflow is checked with the stack pointer of the wasm frame.
+---
+ chromium/v8/src/wasm/wasm-external-refs.cc | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/chromium/v8/src/wasm/wasm-external-refs.cc b/chromium/v8/src/wasm/wasm-external-refs.cc
+index 582631e38e..6d4b2daee2 100644
+--- a/chromium/v8/src/wasm/wasm-external-refs.cc
++++ b/chromium/v8/src/wasm/wasm-external-refs.cc
+@@ -1442,13 +1442,29 @@ void switch_from_the_central_stack_for_js(Isolate* isolate) {
+ // frame_size includes param slots area and extra frame slots above FP.
+ Address grow_stack(Isolate* isolate, void* current_sp, size_t frame_size,
+                    size_t gap, Address current_fp) {
++#if V8_TARGET_ARCH_E2K
++  // C code called from a secondary stack runs on the main stack on e2k (the
++  // hardware stack pointer stays there, see la_asm.h, ccall): the stack to
++  // grow is the active one, and the main stack is the one without a parent
++  // (as in shrink_stack).
++  if (isolate->isolate_data()->active_stack() == nullptr ||
++      isolate->isolate_data()->active_stack()->jmpbuf()->parent == nullptr) {
++#else
+   if (isolate->IsOnCentralStack()) {
++#endif
+     // Should not grow the central stack.
+     return 0;
+   }
+   // Check if this is a real stack overflow.
++#if V8_TARGET_ARCH_E2K
++  // The stack pointer of C is not on the active stack (above): that of wasm is current_sp.
++  if (reinterpret_cast<uintptr_t>(current_sp) - gap <
++      reinterpret_cast<uintptr_t>(
++          isolate->isolate_data()->active_stack()->jslimit())) {
++#else
+   StackLimitCheck check(isolate);
+   if (check.WasmGrowableStackHasOverflowed(gap)) {
++#endif
+     wasm::StackMemory* active_stack = isolate->isolate_data()->active_stack();
+     DCHECK(active_stack->IsActive());
+     // Grow by at least the new frame size plus the stack limit margin.

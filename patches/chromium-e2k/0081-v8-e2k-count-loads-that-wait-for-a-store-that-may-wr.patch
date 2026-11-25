@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Thu, 15 Oct 2026 11:57:22 +0100
+Subject: [PATCH 81/99] v8: e2k: count loads that wait for a store that may
+ write their cell
+
+E2K_FUSE_STATS=1 now also prints how many loads the window scheduler
+holds behind a store it cannot prove apart (different base register,
+unknown offset), and by how many commands: the loads that DAM
+(a lifted load with mas=0x4 and a check with rbranch) could move.
+
+E2K_DAM_NAIVE=1 is an experiment only: such stores are ignored, which
+gives wrong code when the cells meet.  It bounds what DAM could gain.
+
+Code is unchanged without the variables: embedded builtins and the
+snapshot are byte-identical to the build before.
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc |  6 +++++
+ chromium/v8/src/codegen/e2k/la_asm.h         | 25 +++++++++++++++++---
+ 2 files changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index eb84399469..f76f9786f2 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -996,6 +996,12 @@ void PrintStats() {
+           "transfer %ld, a state register %ld, their length %ld, from outside "
+           "%ld\n",
+           w[17], w[18], w[19], w[20], w[21]);
++  const long* d = la::Assembler::dam_stats;
++  fprintf(stderr,
++          "e2k dam: %ld loads, %ld wait for a store that may write their "
++          "cell (%ld commands; 1: %ld, 2: %ld, 3: %ld, 4+: %ld); of them "
++          "from the frame %ld, after a store to the frame %ld\n",
++          d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8]);
+   fprintf(stderr,
+           "e2k fuse: %ld instructions (%ld with slots of their own), %ld "
+           "commands (%ld joins), %ld slots: %.2f per command, %.2f per slot\n"
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 61c7755cf9..93963ed116 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -821,7 +821,7 @@ class Assembler : private e2k::Assembler {
+     return std::abs(m.disp - s.disp) < kSlot ? 2 : 3;
+   }
+   int earliest(const e2k::Note& g) const {
+-    int t = now_;
++    int t = now_, tmay = 0; bool may_fp = false, may_sfp = false;
+     for (int i = 0; i < g.nuse; i++) t = std::max(t, reg_[g.use[i].code].def + need(reg_[g.use[i].code].kind, g.use[i], false));
+     for (int i = 0; i < g.ndef; i++) t = std::max(t, reg_[g.def[i].code].use);
+     for (int p = 0; p < 32; p++) {
+@@ -834,10 +834,29 @@ class Assembler : private e2k::Assembler {
+       if (g.mem[i].store) { t = std::max({t, t_load_, t_store_}); continue; }
+       if (!g.mem[i].known || (g.mem[i].base != R(sp).code && g.mem[i].base != R(fp).code)) t = std::max(t, t_rare_);
+       t = std::max(t, t_old_store_ + 1);
+-      for (const Store& s : stores_) if (int a = apart(g.mem[i], s); a < 2) t = std::max(t, s.t + 1 + a);
++      for (const Store& s : stores_) {
++        int a = apart(g.mem[i], s);
++        if (a == 1) t = std::max(t, s.t + 2);
++        else if (a == 0 && s.t + 1 > tmay) { tmay = s.t + 1; may_fp = g.mem[i].known && (g.mem[i].base == R(sp).code || g.mem[i].base == R(fp).code); may_sfp = s.known && (s.base == R(sp).code || s.base == R(fp).code); }
++      }
+     }
+-    return t;
++    // Counts of loads that wait for a store that may write their cell
++    // (E2K_FUSE_STATS): what DAM could lift.  E2K_DAM_NAIVE (an experiment,
++    // wrong code when the cells meet): such stores are ignored.
++    if (g.nmem && !g.mem[0].store) {
++      dam_stats[0]++;
++      if (tmay > t) {
++        int d = tmay - t; dam_stats[1]++; dam_stats[2] += d; dam_stats[3 + std::min(d, 4) - 1]++;
++        dam_stats[7] += may_fp; dam_stats[8] += may_sfp;
++      }
++    }
++    return naive_alias() ? t : std::max(t, tmay);
+   }
++  static bool naive_alias() { static const bool on = getenv("E2K_DAM_NAIVE") != nullptr; return on; }
++ public:
++  // loads, loads that wait for a may-alias store, commands waited, of them waiting 1/2/3/4+, from the frame, the store to the frame
++  static inline long dam_stats[9] = {};
++ private:
+   // What time `t` adds to the above: the lane of an operation whose operand
+   // is ready in its own lane only, and no load right after a store next to it.
+   bool fits_at(const e2k::Note& g, int t) {

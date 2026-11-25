@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Wed, 7 Oct 2026 16:54:15 +0100
+Subject: [PATCH 03/99] DEV: %prep sed of compiler flags from the spec (revert
+ when exporting patches)
+
+---
+ chromium/build/config/compiler/BUILD.gn | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/chromium/build/config/compiler/BUILD.gn b/chromium/build/config/compiler/BUILD.gn
+index 87a5897c2b..041de0a19f 100644
+--- a/chromium/build/config/compiler/BUILD.gn
++++ b/chromium/build/config/compiler/BUILD.gn
+@@ -1416,7 +1416,7 @@ config("compiler_deterministic") {
+ 
+     # -ffile-compilation-dir is an alias for both -fdebug-compilation-dir=
+     # and -fcoverage-compilation-dir=.
+-    cflags += [ "-ffile-compilation-dir=." ]
++    cflags += [  ]
+ 
+     # Convert absolute paths to relative paths. Expands to, for example:
+     #   -file-prefix-map /path/to/chromium/src=../..
+@@ -1447,7 +1447,7 @@ config("compiler_deterministic") {
+   # paths to the tools it invokes. We don't want this because we don't
+   # really need it and it can mess up the RBE cache entries.
+   if (is_clang) {
+-    cflags += [ "-no-canonical-prefixes" ]
++    cflags += [  ]
+ 
+     # Same for links: Let the compiler driver invoke the linker
+     # with a relative path and pass relative paths to built-in
+@@ -1456,7 +1456,7 @@ config("compiler_deterministic") {
+     # We don't link on RBE, so this change is just for cleaner
+     # internal linker invocations, for people who work on the build.
+     if (!is_win) {
+-      ldflags += [ "-no-canonical-prefixes" ]
++      ldflags += [  ]
+     }
+   }
+ 

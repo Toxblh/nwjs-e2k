@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 13:30:47 +0100
+Subject: [PATCH 50/99] v8: e2k: slli_w by zero is one sign extension
+
+`slli_w rd, rj, 0` is how the LoongArch code this backend comes from
+sign-extends 32 bits, and it does so after most 32-bit arithmetic with
+an overflow check. The layer made it a shift by nothing into a temporary
+and then sxt; now it is sxt alone (addi_w by zero likewise): one
+operation and one command of delay less on the path of nearly every
+integer loop.
+---
+ chromium/v8/src/codegen/e2k/la_asm.h | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 822f6abb23..72386eee2f 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -348,7 +348,10 @@ class Assembler : private e2k::Assembler {
+   void add_d(Register rd, Register rj, Register rk) { alu(&E::addd, rd, R(rj), R(rk)); }
+   void sub_w(Register rd, Register rj, Register rk) { alu_w(&E::subs, rd, R(rj), R(rk)); }
+   void sub_d(Register rd, Register rj, Register rk) { alu(&E::subd, rd, R(rj), R(rk)); }
+-  void addi_w(Register rd, Register rj, int32_t si12) { alu_w(&E::adds, rd, R(rj), si12); }
++  void addi_w(Register rd, Register rj, int32_t si12) {
++    if (si12 == 0) { L(sxt(0, 2, R(rj), D(rd))); return; }
++    alu_w(&E::adds, rd, R(rj), si12);
++  }
+   void addi_d(Register rd, Register rj, int32_t si12) { alu(&E::addd, rd, R(rj), si12); }
+   void addu16i_d(Register rd, Register rj, int32_t si16) { alu(&E::addd, rd, R(rj), int64_t(si16) * 65536); }
+   // sa2 is the shift itself, 1..4
+@@ -408,7 +411,12 @@ class Assembler : private e2k::Assembler {
+   void srl_w(Register rd, Register rj, Register rk) { alu_w(&E::shrs, rd, R(rj), R(rk)); }
+   void sra_w(Register rd, Register rj, Register rk) { alu_w(&E::sars, rd, R(rj), R(rk)); }
+   void rotr_w(Register rd, Register rj, Register rk) { alu_w(&E::scrs, rd, R(rj), R(rk)); }
+-  void slli_w(Register rd, Register rj, int32_t ui5) { alu_w(&E::shls, rd, R(rj), ui5 & 31); }
++  // slli_w rd, rj, 0 is how LoongArch code sign-extends 32 bits: one sxt, not
++  // a shift by nothing into a temporary and then sxt.
++  void slli_w(Register rd, Register rj, int32_t ui5) {
++    if ((ui5 & 31) == 0) { L(sxt(0, 2, R(rj), D(rd))); return; }
++    alu_w(&E::shls, rd, R(rj), ui5 & 31);
++  }
+   void srli_w(Register rd, Register rj, int32_t ui5) { alu_w(&E::shrs, rd, R(rj), ui5 & 31); }
+   void srai_w(Register rd, Register rj, int32_t ui5) { alu_w(&E::sars, rd, R(rj), ui5 & 31); }
+   void rotri_w(Register rd, Register rj, int32_t ui5) { alu_w(&E::scrs, rd, R(rj), ui5 & 31); }

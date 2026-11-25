@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 13:39:36 +0100
+Subject: [PATCH 51/99] v8: e2k: operation descriptions are constants
+
+Every operation built its description at each call, and the kind of the
+operation (what a scheduler needs: how long its result takes) is read
+from its name by a function meant for compile time. It showed as 5 % of
+a profile of baseline compilation. The descriptions are static constexpr
+members now; the code generated is the same.
+---
+ chromium/v8/src/codegen/e2k/e2k_asm.h | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/e2k_asm.h b/chromium/v8/src/codegen/e2k/e2k_asm.h
+index e8e13ef3b8..69bb752fed 100644
+--- a/chromium/v8/src/codegen/e2k/e2k_asm.h
++++ b/chromium/v8/src/codegen/e2k/e2k_asm.h
+@@ -196,8 +196,11 @@ class Assembler : public Command {
+   //   ALOPF15     name(ch, src2, state_register)          rws/rwd
+   //   ALOPF16     name(ch, state_register, dst)           rrs/rrd
+ #define E2K_SREG(...)
++// The description of an operation is a constant: kind_of() reads the name,
++// which took 5 % of the time of compiling when done at every call.
+ #define E2K_OP(name, fmt, cop, opce, opc2, opce2, w32, plain, ales) \
+-  E2K_##fmt(name, (Op{cop, opce, opc2, opce2, bool(w32), plain, ales, kind_of(#name, w32)}))
++  static constexpr Op kOp_##name = Op{cop, opce, opc2, opce2, bool(w32), plain, ales, kind_of(#name, w32)}; \
++  E2K_##fmt(name, kOp_##name)
+ #define E2K_ALOPF1(name, op) \
+   void name(int ch, Src1 s1, Src2 s2, Reg d) { use(s1.code); def(d.code); alop(op, ch, s1.code, s2, d.code); }
+ #define E2K_ALOPF11 E2K_ALOPF1

@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 14:21:12 +0100
+Subject: [PATCH 53/99] v8: e2k: E2K_DUMP_CODE=<dir> writes the code of every
+ TurboFan compilation
+
+The dump of --perf-prof is not the code that runs without the profiler:
+it asks for the position of every instruction, which ends the scheduling
+windows. This writes the final bytes, a file per compilation, to read
+with objdump and to time on a stand.
+---
+ .../backend/e2k/code-generator-e2k.cc         | 26 ++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index d01a2f05b4..de5e4f602d 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -2,6 +2,11 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include <atomic>
++#include <cctype>
++#include <cstdio>
++#include <cstdlib>
++
+ #include "src/builtins/builtins-inl.h"
+ #include "src/codegen/assembler-inl.h"
+ #include "src/codegen/callable.h"
+@@ -5296,7 +5301,26 @@ void CodeGenerator::AssembleReturn(InstructionOperand* additional_pop_count) {
+   __ Ret();
+ }
+ 
+-void CodeGenerator::FinishCode() {}
++void CodeGenerator::FinishCode() {
++  // E2K_DUMP_CODE=<directory>: the code of every compilation as it will
++  // run, a file each, to read (objdump -D -b binary -m elbrus-v5:64) and to
++  // time on a stand. The profiler's dump (--perf-prof) is not that code: it
++  // asks for the position of every instruction, which ends the windows.
++  static const char* const dir = getenv("E2K_DUMP_CODE");
++  if (dir == nullptr) return;
++  static std::atomic<int> count{0};
++  std::unique_ptr<char[]> name = info()->GetDebugName();
++  char path[512];
++  int n = snprintf(path, sizeof path, "%s/%04d-", dir, count.fetch_add(1));
++  for (const char* p = name.get(); *p && n < 500; p++) {
++    path[n++] = isalnum(static_cast<unsigned char>(*p)) ? *p : '_';
++  }
++  snprintf(path + n, sizeof path - n, ".bin");
++  if (FILE* out = fopen(path, "wb")) {
++    fwrite(masm()->buffer_start(), 1, masm()->pc_offset(), out);
++    fclose(out);
++  }
++}
+ 
+ void CodeGenerator::PrepareForDeoptimizationExits(
+     ZoneDeque<DeoptimizationExit*>* exits) {

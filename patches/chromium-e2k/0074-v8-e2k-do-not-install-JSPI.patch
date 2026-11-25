@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 23:48:46 +0100
+Subject: [PATCH 74/99] v8: e2k: do not install JSPI
+
+Stack switching is not ported: the code runs on the secondary stack and
+the first call of C++ from it faults just under the main data stack (the
+hardware stack pointer stays there). Every JSPI test of mjsunit died of
+SIGSEGV. WebAssembly.Suspending and WebAssembly.promising are left out
+until then, so that a page that tests for them takes its other path.
+---
+ chromium/v8/src/wasm/wasm-js.cc | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/chromium/v8/src/wasm/wasm-js.cc b/chromium/v8/src/wasm/wasm-js.cc
+index 9770961239..049cccee0a 100644
+--- a/chromium/v8/src/wasm/wasm-js.cc
++++ b/chromium/v8/src/wasm/wasm-js.cc
+@@ -3398,6 +3398,19 @@ void WasmJs::InstallModule(Isolate* isolate,
+               SideEffectType::kHasNoSideEffect);
+ }
+ 
++namespace {
++#if V8_TARGET_ARCH_E2K
++// Stack switching does not work on e2k yet: the code runs on the secondary
++// stack, but C++ is called with the hardware stack pointer (%usd), which
++// stays in the main stack, and the first such call faults just under it.
++// Until that is done WebAssembly.Suspending and WebAssembly.promising are
++// not installed, so that pages which test for them take their other path.
++constexpr bool kJSPIAvailable = false;
++#else
++constexpr bool kJSPIAvailable = true;
++#endif
++}  // namespace
++
+ // static
+ void WasmJs::Install(Isolate* isolate) {
+   DirectHandle<JSGlobalObject> global = isolate->global_object();
+@@ -3472,7 +3485,7 @@ void WasmJs::Install(Isolate* isolate) {
+ 
+   // Initialize and install JSPI feature.
+   // JSPI is not supported by Wasm interpreter.
+-  if (!v8_flags.wasm_jitless) {
++  if (!v8_flags.wasm_jitless && kJSPIAvailable) {
+     CHECK(native_context->is_wasm_jspi_installed() == Smi::zero());
+     isolate->WasmInitJSPIFeature();
+     InstallJSPromiseIntegration(isolate, native_context, webassembly);
+@@ -3499,7 +3512,7 @@ void WasmJs::InstallConditionalFeatures(Isolate* isolate,
+   // }
+ 
+   // Install JSPI-related features.
+-  if (!v8_flags.wasm_jitless) {
++  if (!v8_flags.wasm_jitless && kJSPIAvailable) {
+     if (context->is_wasm_jspi_installed() == Smi::zero()) {
+       isolate->WasmInitJSPIFeature();
+       if (InstallJSPromiseIntegration(isolate, context, webassembly)) {

@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Fri, 16 Oct 2026 08:51:01 +0100
+Subject: [PATCH 86/99] v8: e2k: take rbranch into deferred code only when it
+ calls
+
+Deferred is a layout hint, not a frequency. A taken rbranch costs 14
+cycles against 6 of an ordinary branch, so a branch into deferred code is
+made rare only when the deferred code reachable from the target (up to
+16 blocks) calls, deoptimizes or aborts; deferred code that only computes
+and goes back to ordinary code (the Smi case of ToBooleanForBaselineJump)
+gets an ordinary branch.
+---
+ .../backend/e2k/code-generator-e2k.cc         | 47 ++++++++++++++++++-
+ 1 file changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index 9596a3a0c5..efbe131b33 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -4721,6 +4721,50 @@ void AssembleBranchToLabels(CodeGenerator* gen, MacroAssembler* masm,
+ #define __ masm()->
+ }
+ 
++namespace {
++
++// Whether a branch into deferred code is rare. Deferred is a layout hint (CSA
++// labels, branch hints) and not a frequency: deferred code that calls (the
++// runtime, a builtin, a stub) is a slow path, but deferred code that only
++// computes and goes back to ordinary code (the Smi case of
++// ToBooleanForBaselineJump) may be taken often, and a taken rbranch costs 14
++// cycles against 6 of an ordinary branch (la/NOTES.md). The deferred blocks
++// reachable from the target are looked at, up to a bound past which the path
++// counts as a slow one.
++bool DeferredTargetIsRare(const InstructionSequence* code, RpoNumber target) {
++  constexpr int kMaxBlocks = 16;
++  RpoNumber work[kMaxBlocks];
++  int count = 0, done = 0;
++  work[count++] = target;
++  while (done < count) {
++    const InstructionBlock* block = code->InstructionBlockAt(work[done++]);
++    if (!block->IsDeferred()) continue;
++    for (int i = block->code_start(); i < block->code_end(); i++) {
++      const Instruction* instr = code->InstructionAt(i);
++      if (instr->IsCall() || instr->IsDeoptimizeCall() ||
++          instr->arch_opcode() == kArchDeoptimize ||
++          instr->arch_opcode() == kArchAbortCSADcheck ||
++          instr->arch_opcode() == kArchDebugBreak ||
++          instr->arch_opcode() == kArchTailCallCodeObject ||
++          instr->arch_opcode() == kArchTailCallAddress ||
++          instr->arch_opcode() == kArchStoreWithWriteBarrier ||
++          instr->arch_opcode() == kArchTruncateDoubleToI) {
++        return true;
++      }
++    }
++    for (RpoNumber succ : block->successors()) {
++      bool seen = false;
++      for (int k = 0; k < count; k++) seen |= work[k] == succ;
++      if (seen) continue;
++      if (count == kMaxBlocks) return true;
++      work[count++] = succ;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
+ // Assembles branches after an instruction.
+ void CodeGenerator::AssembleArchBranch(Instruction* instr, BranchInfo* branch) {
+   Label* tlabel = branch->true_label;
+@@ -4733,7 +4777,8 @@ void CodeGenerator::AssembleArchBranch(Instruction* instr, BranchInfo* branch) {
+     RpoNumber target = i.InputRpo(instr->InputCount() - k);
+     if (GetLabel(target) == tlabel) {
+       rare = instructions()->InstructionBlockAt(target)->IsDeferred() &&
+-             !instructions()->InstructionBlockAt(current_block_)->IsDeferred();
++             !instructions()->InstructionBlockAt(current_block_)->IsDeferred() &&
++             DeferredTargetIsRare(instructions(), target);
+     }
+   }
+   // So is a branch taken when an addition or a subtraction overflows, even

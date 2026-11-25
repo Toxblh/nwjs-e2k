@@ -1,0 +1,303 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 10:48:40 +0100
+Subject: [PATCH 47/99] v8: e2k: select by a predicate: a compare and a merge
+
+Select on a comparison branched over a move (two branches when the
+result was neither value), select on a bit test and SelectWord masked
+both values and joined them: five operations. A merge takes either value
+by the predicate of the compare. New layer instructions seleq, sellt,
+selltu, seltstz(i) and tstz(i)/tstnz(i) for the test as a value;
+MacroAssembler::SelectCmp, SelectTst, CompareTst; SelectWord is one
+compare and one merge.
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc  |  9 ++
+ chromium/v8/src/codegen/e2k/assembler-e2k.h   | 13 +++
+ chromium/v8/src/codegen/e2k/la_asm.h          | 14 +++
+ .../v8/src/codegen/e2k/macro-assembler-e2k.cc | 96 ++++++++++++++++++-
+ .../v8/src/codegen/e2k/macro-assembler-e2k.h  | 10 ++
+ .../backend/e2k/code-generator-e2k.cc         | 50 +---------
+ 6 files changed, 144 insertions(+), 48 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index 66e02647c6..ecd82da856 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -1165,6 +1165,15 @@ void Assembler::bteqz(Register rj, Register rk, int32_t offset) { LA(bteqz(rj, r
+ void Assembler::btnez(Register rj, Register rk, int32_t offset) { LA(btnez(rj, rk, offset)); }
+ void Assembler::bteqzi(Register rj, int64_t mask, int32_t offset) { LA(bteqzi(rj, mask, offset)); }
+ void Assembler::btnezi(Register rj, int64_t mask, int32_t offset) { LA(btnezi(rj, mask, offset)); }
++void Assembler::seleq(Register rd, Register rj, Register rk, Register rt, Register rf) { LA(seleq(rd, rj, rk, rt, rf)); }
++void Assembler::sellt(Register rd, Register rj, Register rk, Register rt, Register rf) { LA(sellt(rd, rj, rk, rt, rf)); }
++void Assembler::selltu(Register rd, Register rj, Register rk, Register rt, Register rf) { LA(selltu(rd, rj, rk, rt, rf)); }
++void Assembler::seltstz(Register rd, Register rj, Register rk, Register rt, Register rf) { LA(seltstz(rd, rj, rk, rt, rf)); }
++void Assembler::seltstzi(Register rd, Register rj, int64_t mask, Register rt, Register rf) { LA(seltstzi(rd, rj, mask, rt, rf)); }
++void Assembler::tstz(Register rd, Register rj, Register rk) { LA(tstz(rd, rj, rk)); }
++void Assembler::tstzi(Register rd, Register rj, int64_t mask) { LA(tstzi(rd, rj, mask)); }
++void Assembler::tstnz(Register rd, Register rj, Register rk) { LA(tstnz(rd, rj, rk)); }
++void Assembler::tstnzi(Register rd, Register rj, int64_t mask) { LA(tstnzi(rd, rj, mask)); }
+ void Assembler::beqz(Register rj, int32_t offset) { LA(beqz(rj, offset)); }
+ void Assembler::bnez(Register rj, int32_t offset) { LA(bnez(rj, offset)); }
+ void Assembler::jirl(Register rd, Register rj, int32_t offset) { LA(jirl(rd, rj, offset)); }
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index 4cac7f4c14..7bc0e0520b 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -469,6 +469,19 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   void btnez(Register rj, Register rk, int32_t offset);
+   void bteqzi(Register rj, int64_t mask, int32_t offset);
+   void btnezi(Register rj, int64_t mask, int32_t offset);
++  // Not LoongArch: rd = rj == rk ? rt : rf, the same for rj < rk signed and
++  // unsigned and for (rj & rk) == 0, a compare and a merge on its predicate;
++  // rd = (rj & rk) == 0, != 0.
++  void seleq(Register rd, Register rj, Register rk, Register rt, Register rf);
++  void sellt(Register rd, Register rj, Register rk, Register rt, Register rf);
++  void selltu(Register rd, Register rj, Register rk, Register rt, Register rf);
++  void seltstz(Register rd, Register rj, Register rk, Register rt, Register rf);
++  void seltstzi(Register rd, Register rj, int64_t mask, Register rt,
++                Register rf);
++  void tstz(Register rd, Register rj, Register rk);
++  void tstzi(Register rd, Register rj, int64_t mask);
++  void tstnz(Register rd, Register rj, Register rk);
++  void tstnzi(Register rd, Register rj, int64_t mask);
+   void beqz(Register rj, int32_t offset);
+   inline void beqz(Register rj, Label* L) {
+     beqz(rj, shifted_branch_offset21(L));
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 151f47ae52..011acc6136 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -474,6 +474,19 @@ class Assembler : private e2k::Assembler {
+   }
+   void maskeqz(Register rd, Register rj, Register rk) { C(cmpedb(0, R(rk), 0, PT0)); L(merged(0, R(rj), 0, D(rd), PT0)); }
+   void masknez(Register rd, Register rj, Register rk) { C(cmpedb(0, R(rk), 0, PT0)); L(merged(0, 0, R(rj), D(rd), PT0)); }
++  // Not LoongArch: rd = rj == rk ? rt : rf, and the same for rj < rk signed
++  // and unsigned and for (rj & rk) == 0: a compare and a merge on its
++  // predicate, where LoongArch branches over a move or masks both values.
++  void seleq(Register rd, Register rj, Register rk, Register rt, Register rf) { sel(&E::cmpedb, rd, R(rj), R(rk), rt, rf); }
++  void sellt(Register rd, Register rj, Register rk, Register rt, Register rf) { sel(&E::cmpldb, rd, R(rj), R(rk), rt, rf); }
++  void selltu(Register rd, Register rj, Register rk, Register rt, Register rf) { sel(&E::cmpbdb, rd, R(rj), R(rk), rt, rf); }
++  void seltstz(Register rd, Register rj, Register rk, Register rt, Register rf) { sel(&E::cmpandedb, rd, R(rj), R(rk), rt, rf); }
++  void seltstzi(Register rd, Register rj, int64_t mask, Register rt, Register rf) { sel(&E::cmpandedb, rd, R(rj), mask, rt, rf); }
++  // rd = (rj & rk) == 0, (rj & mask) == 0.
++  void tstz(Register rd, Register rj, Register rk) { set(&E::cmpandedb, rd, R(rj), R(rk)); }
++  void tstzi(Register rd, Register rj, int64_t mask) { set(&E::cmpandedb, rd, R(rj), mask); }
++  void tstnz(Register rd, Register rj, Register rk) { C(cmpandedb(0, R(rj), R(rk), PT0)); L(merged(0, 1, 0, D(rd), PT0)); }
++  void tstnzi(Register rd, Register rj, int64_t mask) { C(cmpandedb(0, R(rj), mask, PT0)); L(merged(0, 1, 0, D(rd), PT0)); }
+ 
+   // ---- memory --------------------------------------------------------------
+   void ld_b(Register rd, Register rj, int32_t si12) { load(&E::ldb, D(rd), rj, si12, 0); }
+@@ -900,6 +913,7 @@ class Assembler : private e2k::Assembler {
+   // LoongArch wants the sign extension.
+   void alu_w(Alu f, Register rd, e2k::Src1 a, e2k::Src2 b) { C((this->*f)(0, a, b, T0)); L(sxt(0, 2, T0, D(rd))); }
+   void set(Cmp f, Register rd, e2k::Src1 a, e2k::Src2 b) { C((this->*f)(0, a, b, PT0)); L(merged(0, 0, 1, D(rd), PT0)); }
++  void sel(Cmp f, Register rd, e2k::Src1 a, e2k::Src2 b, Register rt, Register rf) { C((this->*f)(0, a, b, PT0)); L(merged(0, R(rf), R(rt), D(rd), PT0)); }
+   void br(Cmp f, bool negate, e2k::Src1 a, e2k::Src2 b, int32_t offset) {
+     // Scheduled, the compare and the target go as early as they can, the
+     // transfer stays last; a rare branch stays one command.  Its compare
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+index 53f5a82e8b..c789f9bca7 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+@@ -3136,12 +3136,102 @@ void MacroAssembler::SelectWord(Register result, Register cond, Register v_true,
+     maskeqz(result, v_true, cond);
+   } else if (v_true == zero_reg) {
+     masknez(result, v_false, cond);
++  } else {
++    seleq(result, cond, zero_reg, v_false, v_true);
++  }
++}
++
++void MacroAssembler::SelectCmp(Register result, Condition cond, Register lhs,
++                               const Operand& rhs, Register v_true,
++                               Register v_false) {
++  UseScratchRegisterScope temps(this);
++  Register r = no_reg;
++  if (rhs.is_reg()) {
++    r = rhs.rm();
++  } else if (rhs.immediate() == 0 && RelocInfo::IsNoInfo(rhs.rmode())) {
++    r = zero_reg;
++  } else {
++    r = temps.Acquire();
++    DCHECK(!AreAliased(r, lhs, v_true, v_false));
++    li(r, rhs);
++  }
++  switch (cond) {
++    case eq:
++      seleq(result, lhs, r, v_true, v_false);
++      break;
++    case ne:
++      seleq(result, lhs, r, v_false, v_true);
++      break;
++    case less:
++      sellt(result, lhs, r, v_true, v_false);
++      break;
++    case greater_equal:
++      sellt(result, lhs, r, v_false, v_true);
++      break;
++    case greater:
++      sellt(result, r, lhs, v_true, v_false);
++      break;
++    case less_equal:
++      sellt(result, r, lhs, v_false, v_true);
++      break;
++    case Uless:
++      selltu(result, lhs, r, v_true, v_false);
++      break;
++    case Ugreater_equal:
++      selltu(result, lhs, r, v_false, v_true);
++      break;
++    case Ugreater:
++      selltu(result, r, lhs, v_true, v_false);
++      break;
++    case Uless_equal:
++      selltu(result, r, lhs, v_false, v_true);
++      break;
++    default:
++      UNREACHABLE();
++  }
++}
++
++void MacroAssembler::SelectTst(Register result, Condition cond, Register lhs,
++                               const Operand& rhs, Register v_true,
++                               Register v_false) {
++  DCHECK(cond == eq || cond == ne);
++  if (cond == ne) std::swap(v_true, v_false);
++  if (rhs.is_reg()) {
++    seltstz(result, lhs, rhs.rm(), v_true, v_false);
++  } else if (RelocInfo::IsNoInfo(rhs.rmode())) {
++    seltstzi(result, lhs, rhs.immediate(), v_true, v_false);
+   } else {
+     UseScratchRegisterScope temps(this);
+     Register scratch = temps.Acquire();
+-    maskeqz(scratch, v_true, cond);
+-    masknez(result, v_false, cond);
+-    or_(result, scratch, result);
++    li(scratch, rhs);
++    seltstz(result, lhs, scratch, v_true, v_false);
++  }
++}
++
++void MacroAssembler::CompareTst(Condition cond, Register result, Register lhs,
++                                const Operand& rhs) {
++  DCHECK(cond == eq || cond == ne);
++  if (rhs.is_reg()) {
++    if (cond == eq) {
++      tstz(result, lhs, rhs.rm());
++    } else {
++      tstnz(result, lhs, rhs.rm());
++    }
++  } else if (RelocInfo::IsNoInfo(rhs.rmode())) {
++    if (cond == eq) {
++      tstzi(result, lhs, rhs.immediate());
++    } else {
++      tstnzi(result, lhs, rhs.immediate());
++    }
++  } else {
++    UseScratchRegisterScope temps(this);
++    Register scratch = temps.Acquire();
++    And(scratch, lhs, rhs);
++    if (cond == eq) {
++      Sltu(result, scratch, 1);
++    } else {
++      Sltu(result, zero_reg, scratch);
++    }
+   }
+ }
+ 
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h
+index 528f45e6e4..a3eafc14ad 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h
+@@ -145,6 +145,16 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
+   // Select v_true if cond is non-zero, otherwise select v_false.
+   void SelectWord(Register result, Register cond, Register v_true,
+                   Register v_false);
++  // result = lhs <cond> rhs ? v_true : v_false; a value may be zero_reg and
++  // may be the result register.
++  void SelectCmp(Register result, Condition cond, Register lhs,
++                 const Operand& rhs, Register v_true, Register v_false);
++  // The same for (lhs & rhs) == 0 (eq), != 0 (ne).
++  void SelectTst(Register result, Condition cond, Register lhs,
++                 const Operand& rhs, Register v_true, Register v_false);
++  // result = (lhs & rhs) == 0 (eq), != 0 (ne).
++  void CompareTst(Condition cond, Register result, Register lhs,
++                  const Operand& rhs);
+ 
+   void CompareWord(Condition cond, Register dst, Register lhs,
+                    const Operand& rhs);
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index aa6e29fc12..94718faa68 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -4721,14 +4721,7 @@ void CodeGenerator::AssembleArchBoolean(Instruction* instr,
+ 
+   if (instr->arch_opcode() == kE2kTst) {
+     Condition cc = FlagsConditionToConditionTst(condition);
+-    UseScratchRegisterScope temps(masm());
+-    Register scratch = temps.Acquire();
+-    __ And(scratch, i.InputRegister(0), i.InputOperand(1));
+-    if (cc == eq) {
+-      __ Sltu(result, scratch, 1);
+-    } else {
+-      __ Sltu(result, zero_reg, scratch);
+-    }
++    __ CompareTst(cc, result, i.InputRegister(0), i.InputOperand(1));
+     return;
+   } else if (instr->arch_opcode() == kE2kAddOvf_w ||
+              instr->arch_opcode() == kE2kSubOvf_w) {
+@@ -4882,15 +4875,8 @@ void CodeGenerator::AssembleArchSelect(Instruction* instr,
+   if (instr->arch_opcode() == kE2kTst) {
+     DCHECK_GE(instr->InputCount(), 4);
+     Condition cc = FlagsConditionToConditionTst(condition);
+-    UseScratchRegisterScope temps(masm());
+-    Register scratch = temps.Acquire();
+-    if (cc == eq) {
+-      Register temp = v_true;
+-      v_true = v_false;
+-      v_false = temp;
+-    }
+-    __ And(scratch, i.InputRegister(0), i.InputOperand(1));
+-    __ SelectWord(result, scratch, v_true, v_false);
++    __ SelectTst(result, cc, i.InputRegister(0), i.InputOperand(1), v_true,
++                 v_false);
+     return;
+   } else if (instr->arch_opcode() == kE2kCmp64 ||
+              instr->arch_opcode() == kE2kCmp32 ||
+@@ -4913,34 +4899,8 @@ void CodeGenerator::AssembleArchSelect(Instruction* instr,
+       left = i.InputRegister(0);
+       right = i.InputOperand(1);
+     }
+-    if (v_true == zero_reg || v_false == zero_reg) {
+-      if (v_true == zero_reg) {
+-        v_true = v_false;
+-        cc = NegateCondition(cc);
+-      }
+-      UseScratchRegisterScope temps(masm());
+-      Register scratch = temps.Acquire();
+-      __ CompareWord(cc, scratch, left, right);
+-      __ maskeqz(result, v_true, scratch);
+-      return;
+-    } else if (result == v_true || result == v_false) {
+-      if (result == v_false) {
+-        v_false = v_true;
+-        cc = NegateCondition(cc);
+-      }
+-      Label done;
+-      __ Branch(&done, cc, left, right);
+-      __ Move(result, v_false);
+-      __ bind(&done);
+-    } else {
+-      Label true_label, done;
+-      __ Branch(&true_label, cc, left, right);
+-      __ Move(result, v_false);
+-      __ Branch(&done);
+-      __ bind(&true_label);
+-      __ Move(result, v_true);
+-      __ bind(&done);
+-    }
++    // A compare and a merge on its predicate: no branch over a move.
++    __ SelectCmp(result, cc, left, right, v_true, v_false);
+     return;
+   } else if (instr->arch_opcode() == kE2kAddOvf_w ||
+              instr->arch_opcode() == kE2kSubOvf_w) {

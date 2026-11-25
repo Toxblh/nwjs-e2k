@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Wed, 7 Oct 2026 20:17:28 +0100
+Subject: [PATCH 06/99] e2k: no trap-mode sanitizers (llvm.ubsantrap is not
+ lowered by lccrt)
+
+---
+ chromium/build/config/sanitizers/sanitizers.gni | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/chromium/build/config/sanitizers/sanitizers.gni b/chromium/build/config/sanitizers/sanitizers.gni
+index b5cdfd1857..7aa06f7b0c 100644
+--- a/chromium/build/config/sanitizers/sanitizers.gni
++++ b/chromium/build/config/sanitizers/sanitizers.gni
+@@ -534,7 +534,9 @@ template("ubsan_hardening") {
+     # *   the build is not for Wasm, which doesn't recognize any of
+     #     these sanitizer flags (see https://crrev.com/c/7911761), and
+     # *   the build is Clang, which provides the UBSan instrumentation.
+-    _condition = !is_ubsan && !is_wasm && is_clang
++    # *   the build is not for e2k, where the lccrt backend does not lower
++    #     the llvm.ubsantrap intrinsic.
++    _condition = !is_ubsan && !is_wasm && is_clang && current_cpu != "e2k"
+     if (defined(invoker.condition)) {
+       _condition = invoker.condition && _condition
+     }

@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Mon, 12 Oct 2026 09:32:26 +0100
+Subject: [PATCH 20/99] e2k: name the architecture on chrome://version and the
+ About page
+
+---
+ chromium/chrome/browser/ui/webui/version/version_ui.cc | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/chromium/chrome/browser/ui/webui/version/version_ui.cc b/chromium/chrome/browser/ui/webui/version/version_ui.cc
+index 4c523d48d8..945944a944 100644
+--- a/chromium/chrome/browser/ui/webui/version/version_ui.cc
++++ b/chromium/chrome/browser/ui/webui/version/version_ui.cc
+@@ -243,8 +243,13 @@ void VersionUI::AddVersionDetailStrings(content::WebUIDataSource* html_source) {
+                                   version_info::IsOfficialBuild()
+                                       ? IDS_VERSION_UI_OFFICIAL
+                                       : IDS_VERSION_UI_UNOFFICIAL);
++#if defined(ARCH_CPU_E2K)
++  // Not a grit string: there is no translation to pick up.
++  html_source->AddString(version_ui::kVersionProcessorVariation, "(e2k)");
++#else
+   html_source->AddLocalizedString(version_ui::kVersionProcessorVariation,
+                                   VersionProcessorVariation());
++#endif
+ 
+   // Data strings.
+   html_source->AddString(version_ui::kVersion,
+@@ -346,6 +351,10 @@ std::u16string VersionUI::GetAnnotatedVersionStringForUi() {
+                                     ? IDS_VERSION_UI_OFFICIAL
+                                     : IDS_VERSION_UI_UNOFFICIAL),
+       base::UTF8ToUTF16(GetProductModifier()),
++#if defined(ARCH_CPU_E2K)
++      u"(e2k)");
++#else
+       l10n_util::GetStringUTF16(VersionUI::VersionProcessorVariation()));
++#endif
+ }
+ #endif  // !BUILDFLAG(IS_ANDROID)

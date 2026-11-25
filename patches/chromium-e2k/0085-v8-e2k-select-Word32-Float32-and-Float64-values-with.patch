@@ -1,0 +1,315 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Fri, 16 Oct 2026 08:50:44 +0100
+Subject: [PATCH 85/99] v8: e2k: select Word32, Float32 and Float64 values with
+ merge
+
+Declare kWord32Select, kFloat32Select and kFloat64Select. A Word32
+select is the Word64 one (the values are sign-extended either way).
+Floating-point registers are general registers on e2k, so a float select
+is the same compare and merge on the predicate (fsel after a floating-
+point compare); the selector gives its values in registers and makes it
+only on a compare, a bit test or a floating-point compare.
+Math.round (Float64Round) and Math.sign lower to such selects.
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc  |  5 +++
+ chromium/v8/src/codegen/e2k/assembler-e2k.h   | 11 ++++++
+ chromium/v8/src/codegen/e2k/la_asm.h          |  7 ++++
+ .../v8/src/codegen/e2k/macro-assembler-e2k.cc | 30 +++++++++++++-
+ .../v8/src/codegen/e2k/macro-assembler-e2k.h  | 11 ++++++
+ .../backend/e2k/code-generator-e2k.cc         | 36 ++++++++++++++++-
+ .../backend/e2k/instruction-selector-e2k.cc   | 39 +++++++++++++------
+ 7 files changed, 126 insertions(+), 13 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index f76f9786f2..c148a055ea 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -1215,6 +1215,11 @@ void Assembler::sellt(Register rd, Register rj, Register rk, Register rt, Regist
+ void Assembler::selltu(Register rd, Register rj, Register rk, Register rt, Register rf) { LA(selltu(rd, rj, rk, rt, rf)); }
+ void Assembler::seltstz(Register rd, Register rj, Register rk, Register rt, Register rf) { LA(seltstz(rd, rj, rk, rt, rf)); }
+ void Assembler::seltstzi(Register rd, Register rj, int64_t mask, Register rt, Register rf) { LA(seltstzi(rd, rj, mask, rt, rf)); }
++void Assembler::seleq(FPURegister fd, Register rj, Register rk, FPURegister ft, FPURegister ff) { LA(seleq(fd, rj, rk, ft, ff)); }
++void Assembler::sellt(FPURegister fd, Register rj, Register rk, FPURegister ft, FPURegister ff) { LA(sellt(fd, rj, rk, ft, ff)); }
++void Assembler::selltu(FPURegister fd, Register rj, Register rk, FPURegister ft, FPURegister ff) { LA(selltu(fd, rj, rk, ft, ff)); }
++void Assembler::seltstz(FPURegister fd, Register rj, Register rk, FPURegister ft, FPURegister ff) { LA(seltstz(fd, rj, rk, ft, ff)); }
++void Assembler::seltstzi(FPURegister fd, Register rj, int64_t mask, FPURegister ft, FPURegister ff) { LA(seltstzi(fd, rj, mask, ft, ff)); }
+ void Assembler::tstz(Register rd, Register rj, Register rk) { LA(tstz(rd, rj, rk)); }
+ void Assembler::tstzi(Register rd, Register rj, int64_t mask) { LA(tstzi(rd, rj, mask)); }
+ void Assembler::tstnz(Register rd, Register rj, Register rk) { LA(tstnz(rd, rj, rk)); }
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index 26d37a9112..b27a3dd0f3 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -494,6 +494,17 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   void seltstz(Register rd, Register rj, Register rk, Register rt, Register rf);
+   void seltstzi(Register rd, Register rj, int64_t mask, Register rt,
+                 Register rf);
++  // The same into floating-point registers.
++  void seleq(FPURegister fd, Register rj, Register rk, FPURegister ft,
++             FPURegister ff);
++  void sellt(FPURegister fd, Register rj, Register rk, FPURegister ft,
++             FPURegister ff);
++  void selltu(FPURegister fd, Register rj, Register rk, FPURegister ft,
++              FPURegister ff);
++  void seltstz(FPURegister fd, Register rj, Register rk, FPURegister ft,
++               FPURegister ff);
++  void seltstzi(FPURegister fd, Register rj, int64_t mask, FPURegister ft,
++                FPURegister ff);
+   void tstz(Register rd, Register rj, Register rk);
+   void tstzi(Register rd, Register rj, int64_t mask);
+   void tstnz(Register rd, Register rj, Register rk);
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 93963ed116..1c44117d76 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -520,6 +520,12 @@ class Assembler : private e2k::Assembler {
+   void selltu(Register rd, Register rj, Register rk, Register rt, Register rf) { sel(&E::cmpbdb, rd, R(rj), R(rk), rt, rf); }
+   void seltstz(Register rd, Register rj, Register rk, Register rt, Register rf) { sel(&E::cmpandedb, rd, R(rj), R(rk), rt, rf); }
+   void seltstzi(Register rd, Register rj, int64_t mask, Register rt, Register rf) { sel(&E::cmpandedb, rd, R(rj), mask, rt, rf); }
++  // The same into floating-point registers (general registers on e2k).
++  void seleq(FPURegister fd, Register rj, Register rk, FPURegister ft, FPURegister ff) { fselc(&E::cmpedb, fd, R(rj), R(rk), ft, ff); }
++  void sellt(FPURegister fd, Register rj, Register rk, FPURegister ft, FPURegister ff) { fselc(&E::cmpldb, fd, R(rj), R(rk), ft, ff); }
++  void selltu(FPURegister fd, Register rj, Register rk, FPURegister ft, FPURegister ff) { fselc(&E::cmpbdb, fd, R(rj), R(rk), ft, ff); }
++  void seltstz(FPURegister fd, Register rj, Register rk, FPURegister ft, FPURegister ff) { fselc(&E::cmpandedb, fd, R(rj), R(rk), ft, ff); }
++  void seltstzi(FPURegister fd, Register rj, int64_t mask, FPURegister ft, FPURegister ff) { fselc(&E::cmpandedb, fd, R(rj), mask, ft, ff); }
+   // rd = (rj & rk) == 0, (rj & mask) == 0.
+   void tstz(Register rd, Register rj, Register rk) { set(&E::cmpandedb, rd, R(rj), R(rk)); }
+   void tstzi(Register rd, Register rj, int64_t mask) { set(&E::cmpandedb, rd, R(rj), mask); }
+@@ -982,6 +988,7 @@ class Assembler : private e2k::Assembler {
+   void alu_w(Alu f, Register rd, e2k::Src1 a, e2k::Src2 b) { C((this->*f)(0, a, b, T0)); L(sxt(0, 2, T0, D(rd))); }
+   void set(Cmp f, Register rd, e2k::Src1 a, e2k::Src2 b) { C((this->*f)(0, a, b, PT0)); L(merged(0, 0, 1, D(rd), PT0)); }
+   void sel(Cmp f, Register rd, e2k::Src1 a, e2k::Src2 b, Register rt, Register rf) { C((this->*f)(0, a, b, PT0)); L(merged(0, R(rf), R(rt), D(rd), PT0)); }
++  void fselc(Cmp f, FPURegister fd, e2k::Src1 a, e2k::Src2 b, FPURegister ft, FPURegister ff) { C((this->*f)(0, a, b, PT0)); L(merged(0, F(ff), F(ft), F(fd), PT0)); }
+   void br(Cmp f, bool negate, e2k::Src1 a, e2k::Src2 b, int32_t offset) {
+     // Scheduled, the compare and the target go as early as they can, the
+     // transfer stays last; a rare branch stays one command.  Its compare
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+index a9884de310..3335e9499d 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+@@ -3154,6 +3154,18 @@ void MacroAssembler::SelectWord(Register result, Register cond, Register v_true,
+ void MacroAssembler::SelectCmp(Register result, Condition cond, Register lhs,
+                                const Operand& rhs, Register v_true,
+                                Register v_false) {
++  SelectCmpT(result, cond, lhs, rhs, v_true, v_false);
++}
++
++void MacroAssembler::SelectCmp(FPURegister result, Condition cond,
++                               Register lhs, const Operand& rhs,
++                               FPURegister v_true, FPURegister v_false) {
++  SelectCmpT(result, cond, lhs, rhs, v_true, v_false);
++}
++
++template <typename R>
++void MacroAssembler::SelectCmpT(R result, Condition cond, Register lhs,
++                                const Operand& rhs, R v_true, R v_false) {
+   UseScratchRegisterScope temps(this);
+   Register r = no_reg;
+   if (rhs.is_reg()) {
+@@ -3162,7 +3174,11 @@ void MacroAssembler::SelectCmp(Register result, Condition cond, Register lhs,
+     r = zero_reg;
+   } else {
+     r = temps.Acquire();
+-    DCHECK(!AreAliased(r, lhs, v_true, v_false));
++    if constexpr (std::is_same_v<R, Register>) {
++      DCHECK(!AreAliased(r, lhs, v_true, v_false));
++    } else {
++      DCHECK(!AreAliased(r, lhs));
++    }
+     li(r, rhs);
+   }
+   switch (cond) {
+@@ -3204,6 +3220,18 @@ void MacroAssembler::SelectCmp(Register result, Condition cond, Register lhs,
+ void MacroAssembler::SelectTst(Register result, Condition cond, Register lhs,
+                                const Operand& rhs, Register v_true,
+                                Register v_false) {
++  SelectTstT(result, cond, lhs, rhs, v_true, v_false);
++}
++
++void MacroAssembler::SelectTst(FPURegister result, Condition cond,
++                               Register lhs, const Operand& rhs,
++                               FPURegister v_true, FPURegister v_false) {
++  SelectTstT(result, cond, lhs, rhs, v_true, v_false);
++}
++
++template <typename R>
++void MacroAssembler::SelectTstT(R result, Condition cond, Register lhs,
++                                const Operand& rhs, R v_true, R v_false) {
+   DCHECK(cond == eq || cond == ne);
+   if (cond == ne) std::swap(v_true, v_false);
+   if (rhs.is_reg()) {
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h
+index 0b32d89e64..07aec471c2 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h
+@@ -152,6 +152,17 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
+   // The same for (lhs & rhs) == 0 (eq), != 0 (ne).
+   void SelectTst(Register result, Condition cond, Register lhs,
+                  const Operand& rhs, Register v_true, Register v_false);
++  // Both into floating-point registers (Float32Select, Float64Select).
++  void SelectCmp(FPURegister result, Condition cond, Register lhs,
++                 const Operand& rhs, FPURegister v_true, FPURegister v_false);
++  void SelectTst(FPURegister result, Condition cond, Register lhs,
++                 const Operand& rhs, FPURegister v_true, FPURegister v_false);
++  template <typename R>
++  void SelectCmpT(R result, Condition cond, Register lhs, const Operand& rhs,
++                  R v_true, R v_false);
++  template <typename R>
++  void SelectTstT(R result, Condition cond, Register lhs, const Operand& rhs,
++                  R v_true, R v_false);
+   // result = (lhs & rhs) == 0 (eq), != 0 (ne).
+   void CompareTst(Condition cond, Register result, Register lhs,
+                   const Operand& rhs);
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index 4e535b0e0f..9596a3a0c5 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -4954,13 +4954,47 @@ void CodeGenerator::AssembleArchSelect(Instruction* instr,
+   // calculate the indices of the last two inputs.
+   size_t true_value_index = instr->InputCount() - 2;
+   size_t false_value_index = instr->InputCount() - 1;
++  if (instr->OutputAt(output_index)->IsFPRegister()) {
++    // Float32Select, Float64Select: the merge takes the floating-point
++    // registers as they are (general registers on e2k); the selector gives
++    // them in registers and only with these conditions.
++    FPURegister result = i.OutputDoubleRegister(output_index);
++    FPURegister v_true = i.InputDoubleRegister(true_value_index);
++    FPURegister v_false = i.InputDoubleRegister(false_value_index);
++    switch (instr->arch_opcode()) {
++      case kE2kTst:
++        __ SelectTst(result, FlagsConditionToConditionTst(condition),
++                     i.InputRegister(0), i.InputOperand(1), v_true, v_false);
++        return;
++      case kE2kCmp32:
++      case kE2kCmp64:
++        __ SelectCmp(result, FlagsConditionToConditionCmp(condition),
++                     i.InputRegister(0), i.InputOperand(1), v_true, v_false);
++        return;
++      case kE2kFloat32Cmp:
++      case kE2kFloat64Cmp: {
++        bool predicate;
++        FlagsConditionToConditionCmpFPU(&predicate, condition);
++        if (predicate) {
++          __ fsel(FCC0, result, v_false, v_true);
++        } else {
++          __ fsel(FCC0, result, v_true, v_false);
++        }
++        return;
++      }
++      default:
++        UNREACHABLE();
++    }
++  }
+   Register result = i.OutputRegister(output_index);
+   Register v_true = i.InputOrZeroRegister(true_value_index);
+   Register v_false = i.InputOrZeroRegister(false_value_index);
+ 
+   DCHECK(
+       LocationOperand::cast(instr->OutputAt(output_index))->representation() ==
+-      MachineRepresentation::kWord64);
++          MachineRepresentation::kWord64 ||
++      LocationOperand::cast(instr->OutputAt(output_index))->representation() ==
++          MachineRepresentation::kWord32);
+ 
+   if (instr->arch_opcode() == kE2kTst) {
+     DCHECK_GE(instr->InputCount(), 4);
+diff --git a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+index 5a042ef0c4..938a89e838 100644
+--- a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+@@ -66,6 +66,16 @@ class E2kOperandGenerator final : public OperandGenerator {
+     return UseRegisterAtEnd(node);
+   }
+ 
++  // A value of a select: zero may be the immediate, but not for floating
++  // point, which the merge takes in registers.
++  InstructionOperand UseSelectValue(OpIndex node, bool at_end = false) {
++    if (selector()->Get(node).outputs_rep()[0].IsFloat()) {
++      return at_end ? UseRegisterAtEnd(node) : UseRegister(node);
++    }
++    return at_end ? UseRegisterAtEndOrImmediateZero(node)
++                  : UseRegisterOrImmediateZero(node);
++  }
++
+   bool IsIntegerConstant(OpIndex node) {
+     int64_t unused;
+     return selector()->MatchSignedIntegralConstant(node, &unused);
+@@ -381,10 +391,8 @@ static void VisitBinop(InstructionSelector* selector, turboshaft::OpIndex node,
+   }
+ 
+   if (cont->IsSelect()) {
+-    inputs[input_count++] =
+-        g.UseRegisterAtEndOrImmediateZero(cont->true_value());
+-    inputs[input_count++] =
+-        g.UseRegisterAtEndOrImmediateZero(cont->false_value());
++    inputs[input_count++] = g.UseSelectValue(cont->true_value(), true);
++    inputs[input_count++] = g.UseSelectValue(cont->false_value(), true);
+   }
+ 
+   outputs[output_count++] = g.DefineAsRegister(node);
+@@ -2238,8 +2246,8 @@ static Instruction* VisitCompare(InstructionSelector* selector,
+   inputs[input_count++] = left;
+   inputs[input_count++] = right;
+   if (cont->IsSelect()) {
+-    inputs[input_count++] = g.UseRegisterOrImmediateZero(cont->true_value());
+-    inputs[input_count++] = g.UseRegisterOrImmediateZero(cont->false_value());
++    inputs[input_count++] = g.UseSelectValue(cont->true_value());
++    inputs[input_count++] = g.UseSelectValue(cont->false_value());
+   }
+ #ifdef V8_COMPRESS_POINTERS
+   if (opcode == kE2kCmp32) {
+@@ -2767,8 +2775,8 @@ void InstructionSelector::VisitStackPointerGreaterThan(
+   inputs[input_count++] = g.UseRegisterWithMode(value, register_mode);
+ 
+   if (cont->IsSelect()) {
+-    inputs[input_count++] = g.UseRegisterOrImmediateZero(cont->true_value());
+-    inputs[input_count++] = g.UseRegisterOrImmediateZero(cont->false_value());
++    inputs[input_count++] = g.UseSelectValue(cont->true_value());
++    inputs[input_count++] = g.UseSelectValue(cont->false_value());
+   }
+   EmitWithContinuation(opcode, output_count, outputs, input_count, inputs,
+                        temp_count, temps, cont);
+@@ -2779,6 +2787,11 @@ void InstructionSelector::VisitWordCompareZero(OpIndex user, OpIndex value,
+                                                FlagsContinuation* cont) {
+   {
+     E2kOperandGenerator g(this);
++    // A floating-point select is made only on a compare, a bit test or a
++    // floating-point compare (AssembleArchSelect).
++    const bool float_select =
++        cont->IsSelect() &&
++        Get(cont->true_value()).outputs_rep()[0].IsFloat();
+     // Try to combine with comparisons against 0 by simply inverting the branch.
+     while (const ComparisonOp* equal =
+                this->TryCast<Opmask::kWord32Equal>(value)) {
+@@ -2871,7 +2884,8 @@ void InstructionSelector::VisitWordCompareZero(OpIndex user, OpIndex value,
+             break;
+         }
+       } else if (const ProjectionOp* projection =
+-                     value_op.TryCast<ProjectionOp>()) {
++                     value_op.TryCast<ProjectionOp>();
++                 projection != nullptr && !float_select) {
+         // Check if this is the overflow output projection of an
+         // <Operation>WithOverflow node.
+         if (projection->index == 1u) {
+@@ -2912,7 +2926,7 @@ void InstructionSelector::VisitWordCompareZero(OpIndex user, OpIndex value,
+         }
+         VisitWordCompare(this, value, kE2kTst, cont, true);
+         return;
+-      } else if (value_op.Is<StackPointerGreaterThanOp>()) {
++      } else if (value_op.Is<StackPointerGreaterThanOp>() && !float_select) {
+         cont->OverwriteAndNegateIfEqual(kStackPointerGreaterThanCondition);
+         return VisitStackPointerGreaterThan(value, cont);
+       }
+@@ -4016,7 +4030,10 @@ InstructionSelector::SupportedMachineOperatorFlags() {
+          MachineOperatorBuilder::kFloat32RoundTruncate |
+          MachineOperatorBuilder::kFloat64RoundTiesEven |
+          MachineOperatorBuilder::kFloat32RoundTiesEven |
+-         MachineOperatorBuilder::kWord64Select;
++         MachineOperatorBuilder::kWord32Select |
++         MachineOperatorBuilder::kWord64Select |
++         MachineOperatorBuilder::kFloat32Select |
++         MachineOperatorBuilder::kFloat64Select;
+ }
+ 
+ // static

@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 14:21:02 +0100
+Subject: [PATCH 52/99] v8: e2k: pack the literals of a command once per
+ placement
+
+The scheduler asked whether a group joined a command, how long the
+command became, whether the linked branches stayed in place and then the
+length again: four packings of the literals (plan/search) for one
+placement, half of the profile of baseline compilation. joined_size()
+answers the first two with one packing and the rest reuse it. Compiling
+with the scheduler: 0.95 s -> 0.70 s on a 107 KB script under
+--always-sparkplug (0.64 s without the scheduler); the code is the same.
+---
+ chromium/v8/src/codegen/e2k/e2k_asm.h | 3 +++
+ chromium/v8/src/codegen/e2k/la_asm.h  | 8 ++++----
+ 2 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/e2k_asm.h b/chromium/v8/src/codegen/e2k/e2k_asm.h
+index 69bb752fed..3b073d413d 100644
+--- a/chromium/v8/src/codegen/e2k/e2k_asm.h
++++ b/chromium/v8/src/codegen/e2k/e2k_asm.h
+@@ -166,6 +166,9 @@ class Assembler : public Command {
+     memset(map_, -1, sizeof map_); join_ = true; bad_ = false; lanes_ = nullptr;
+   }
+   bool joined() const { return !bad_ && fits(); }
++  // joined() and size() with one packing of the literals: the size in bytes
++  // of the command the operations joined, 0 when they did not.
++  int joined_size() const { Plan p; return !bad_ && plan(p) ? ((p.total + 1) & ~1) * 4 : 0; }
+   // A command with a control transfer (the code after it may be entered from
+   // elsewhere), a CS1 syllable (window, call, mas, wait) or a write to a
+   // state register takes nothing more.
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 72386eee2f..6da51cf323 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -850,8 +850,8 @@ class Assembler : private e2k::Assembler {
+       int t = earliest(g) - now_;
+       at_ = solo_ ? n : g.ss ? std::max(t, n - 1) : t;
+       if (g.rare) windows[kRare]++; else if (solo_ || g.ss) ends_ = g.ss ? kTransfer : kState;
+-    } else if (joined() && size() <= kMaxCommand && stays(at_, size(), has_cs0_)) {
+-      return put(*this, noted());
++    } else if (int size = joined_size(); size && size <= kMaxCommand && stays(at_, size, has_cs0_)) {
++      return put(*this, noted(), size);
+     } else if (at_ >= first_new_) {
+       return put(lone_, group_);  // it does not go into an empty command either
+     } else {
+@@ -865,10 +865,10 @@ class Assembler : private e2k::Assembler {
+     extend(lanes_); note();
+     return false;
+   }
+-  bool put(const e2k::Command& c, const e2k::Note& g) {
++  bool put(const e2k::Command& c, const e2k::Note& g, int size = 0) {
+     static_cast<e2k::Command&>(*this) = c;
+     counts_.joined += at_ < first_new_;
+-    win_[at_].c = c; win_[at_].size = size();
++    win_[at_].c = c; win_[at_].size = size ? size : this->size();
+     if (g.rare) win_[at_].linked = true;
+     drop();
+     seen(g, now_ + at_);

@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Wed, 14 Oct 2026 22:37:12 +0100
+Subject: [PATCH 77/99] v8: look up wasm code only for wasm frames, and read a
+ frame's type once
+
+With WebAssembly enabled every step of a stack walk asked the wasm code
+manager whether the PC is in wasm code, also for JS and builtin frames,
+and called the virtual StackFrame::type() several times for one frame.
+Throwing in JS walks the stack several times (message location,
+Error.stack, handler search). ComputeStackFrameType now asks the wasm
+code manager only when the frame marker is one of the wasm frame types
+(or there is no frame pointer), and StackFrameIterator::Advance and
+Isolate::UnwindAndFindHandler read the type once per frame.
+
+On Elbrus-8SV, bench.js tryCatch with wasm against without: +16.6 % before,
+about +10 % with these and the trap PC change.
+---
+ chromium/v8/src/execution/frames.cc  | 59 ++++++++++++++++++++++------
+ chromium/v8/src/execution/isolate.cc |  5 ++-
+ 2 files changed, 51 insertions(+), 13 deletions(-)
+
+diff --git a/chromium/v8/src/execution/frames.cc b/chromium/v8/src/execution/frames.cc
+index 55cd51c2b5..b63e1c9cab 100644
+--- a/chromium/v8/src/execution/frames.cc
++++ b/chromium/v8/src/execution/frames.cc
+@@ -193,6 +193,9 @@ StackFrameIterator::StackFrameIterator(Isolate* isolate,
+ 
+ void StackFrameIterator::Advance() {
+   DCHECK(!done());
++  // The current frame's class does not change until SetNewFrame below.
++  // Avoid repeated virtual calls when checking wasm and entry frames.
++  const StackFrame::Type current_type = frame_->type();
+   // Compute the state of the calling frame before restoring
+   // callee-saved registers and unwinding handlers. This allows the
+   // frame code that computes the caller state to access the top
+@@ -201,11 +204,11 @@ void StackFrameIterator::Advance() {
+   StackFrame::Type type;
+   state.iteration_depth = frame_->iteration_depth() + 1;
+ #if V8_ENABLE_WEBASSEMBLY
+-  if (((frame_->type() == StackFrame::WASM_JSPI &&
++  if (((current_type == StackFrame::WASM_JSPI &&
+         Memory<Address>(frame_->fp() +
+                         WasmJspiFrameConstants::kCallerFPOffset) ==
+             kNullAddress) ||
+-       frame_->type() == StackFrame::WASM_STACK_ENTRY) &&
++       current_type == StackFrame::WASM_STACK_ENTRY) &&
+       !first_stack_only_) {
+     // Handle stack switches here.
+     // For JSPI, both the parent stack exit frame and child stack entry frame
+@@ -218,9 +221,9 @@ void StackFrameIterator::Advance() {
+     type = StackFrame::MarkerToType(
+         Memory<intptr_t>(wasm_stack_->jmpbuf()->fp +
+                          CommonFrameConstants::kContextOrFrameTypeOffset));
+-    DCHECK((frame_->type() == StackFrame::WASM_JSPI &&
++    DCHECK((current_type == StackFrame::WASM_JSPI &&
+             type == StackFrame::WASM_JSPI) ||
+-           (frame_->type() == StackFrame::WASM_STACK_ENTRY &&
++           (current_type == StackFrame::WASM_STACK_ENTRY &&
+             type == StackFrame::WASM_STACK_EXIT));
+     SetNewFrame(type, &state);
+     return;
+@@ -232,10 +235,10 @@ void StackFrameIterator::Advance() {
+   // to higher addresses as we iterate the stack. This breaks with
+   // stack-switching, so only unwind the stack handlers for frames that are
+   // known to use them.
+-  if (frame_->type() == StackFrame::ENTRY ||
+-      frame_->type() == StackFrame::CONSTRUCT_ENTRY
++  if (current_type == StackFrame::ENTRY ||
++      current_type == StackFrame::CONSTRUCT_ENTRY
+ #if V8_ENABLE_WEBASSEMBLY
+-      || frame_->type() == StackFrame::C_WASM_ENTRY
++      || current_type == StackFrame::C_WASM_ENTRY
+ #endif
+   ) {
+     StackHandlerIterator it(frame_, handler_);
+@@ -945,10 +948,44 @@ StackFrame::Type StackFrameIterator::ComputeStackFrameType(
+   const Address pc = StackFrame::unauthenticated_pc(state->pc_address);
+ 
+ #if V8_ENABLE_WEBASSEMBLY
+-  // If the {pc} does not point into WebAssembly code we can rely on the
+-  // returned {wasm_code} to be null and fall back to {GetContainingCode}.
+-  if (wasm::WasmCode* wasm_code =
+-          wasm::GetWasmCodeManager()->LookupCode(isolate(), pc)) {
++  // Only wasm frame types can belong to native wasm code. Skip the wasm
++  // code cache for JS and builtin frames, including while capturing an
++  // Error stack. Keep the null-FP stack-entry case unchanged.
++  bool may_be_wasm_frame = true;
++  if (state->fp != kNullAddress) {
++    MSAN_MEMORY_IS_INITIALIZED(
++        state->fp + CommonFrameConstants::kContextOrFrameTypeOffset,
++        kSystemPointerSize);
++    const intptr_t marker = Memory<intptr_t>(
++        state->fp + CommonFrameConstants::kContextOrFrameTypeOffset);
++    may_be_wasm_frame = false;
++    if (StackFrame::IsTypeMarker(marker)) {
++      switch (StackFrame::MarkerToType(marker)) {
++        case StackFrame::JS_TO_WASM:
++        case StackFrame::WASM_JSPI:
++        case StackFrame::WASM:
++        case StackFrame::WASM_DEBUG_BREAK:
++        case StackFrame::WASM_EXIT:
++        case StackFrame::WASM_LIFTOFF_SETUP:
++        case StackFrame::WASM_TO_JS:
++        case StackFrame::WASM_SEGMENT_START:
++        case StackFrame::WASM_STACK_ENTRY:
++        case StackFrame::WASM_STACK_EXIT:
++        case StackFrame::C_WASM_ENTRY:
++#if V8_ENABLE_DRUMBRAKE
++        case StackFrame::WASM_INTERPRETER_ENTRY:
++#endif
++          may_be_wasm_frame = true;
++          break;
++        default:
++          break;
++      }
++    }
++  }
++  wasm::WasmCode* wasm_code =
++      may_be_wasm_frame ? wasm::GetWasmCodeManager()->LookupCode(isolate(), pc)
++                        : nullptr;
++  if (wasm_code != nullptr) {
+     switch (wasm_code->kind()) {
+       case wasm::WasmCode::kWasmFunction:
+         return StackFrame::WASM;
+diff --git a/chromium/v8/src/execution/isolate.cc b/chromium/v8/src/execution/isolate.cc
+index 151e131913..6afc6df502 100644
+--- a/chromium/v8/src/execution/isolate.cc
++++ b/chromium/v8/src/execution/isolate.cc
+@@ -2989,8 +2989,9 @@ Tagged<Object> Isolate::UnwindAndFindHandler() {
+       continue;
+     }
+     int visited_frames = iter.frame()->iteration_depth();
++    const StackFrame::Type frame_type = iter.frame()->type();
+ #if V8_ENABLE_WEBASSEMBLY
+-    if (iter.frame()->type() == StackFrame::WASM_JSPI) {
++    if (frame_type == StackFrame::WASM_JSPI) {
+       if (catchable_by_js && iter.frame()->LookupCode()->builtin_id() !=
+                                  Builtin::kJSToWasmStressSwitchStacksAsm) {
+         Tagged<Code> code =
+@@ -3055,7 +3056,7 @@ Tagged<Object> Isolate::UnwindAndFindHandler() {
+                           visited_frames);
+     }
+ 
+-    switch (frame->type()) {
++    switch (frame_type) {
+       case StackFrame::ENTRY:
+       case StackFrame::CONSTRUCT_ENTRY: {
+         // For JSEntry frames we always have a handler.

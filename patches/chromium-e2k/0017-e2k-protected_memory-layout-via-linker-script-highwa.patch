@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Sun, 11 Oct 2026 08:00:57 +0100
+Subject: [PATCH 17/99] e2k: protected_memory layout via linker script, highway
+ and s2cellid without x86 paths
+
+---
+ chromium/build/config/linux/BUILD.gn              |  6 ++++++
+ .../build/config/linux/e2k_protected_memory.ld    | 15 +++++++++++++++
+ .../highway/hwy/detect_compiler_arch.h            |  3 ++-
+ .../s2cellid/src/s2/util/math/mathutil.h          |  4 +++-
+ 4 files changed, 26 insertions(+), 2 deletions(-)
+ create mode 100644 chromium/build/config/linux/e2k_protected_memory.ld
+
+diff --git a/chromium/build/config/linux/BUILD.gn b/chromium/build/config/linux/BUILD.gn
+index 175ea38a3b..b96182c7cc 100644
+--- a/chromium/build/config/linux/BUILD.gn
++++ b/chromium/build/config/linux/BUILD.gn
+@@ -43,6 +43,12 @@ config("runtime_library") {
+       (!use_custom_libcxx || current_cpu == "mipsel" || current_cpu == "e2k")) {
+     libs = [ "atomic" ]
+   }
++
++  if (current_cpu == "e2k") {
++    # See the comment in the script.
++    ldflags = [ "-Wl,-T," + rebase_path("e2k_protected_memory.ld",
++                                        root_build_dir) ]
++  }
+ }
+ 
+ config("libcap") {
+diff --git a/chromium/build/config/linux/e2k_protected_memory.ld b/chromium/build/config/linux/e2k_protected_memory.ld
+new file mode 100644
+index 0000000000..4c2faba91f
+--- /dev/null
++++ b/chromium/build/config/linux/e2k_protected_memory.ld
+@@ -0,0 +1,15 @@
++/* clang for e2k does not honour the section attribute of inline variables, so
++ * the page-aligned `writers` guard of base/memory/protected_memory.h does not
++ * end up in the protected_memory section. Put it there, and pad the section to
++ * a page boundary in place of protected_memory_buffer. */
++SECTIONS
++{
++  protected_memory : ALIGN(4096)
++  {
++    *(.data._ZN4base22AutoWritableMemoryBase10WriterData7writersE)
++    *(.bss._ZN4base22AutoWritableMemoryBase10WriterData7writersE)
++    *(protected_memory)
++    . = ALIGN(4096);
++  }
++}
++INSERT AFTER .data;
+diff --git a/chromium/third_party/libaom/source/libaom/third_party/highway/hwy/detect_compiler_arch.h b/chromium/third_party/libaom/source/libaom/third_party/highway/hwy/detect_compiler_arch.h
+index 1810a5434d..fca7dba437 100644
+--- a/chromium/third_party/libaom/source/libaom/third_party/highway/hwy/detect_compiler_arch.h
++++ b/chromium/third_party/libaom/source/libaom/third_party/highway/hwy/detect_compiler_arch.h
+@@ -442,7 +442,8 @@
+ #define HWY_ARCH_MAX_BYTES 64
+ #elif HWY_ARCH_WASM || HWY_ARCH_LOONGARCH
+ #define HWY_ARCH_MAX_BYTES 32
+-#elif HWY_ARCH_PPC || HWY_ARCH_S390X || HWY_ARCH_ARM_V7 || HWY_ARCH_ARM_OLD
++#elif HWY_ARCH_PPC || HWY_ARCH_S390X || HWY_ARCH_ARM_V7 || \
++    HWY_ARCH_ARM_OLD || defined(__e2k__)
+ #define HWY_ARCH_MAX_BYTES 16
+ #else
+ #error "Missing case for HWY_ARCH_*"
+diff --git a/chromium/third_party/s2cellid/src/s2/util/math/mathutil.h b/chromium/third_party/s2cellid/src/s2/util/math/mathutil.h
+index f383566c41..da01053b68 100644
+--- a/chromium/third_party/s2cellid/src/s2/util/math/mathutil.h
++++ b/chromium/third_party/s2cellid/src/s2/util/math/mathutil.h
+@@ -103,7 +103,9 @@ class MathUtil {
+ // is no advantage to passing an argument type of "float" on Intel
+ // architectures anyway.
+ 
+-#if defined __GNUC__ && (defined __i386__ || defined __SSE2__)
++// clang for e2k predefines __SSE2__ but has no x86 inline assembly.
++#if defined __GNUC__ && (defined __i386__ || defined __SSE2__) && \
++    !defined __e2k__
+ #if defined __SSE2__
+     // SSE2.
+     int32_t result;

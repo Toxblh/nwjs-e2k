@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Sat, 7 Nov 2026 20:00:55 +0400
+Subject: [PATCH 98/99] v8: e2k: place literals without the exhaustive search
+ where it is known
+
+e2k::Assembler::plan and search ran the exhaustive literal placement
+search for every plan of a command with literals, and join() plans a
+command again for every operation offered to it: with end() they were
+7-13 % of all cycles (compile threads) of the compile-heavy JetStream 3
+tests on 4x8SV.
+
+- no literal: nothing to place; one literal: its first choice;
+- when no 16-bit piece of a literal equals a piece of another one, more
+  than eight halves at the natural sizes cannot fit, and a greedy
+  placement that fills exactly the lowest halves is what the search
+  returns;
+- otherwise a per-thread cache of search results, failures included;
+- the search last.
+
+The same bytes as before: checked against the old encoder on 2 000 000
+random commands (patch 0005 of browser/patches/v8-hot in e2k-rjit,
+ported unchanged).  JetStream 3, 4 cores: CPU time -1...-5 % on
+typescript-lib, web-ssr, babel-wtb, prettier-wtb; scores unchanged.
+---
+ chromium/v8/src/codegen/e2k/e2k_asm.h | 98 ++++++++++++++++++++++++++-
+ 1 file changed, 97 insertions(+), 1 deletion(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/e2k_asm.h b/chromium/v8/src/codegen/e2k/e2k_asm.h
+index da706d7f53..7903bfccb9 100644
+--- a/chromium/v8/src/codegen/e2k/e2k_asm.h
++++ b/chromium/v8/src/codegen/e2k/e2k_asm.h
+@@ -526,6 +526,94 @@ class Assembler : public Command {
+     if (o.label || l.label) return o.label == l.label && h.sub == i;
+     return uint16_t(uint64_t(o.v) >> 16 * h.sub) == uint16_t(uint64_t(l.v) >> 16 * i);
+   }
++  // Puts the literals at the choices idx[] in placement order; a half already
++  // taken is shared (the search only makes such choices when the pieces match).
++  void replay(Plan& p, const int* order, const uint8_t* idx) const {
++    unsigned m = 0;
++    for (Half& h : p.half_lts) h = Half{-1, 0};
++    for (int k = 0; k < nlits_; k++) {
++      const Lit& l = lits_[order[k]];
++      uint8_t pos[11], size[11];
++      choices(l, pos, size);
++      int c = idx[order[k]];
++      for (int i = 0; i < size[c]; i++) {
++        Half& x = p.half_lts[pos[c] + i];
++        if (x.owner < 0) { x.owner = int8_t(order[k]); x.sub = uint8_t(i); m |= 1u << ((pos[c] + i) ^ 1); }
++      }
++    }
++    p.best = m; memcpy(p.choice, idx, 7);
++  }
++  // Without the search (the same encoder change as e2k-rjit src/asm, hwfacts):
++  // when no 16-bit piece of a literal equals a piece of another one, nothing
++  // can be shared, so (1) more than eight halves at the natural sizes cannot
++  // fit (widening only adds halves): p.best = 0x100; (2) a greedy placement
++  // (each literal at its first free choice, in placement order) that fills
++  // exactly the lowest bits of the mask is the first leaf of the search with
++  // the smallest mask, i.e. what the search returns.  False: search.
++  bool greedy(Plan& p, const int* order) const {
++    static const uint8_t natural[3] = {1, 2, 4};
++    int k = 0;
++    for (int i = 0; i < nlits_; i++) {
++      const Lit& a = lits_[i];
++      int na = a.ch < 0 ? 2 : natural[a.cls];
++      k += na;
++      for (int j = 0; j < nlits_; j++) {
++        if (j == i) continue;
++        const Lit& b = lits_[j];
++        if (a.label || b.label) { if (a.label == b.label) return false; continue; }
++        for (int x = 0; x < na; x++)
++          for (int y = 0; y < 4; y++)
++            if (uint16_t(uint64_t(a.v) >> 16 * x) == uint16_t(uint64_t(b.v) >> 16 * y)) return false;
++      }
++    }
++    if (k > 8) { p.best = 0x100; return true; }
++    unsigned used = 0, m = 0;
++    uint8_t idx[7] = {};
++    for (int q = 0; q < nlits_; q++) {
++      const Lit& l = lits_[order[q]];
++      uint8_t pos[11], size[11];
++      int n = choices(l, pos, size), c = 0;
++      for (; c < n; c++) { unsigned bits = ((1u << size[c]) - 1) << pos[c]; if (!(used & bits)) { used |= bits; break; } }
++      if (c == n) return false;
++      idx[order[q]] = uint8_t(c);
++      for (int i = 0; i < size[c]; i++) m |= 1u << ((pos[c] + i) ^ 1);
++    }
++    if (m != (1u << k) - 1) return false;
++    replay(p, order, idx);
++    return true;
++  }
++  // The search gives the same placement whenever the literals are the same
++  // (sizes, kinds, values or labels): a small per-thread cache of its results,
++  // failures included (a command that does not fit is tried again and again
++  // by join()).
++  struct LitKey { int8_t n; uint8_t meta[7]; int64_t v[7]; uint8_t choice[7]; };
++  static LitKey* lit_cache() { static thread_local LitKey t[256]; return t; }
++  void lit_key(LitKey& k, unsigned* h) const {
++    memset(&k, 0, sizeof k);
++    k.n = int8_t(nlits_);
++    uint64_t x = 1469598103934665603ull;
++    for (int i = 0; i < nlits_; i++) {
++      const Lit& l = lits_[i];
++      k.meta[i] = uint8_t(l.cls | (l.ch < 0) << 2 | (l.label != nullptr) << 4);
++      k.v[i] = l.label ? int64_t(reinterpret_cast<intptr_t>(l.label)) : l.v;
++      x = (x ^ k.meta[i]) * 1099511628211ull; x = (x ^ uint64_t(k.v[i])) * 1099511628211ull;
++    }
++    *h = unsigned(x ^ x >> 29) & 255;
++  }
++  bool lit_cache_get(Plan& p, const int* order) const {
++    LitKey k; unsigned h; lit_key(k, &h);
++    const LitKey& e = lit_cache()[h];
++    if (e.n != k.n || memcmp(e.meta, k.meta, sizeof k.meta) || memcmp(e.v, k.v, sizeof k.v)) return false;
++    if (e.choice[0] == 0xff) { p.best = 0x100; return true; }   // known not to fit
++    replay(p, order, e.choice);
++    return true;
++  }
++  void lit_cache_put(const Plan& p) const {
++    LitKey k; unsigned h; lit_key(k, &h);
++    memcpy(k.choice, p.choice, 7);
++    if (p.best == 0x100) k.choice[0] = 0xff;
++    lit_cache()[h] = k;
++  }
+   // ponytail: exhaustive search, up to 11^6 leaves for six 16-bit literals
+   // that cannot fit; fine for a prototype, cache or special-case if it shows up.
+   // h is changed in place and put back: a choice that is no better than the
+@@ -584,7 +672,15 @@ inline bool Assembler::plan(Plan& p) const {
+     p.best = 0x100;
+     memcpy(p.half_lts, free_lts, sizeof free_lts);
+     memset(p.choice, 0, sizeof p.choice);
+-    search(p, order, 0, free_lts, 0, idx);
++    // No literals: nothing to place.  One: its first choice has the smallest
++    // mask.  Then the greedy placement or the lower bound, the cache, and the
++    // exhaustive search last.
++    if (nlits_ == 0) p.best = 0;
++    else if (nlits_ == 1) replay(p, order, idx);
++    else if (!greedy(p, order) && !lit_cache_get(p, order)) {
++      search(p, order, 0, free_lts, 0, idx);
++      lit_cache_put(p);
++    }
+     lp_n_ = int8_t(nlits_); lp_best_ = uint16_t(p.best);
+     memcpy(lp_half_, p.half_lts, sizeof lp_half_); memcpy(lp_choice_, p.choice, sizeof lp_choice_);
+   }

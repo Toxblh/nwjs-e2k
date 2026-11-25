@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Sat, 17 Oct 2026 01:26:37 +0100
+Subject: [PATCH 93/99] v8: e2k: the widening even-lane multiplies of extmul in
+ the layer
+
+ExtMulLow/High (macro-assembler) name vmulwev_h_bu, vmulwev_w_hu,
+vmulwev_d_w and vmulwev_d_wu through a macro, which the list of LSX
+instructions V8 uses missed: they were UNIMPLEMENTED().
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc |  8 ++++----
+ chromium/v8/src/codegen/e2k/la_asm.h         | 19 +++++++++++++++++++
+ 2 files changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index 0fdae7c4b7..b07f12b50c 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -2261,7 +2261,7 @@ void Assembler::vmulwev_w_h(VRegister vd, VRegister vj, VRegister vk) {
+ }
+ 
+ void Assembler::vmulwev_d_w(VRegister vd, VRegister vj, VRegister vk) {
+-  UNIMPLEMENTED();
++  LA(vmulwev_d_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vmulwev_q_d(VRegister vd, VRegister vj, VRegister vk) {
+@@ -2285,15 +2285,15 @@ void Assembler::vmulwod_q_d(VRegister vd, VRegister vj, VRegister vk) {
+ }
+ 
+ void Assembler::vmulwev_h_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  UNIMPLEMENTED();
++  LA(vmulwev_h_bu(vd, vj, vk));
+ }
+ 
+ void Assembler::vmulwev_w_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  UNIMPLEMENTED();
++  LA(vmulwev_w_hu(vd, vj, vk));
+ }
+ 
+ void Assembler::vmulwev_d_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  UNIMPLEMENTED();
++  LA(vmulwev_d_wu(vd, vj, vk));
+ }
+ 
+ void Assembler::vmulwev_q_du(VRegister vd, VRegister vj, VRegister vk) {
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index f41108926d..f1b3df0bce 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -935,6 +935,20 @@ class Assembler : private e2k::Assembler {
+   void vmaddwod_w_h(VRegister vd, VRegister vj, VRegister vk) {
+     qsplat(T0, 4, 0xffff0000); C(qpand(0, V(vj), T0, T0)); C(qpmaddh(1, T0, V(vk), T0)); L(qpaddw(0, V(vd), T0, V(vd)));
+   }
++  // Unsigned: the even lanes masked, then a multiply of the wider lanes;
++  // 32 x 32 -> 64 bits has no qp operation: smulx/umulx on the halves.
++  void vmulwev_h_bu(VRegister vd, VRegister vj, VRegister vk) {
++    qsplat(T2, 2, 0xff);
++    C(qpand(0, V(vj), T2, T0); qpand(1, V(vk), T2, T1));
++    L(qpmullh(1, T0, T1, V(vd)));
++  }
++  void vmulwev_w_hu(VRegister vd, VRegister vj, VRegister vk) {
++    qsplat(T2, 4, 0xffff);
++    C(qpand(0, V(vj), T2, T0); qpand(1, V(vk), T2, T1));
++    L(qpmullw(1, T0, T1, V(vd)));
++  }
++  void vmulwev_d_w(VRegister vd, VRegister vj, VRegister vk) { mulwev_d(&E::smulx, vd, vj, vk); }
++  void vmulwev_d_wu(VRegister vd, VRegister vj, VRegister vk) { mulwev_d(&E::umulx, vd, vj, vk); }
+   void vmulwev_h_b(VRegister vd, VRegister vj, VRegister vk) {
+     C(qpsllh(0, V(vj), 8, T0); qpsllh(1, V(vk), 8, T1));
+     C(qpsrah(0, T0, 8, T0); qpsrah(1, T1, 8, T1));
+@@ -1822,6 +1836,11 @@ class Assembler : private e2k::Assembler {
+     qconst(T1, nan, nan);
+     L(qplog(0, 0xca, T2, T1, T0, V(vd)));
+   }
++  void mulwev_d(Alu mul, VRegister vd, VRegister vj, VRegister vk) {
++    C(qpswitchd(0, V(vj), T0); qpswitchd(1, V(vk), T1));
++    C((this->*mul)(0, V(vj), V(vk), T2); (this->*mul)(1, T0, T1, T3));
++    L(qppackdl(0, T3, T2, V(vd)));
++  }
+   void anyeqz(Alu cmpeq, bool any, CFRegister cd, VRegister vj) {
+     qzero(T0);
+     C((this->*cmpeq)(0, V(vj), T0, T0));

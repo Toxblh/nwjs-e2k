@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Wed, 14 Oct 2026 22:37:23 +0100
+Subject: [PATCH 78/99] v8: wasm code reference scopes: TLS model of V8,
+ nothing to drop when empty
+
+Every stack walk of an isolate opens a WasmCodeRefScope, the walks of a
+JS throw too. Its thread-local pointer had no TLS model, so code built
+with -fPIC used the general dynamic one; the e2k GNU linker does not
+relax it, and every access was a call of __tls_get_addr (about 40 cycles
+more than a local-exec load, measured on Elbrus-8SV). It now takes
+V8_TLS_MODEL like the isolate pointer. The destructor of a scope that
+took no reference (all walks without wasm frames) no longer builds the
+dead code tables of DecrementRefCount.
+
+bench.js tryCatch on Elbrus-8SV: 943 -> 916 ms (s8e without wasm: 845).
+---
+ chromium/v8/src/wasm/wasm-code-manager.cc | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/chromium/v8/src/wasm/wasm-code-manager.cc b/chromium/v8/src/wasm/wasm-code-manager.cc
+index dbfcfa9ef3..b0374e4e21 100644
+--- a/chromium/v8/src/wasm/wasm-code-manager.cc
++++ b/chromium/v8/src/wasm/wasm-code-manager.cc
+@@ -27,6 +27,7 @@
+ #include "src/codegen/macro-assembler.h"
+ #include "src/common/code-memory-access.h"
+ #include "src/common/globals.h"
++#include "src/common/thread-local-storage.h"
+ #include "src/deoptimizer/deoptimizer.h"
+ #include "src/diagnostics/disassembler.h"
+ #include "src/logging/counters.h"
+@@ -3119,7 +3120,12 @@ void WasmCodeManager::FlushCodeLookupCache(Isolate* isolate) {
+ }
+ 
+ namespace {
+-thread_local WasmCodeRefScope* current_code_refs_scope = nullptr;
++// Every stack walk of the isolate opens a scope, the walk for a JS exception
++// too. Without the model the compiler takes the general dynamic one, and
++// where the linker does not relax it (GNU ld for e2k) each access is a call
++// of __tls_get_addr.
++__attribute__((tls_model(V8_TLS_MODEL))) thread_local WasmCodeRefScope*
++    current_code_refs_scope = nullptr;
+ }  // namespace
+ 
+ WasmCodeRefScope::WasmCodeRefScope()
+@@ -3130,6 +3136,9 @@ WasmCodeRefScope::WasmCodeRefScope()
+ WasmCodeRefScope::~WasmCodeRefScope() {
+   DCHECK_EQ(this, current_code_refs_scope);
+   current_code_refs_scope = previous_scope_;
++  // Most scopes (all of those of stack walks without wasm frames) took no
++  // reference.
++  if (code_ptrs_.empty()) return;
+   WasmCode::DecrementRefCount(base::VectorOf(code_ptrs_));
+ }
+ 

@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Wed, 14 Oct 2026 01:37:20 +0100
+Subject: [PATCH 75/99] v8: e2k: the profiler asks only typed frames whether
+ they are the wasm-to-JS wrapper
+
+With WebAssembly built in, StackFrameIteratorForProfiler looked every
+frame's pc up in the wasm-to-JS wrapper before anything else, and
+IsWasmToJsWrapperCSA built an EmbeddedData twice per call, through four
+out-of-line accessors each time. The frame of that wrapper is a typed
+frame, so the test now runs only for frames with a type marker, and one
+EmbeddedData serves both the start and the size.
+
+On e2k, where a call costs 15 to 20 cycles, the extra work per frame put
+the signal handler of the profiler above its sampling interval of 100 us
+on a deep stack: the lab test signals/js/deep.js (recursion of 5000
+frames, lazy deoptimization of each, CPU profiler at 100 us) took 5 s in
+the build without WebAssembly and did not finish with it. Now 5 to 6 s.
+---
+ chromium/v8/src/execution/frames.cc | 24 +++++++++++++++++-------
+ 1 file changed, 17 insertions(+), 7 deletions(-)
+
+diff --git a/chromium/v8/src/execution/frames.cc b/chromium/v8/src/execution/frames.cc
+index 7e95a184ac..55cd51c2b5 100644
+--- a/chromium/v8/src/execution/frames.cc
++++ b/chromium/v8/src/execution/frames.cc
+@@ -89,10 +89,14 @@ Address AddressOf(const StackHandler* handler) {
+ #if V8_ENABLE_WEBASSEMBLY
+ bool IsWasmToJsWrapperCSA(Address pc) {
+   // The WasmToJsWrapper can also be called from the embedded data directly.
++  // The profiler asks this for every frame of a sample, in its signal
++  // handler: look the embedded blob up once, not once for the size and once
++  // more for the start.
++  EmbeddedData embedded_data = EmbeddedData::FromBlob();
+   size_t builtin_size =
+-      EmbeddedData::FromBlob().InstructionSizeOf(Builtin::kWasmToJsWrapperCSA);
++      embedded_data.InstructionSizeOf(Builtin::kWasmToJsWrapperCSA);
+   Address wrapper_addr =
+-      Builtins::EmbeddedEntryOf(Builtin::kWasmToJsWrapperCSA);
++      embedded_data.InstructionStartOf(Builtin::kWasmToJsWrapperCSA);
+   if (pc >= wrapper_addr && pc < wrapper_addr + builtin_size) {
+     return true;
+   }
+@@ -1054,11 +1058,6 @@ StackFrame::Type StackFrameIteratorForProfiler::ComputeStackFrameType(
+   // We use unauthenticated_pc because it may come from
+   // fast_c_call_caller_pc_address, for which authentication does not work.
+   const Address pc = StackFrame::unauthenticated_pc(state->pc_address);
+-#if V8_ENABLE_WEBASSEMBLY
+-  if (IsWasmToJsWrapperCSA(pc)) {
+-    return StackFrame::WASM_TO_JS;
+-  }
+-#endif  // V8_ENABLE_WEBASSEMBLY
+ 
+   MSAN_MEMORY_IS_INITIALIZED(
+       state->fp + CommonFrameConstants::kContextOrFrameTypeOffset,
+@@ -1066,6 +1065,17 @@ StackFrame::Type StackFrameIteratorForProfiler::ComputeStackFrameType(
+   const intptr_t marker = Memory<intptr_t>(
+       state->fp + CommonFrameConstants::kContextOrFrameTypeOffset);
+   if (StackFrame::IsTypeMarker(marker)) {
++#if V8_ENABLE_WEBASSEMBLY
++    // The frame of the wasm-to-JS wrapper is a typed frame, so only typed
++    // frames are asked whether their pc is in the wrapper. Asking first, for
++    // every frame, costs several calls per JavaScript frame of each sample
++    // (the embedded blob is looked up through out-of-line accessors); on e2k
++    // that made the signal handler of the profiler slower than its 100 us
++    // sampling interval on a deep stack.
++    if (IsWasmToJsWrapperCSA(pc)) {
++      return StackFrame::WASM_TO_JS;
++    }
++#endif  // V8_ENABLE_WEBASSEMBLY
+     return SafeStackFrameType(StackFrame::MarkerToType(marker));
+   }
+ 

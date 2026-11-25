@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Sat, 7 Nov 2026 20:00:59 +0400
+Subject: [PATCH 99/99] v8: e2k: pack Sparkplug and Maglev code in one pass
+
+The layer schedules each instruction into a window of up to 16 wide
+commands, plans the commands it may join again and again and copies the
+whole window back to the V8 buffer after every instruction.  That pays
+for TurboFan and the builtins; Sparkplug and Maglev compile much more
+code that runs briefly, on the background threads.
+
+Their assemblers now ask for the packing of E2K_NO_SCHED=1 (an
+instruction joins the last wide command, in the order given), which
+also copies only the last command back.  --no-e2k-quick-pack turns it
+off; E2K_NO_FUSE and E2K_NO_SCHED still apply to everything.
+
+JetStream 3 on 4 cores of 4x8SV, against the literal change alone:
+CPU time typescript-lib -6.5 %, web-ssr -9 %, babel-wtb -5 %,
+prettier-wtb -3 %; Air score +18 %; richards, delta-blue,
+navier-stokes, hash-map unchanged (within noise).
+---
+ chromium/v8/src/baseline/baseline-compiler.cc |  3 ++
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc  | 30 ++++++++++++++-----
+ chromium/v8/src/codegen/e2k/assembler-e2k.h   |  8 +++++
+ chromium/v8/src/flags/flag-definitions.h      |  8 +++++
+ chromium/v8/src/maglev/maglev-assembler.h     |  6 +++-
+ 5 files changed, 46 insertions(+), 9 deletions(-)
+
+diff --git a/chromium/v8/src/baseline/baseline-compiler.cc b/chromium/v8/src/baseline/baseline-compiler.cc
+index c07e585194..75bd230f33 100644
+--- a/chromium/v8/src/baseline/baseline-compiler.cc
++++ b/chromium/v8/src/baseline/baseline-compiler.cc
+@@ -320,6 +320,9 @@ BaselineCompiler::BaselineCompiler(
+   //   16 + (bytecode size) / 4
+   bytecode_offset_table_builder_.Reserve(
+       base::bits::RoundUpToPowerOfTwo(16 + bytecode_->Size() / 4));
++#if V8_TARGET_ARCH_E2K
++  masm_.set_quick_pack(v8_flags.e2k_quick_pack);
++#endif
+ }
+ 
+ void BaselineCompiler::GenerateCode() {
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index 934b0f37ee..cc8dd613b3 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -967,10 +967,23 @@ struct Layer {
+   int start = 0;    // how the current instruction found the code: a kStart*
+   la::Assembler::Counts counted = {0, 0, 0, 0, 0};
+   Label* label = nullptr;  // the next instruction branches to it
++  int mode = 0;            // the packing the layer is set to: a kPack*
+ };
+ 
+ // E2K_NO_FUSE=1: a slot per instruction. E2K_NO_SCHED=1: instructions join
+-// the last wide command in the order given, no scheduling.
++// the last wide command in the order given, no scheduling.  The packing of
++// an assembler that asks for the quick one (Sparkplug, Maglev) is kPackFuse.
++enum { kPackPlain, kPackFuse, kPackSched };
++int pack_mode = kPackSched;  // set once from the environment
++
++void SetPacking(Layer& l, int mode) {
++  l.mode = mode;
++  if (mode == kPackFuse) {
++    l.la.set_fuse(true);
++  } else {
++    l.la.set_sched(mode == kPackSched);
++  }
++}
+ // E2K_FUSE_STATS=1: totals at exit; =2: also who emitted the instructions
+ // that could not use an open slot because the position had been asked for
+ // (return addresses, see nm).
+@@ -1029,7 +1042,7 @@ void PrintStats() {
+ Layer& TheLayer() {
+   // One per thread, never destroyed.
+   static thread_local Layer* layer = [] {
+-    static const bool fuse = [] {
++    static const int mode = [] {
+       const char* level = getenv("E2K_FUSE_STATS");
+       stats_level = level ? atoi(level) : 0;
+       if (stats_level >= 2) {
+@@ -1037,14 +1050,13 @@ Layer& TheLayer() {
+         lost = new std::map<std::array<void*, 3>, long>;
+       }
+       if (stats_level) atexit(PrintStats);
+-      return getenv("E2K_NO_FUSE") == nullptr;
++      pack_mode = getenv("E2K_NO_FUSE")    ? kPackPlain
++                  : getenv("E2K_NO_SCHED") ? kPackFuse
++                                           : kPackSched;
++      return pack_mode;
+     }();
+     Layer* l = new Layer;
+-    if (fuse && getenv("E2K_NO_SCHED")) {
+-      l->la.set_fuse(true);
+-    } else {
+-      l->la.set_sched(fuse);
+-    }
++    SetPacking(*l, mode);
+     return l;
+   }();
+   return *layer;
+@@ -1082,6 +1094,8 @@ la::Assembler& Assembler::OpenSlots() {
+     l.la.clear();
+     l.owner = this;
+     l.base = pos;
++    int mode = quick_pack_ && pack_mode == kPackSched ? kPackFuse : pack_mode;
++    if (mode != l.mode) SetPacking(l, mode);
+   }
+   l.start = blocked      ? kStartBlocked
+             : moved      ? kStartMoved
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index 3a9c17b3f6..a3be9991ed 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -1799,7 +1799,15 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+     pc_for_safepoint_ = pc_;
+   }
+ 
++ public:
++  // Sparkplug and Maglev code: instructions join the last wide command in
++  // the order given (the packing of E2K_NO_SCHED=1) instead of going through
++  // the scheduling window, which TurboFan and the builtins keep.  Set before
++  // the first instruction.
++  void set_quick_pack(bool on) { quick_pack_ = on; }
++
+  private:
++  bool quick_pack_ = false;
+   // Buffer size and constant pool distance are checked together at regular
+   // intervals of kBufferCheckInterval emitted bytes.
+   static constexpr int kBufferCheckInterval = 1 * KB / 2;
+diff --git a/chromium/v8/src/flags/flag-definitions.h b/chromium/v8/src/flags/flag-definitions.h
+index 06a2a284d9..f0961fa820 100644
+--- a/chromium/v8/src/flags/flag-definitions.h
++++ b/chromium/v8/src/flags/flag-definitions.h
+@@ -3315,6 +3315,14 @@ DEFINE_BOOL(sparkplug_smi_fast_paths, true,
+             "on Smis itself where the feedback says the operands are Smis")
+ #endif
+ 
++#if V8_TARGET_ARCH_E2K
++// The scheduling window of the e2k layer costs compile time on every
++// instruction; baseline code is compiled often and runs briefly.
++DEFINE_BOOL(e2k_quick_pack, true,
++            "pack the e2k code of Sparkplug and Maglev in one pass, "
++            "without the scheduling window that TurboFan uses")
++#endif
++
+ DEFINE_BOOL(super_ic, true, "use an IC for super property loads")
+ 
+ DEFINE_EXPERIMENTAL_FEATURE(mega_dom_ic, "use MegaDOM IC state for API objects")
+diff --git a/chromium/v8/src/maglev/maglev-assembler.h b/chromium/v8/src/maglev/maglev-assembler.h
+index 1260accc02..1be1f80cc2 100644
+--- a/chromium/v8/src/maglev/maglev-assembler.h
++++ b/chromium/v8/src/maglev/maglev-assembler.h
+@@ -100,7 +100,11 @@ class V8_EXPORT_PRIVATE MaglevAssembler : public MacroAssembler {
+   MaglevAssembler(Isolate* isolate, Zone* zone,
+                   MaglevCodeGenState* code_gen_state)
+       : MacroAssembler(isolate, zone, CodeObjectRequired{false}),
+-        code_gen_state_(code_gen_state) {}
++        code_gen_state_(code_gen_state) {
++#if V8_TARGET_ARCH_E2K
++    set_quick_pack(v8_flags.e2k_quick_pack);
++#endif
++  }
+ 
+   static constexpr RegList GetAllocatableRegisters() {
+ #if defined(V8_TARGET_ARCH_ARM)

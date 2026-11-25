@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Sun, 11 Oct 2026 09:34:21 +0100
+Subject: [PATCH 18/99] e2k: repeat failed node runs
+
+---
+ chromium/third_party/node/node.py | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/chromium/third_party/node/node.py b/chromium/third_party/node/node.py
+index a9c352f258..7f24056eaf 100755
+--- a/chromium/third_party/node/node.py
++++ b/chromium/third_party/node/node.py
+@@ -34,11 +34,16 @@ def GetEnv():
+ 
+ def RunNodeRaw(cmd_parts, stdout=None):
+   cmd = [GetBinaryPath()] + cmd_parts
+-  process = subprocess.Popen(
+-      cmd, cwd=os.getcwd(), env=GetEnv(), stdout=subprocess.PIPE,
+-      stderr=subprocess.PIPE,
+-      universal_newlines=True, encoding='utf-8')
+-  stdout, stderr = process.communicate()
++  # Node 18 on e2k fails at random (its JIT miscompiles now and then), so a
++  # failed run is repeated there.
++  for _ in range(3 if platform.machine() == 'e2k' else 1):
++    process = subprocess.Popen(
++        cmd, cwd=os.getcwd(), env=GetEnv(), stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        universal_newlines=True, encoding='utf-8')
++    stdout, stderr = process.communicate()
++    if process.returncode == 0:
++      break
+   return process.returncode, stdout, stderr
+ 
+ def RunNode(cmd_parts, stdout=None):

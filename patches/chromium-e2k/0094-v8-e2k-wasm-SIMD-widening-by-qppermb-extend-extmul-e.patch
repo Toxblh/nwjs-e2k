@@ -1,0 +1,549 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Sat, 17 Oct 2026 01:36:56 +0100
+Subject: [PATCH 94/99] v8: e2k: wasm SIMD widening by qppermb: extend, extmul,
+ extending loads
+
+extend_low/high, extmul_low/high and the loads with extension or zero
+extension were LSX chains (an interleave with zero, shifts, even-lane
+multiplies, a splat of the loaded value).  They are now not-LoongArch
+instructions of the layer:
+
+- vext/vextr: one qppermb by a constant index (zero bytes from a zero
+  vector), then one arithmetic shift for 8 and 16 bits signed, the signs
+  of the lanes as the other source for 32;
+- vextmul: 8 bits both widened then qpmullh; 16 bits qpmullh and
+  qpmulhh/qpmulhuh interleaved by one qppermb; 32 bits smulx/umulx;
+- vzext: load64_zero/load32_zero are the load and one qppackdl.
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc  |   5 +
+ chromium/v8/src/codegen/e2k/assembler-e2k.h   |   4 +
+ chromium/v8/src/codegen/e2k/la_asm.h          |  58 +++++++++
+ .../v8/src/codegen/e2k/macro-assembler-e2k.cc |  24 ++--
+ .../backend/e2k/code-generator-e2k.cc         | 110 +++++-------------
+ .../baseline/e2k/liftoff-assembler-e2k-inl.h  |  66 +++--------
+ 6 files changed, 130 insertions(+), 137 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index b07f12b50c..934b0f37ee 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -4251,6 +4251,11 @@ void Assembler::vpmax_s(VRegister vd, VRegister vj, VRegister vk) { LA(vpmax_s(v
+ void Assembler::vpmin_d(VRegister vd, VRegister vj, VRegister vk) { LA(vpmin_d(vd, vj, vk)); }
+ void Assembler::vpmax_d(VRegister vd, VRegister vj, VRegister vk) { LA(vpmax_d(vd, vj, vk)); }
+ 
++void Assembler::vext(VRegister vd, VRegister vj, int size, bool sign, bool high) { LA(vext(vd, vj, size, sign, high)); }
++void Assembler::vextr(VRegister vd, Register rj, int size, bool sign) { LA(vextr(vd, rj, size, sign)); }
++void Assembler::vzext(VRegister vd, Register rj) { LA(vzext(vd, rj)); }
++void Assembler::vextmul(VRegister vd, VRegister vj, VRegister vk, int size, bool sign, bool high) { LA(vextmul(vd, vj, vk, size, sign, high)); }
++
+ #undef LA
+ 
+ void Assembler::AdjustBaseAndOffset(MemOperand* src) {
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index 487922f84e..3a9c17b3f6 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -910,6 +910,10 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   void vpmax_s(VRegister vd, VRegister vj, VRegister vk);
+   void vpmin_d(VRegister vd, VRegister vj, VRegister vk);
+   void vpmax_d(VRegister vd, VRegister vj, VRegister vk);
++  void vext(VRegister vd, VRegister vj, int size, bool sign, bool high);
++  void vextr(VRegister vd, Register rj, int size, bool sign);
++  void vzext(VRegister vd, Register rj);
++  void vextmul(VRegister vd, VRegister vj, VRegister vk, int size, bool sign, bool high);
+ 
+   void vfmadd_s(VRegister vd, VRegister vj, VRegister vk, VRegister va);
+   void vfmadd_d(VRegister vd, VRegister vj, VRegister vk, VRegister va);
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index f1b3df0bce..f38ce0c9d2 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -1229,6 +1229,45 @@ class Assembler : private e2k::Assembler {
+   void vpmin_d(VRegister vd, VRegister vj, VRegister vk) { L(qpfmind(0, V(vk), V(vj), V(vd))); }
+   void vpmax_d(VRegister vd, VRegister vj, VRegister vk) { L(qpfmaxd(0, V(vk), V(vj), V(vd))); }
+ 
++  // Widening (wasm extend_low/high, the loads with extension): the low or
++  // high half of vj (vextr: the 64 bits of rj), lanes of `size` bytes, to
++  // lanes twice as wide, signed or not; vzext: vd = 0:rj.
++  void vext(VRegister vd, VRegister vj, int size, bool sign, bool high) { ext(vd, V(vj), size, sign, high); }
++  void vextr(VRegister vd, Register rj, int size, bool sign) { ext(vd, R(rj), size, sign, false); }
++  void vzext(VRegister vd, Register rj) { L(qppackdl(0, 0, R(rj), V(vd))); }
++  // wasm extmul_low/high: the product of the lanes widened.  8 bits: both
++  // widened, qpmullh; 16: qpmullh and qpmulhh/qpmulhuh interleaved; 32:
++  // smulx/umulx on the scalar side.
++  void vextmul(VRegister vd, VRegister vj, VRegister vk, int size, bool sign, bool high) {
++    Reg a = V(vj), b = V(vk);
++    int base = high ? 8 : 0;
++    if (size == 1) {
++      if (sign) {
++        qconst(T0, idx16([=](int o) { return base + o / 2; }));
++        C(qppermb(0, a, a, T0, T2); qppermb(1, b, b, T0, T3));
++        C(qpsrah(0, T2, 8, T2); qpsrah(1, T3, 8, T3));
++      } else {
++        qconst(T0, idx16([=](int o) { return o % 2 ? 16 : base + o / 2; }));
++        qzero(T1);
++        C(qppermb(0, T1, a, T0, T2); qppermb(1, T1, b, T0, T3));
++      }
++      L(qpmullh(1, T2, T3, V(vd)));
++      return;
++    }
++    if (size == 2) {
++      if (sign) C(qpmullh(1, a, b, T0); qpmulhh(4, a, b, T1)); else C(qpmullh(1, a, b, T0); qpmulhuh(4, a, b, T1));
++      qconst(T2, idx16([=](int o) { return (o % 4 >= 2 ? 16 : 0) + (base / 2 + o / 4) * 2 + o % 2; }));
++      L(qppermb(0, T1, T0, T2, V(vd)));
++      return;
++    }
++    Alu mul = sign ? &E::smulx : &E::umulx;
++    if (high) { C(qpswitchd(0, a, T0); qpswitchd(1, b, T1)); a = T0; b = T1; }
++    C((this->*mul)(0, a, b, T2); shrd(1, a, 32, T3));
++    C(shrd(0, b, 32, T1));
++    C((this->*mul)(0, T3, T1, T3));
++    L(qppackdl(0, T3, T2, V(vd)));
++  }
++
+   // ---- memory: two 64-bit halves (any alignment)
+   void vld(VRegister vd, Register rj, int32_t si12) { C(ldd(0, R(rj), si12, T0); ldd(2, R(rj), si12 + 8, T1)); L(qppackdl(0, T1, T0, V(vd))); }
+   void vst(VRegister vd, Register rj, int32_t si12) { C(qpswitchd(0, V(vd), T0)); L(std_(2, R(rj), si12, V(vd)); std_(5, R(rj), si12 + 8, T0)); }
+@@ -1841,6 +1880,25 @@ class Assembler : private e2k::Assembler {
+     C((this->*mul)(0, V(vj), V(vk), T2); (this->*mul)(1, T0, T1, T3));
+     L(qppackdl(0, T3, T2, V(vd)));
+   }
++  void ext(VRegister vd, Reg src, int size, bool sign, bool high) {
++    int base = high ? 8 : 0;
++    if (!sign) {
++      qconst(T0, idx16([=](int o) { return o % (2 * size) >= size ? 16 : base + o / (2 * size) * size + o % size; }));
++      qzero(T1);
++      L(qppermb(0, T1, src, T0, V(vd)));
++      return;
++    }
++    if (size == 4) {
++      qconst(T0, idx16([=](int o) { return (o % 8 >= 4 ? 16 : 0) + base + o / 8 * 4 + o % 4; }));
++      C(qpsraw(0, src, 31, T1));                 // the signs of the lanes
++      L(qppermb(0, T1, src, T0, V(vd)));
++      return;
++    }
++    // each lane twice in the wide one, then the arithmetic shift
++    qconst(T0, idx16([=](int o) { return base + o / (2 * size) * size + o % size; }));
++    C(qppermb(0, src, src, T0, T0));
++    if (size == 1) L(qpsrah(0, T0, 8, V(vd))); else L(qpsraw(0, T0, 16, V(vd)));
++  }
+   void anyeqz(Alu cmpeq, bool any, CFRegister cd, VRegister vj) {
+     qzero(T0);
+     C((this->*cmpeq)(0, V(vj), T0, T0));
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+index 9b5704bb77..9cdb1fa61d 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+@@ -2583,12 +2583,12 @@ void MacroAssembler::Dotp_h(VRegister dst, VRegister src1, VRegister src2,
+ void MacroAssembler::ExtMulLow(LSXDataType type, VRegister dst, VRegister src1,
+                                VRegister src2) {
+   switch (type) {
+-    EXT_MUL_BINOP(LSXS8, vilvl_b, vmulwev_h_b)
+-    EXT_MUL_BINOP(LSXS16, vilvl_h, vmulwev_w_h)
+-    EXT_MUL_BINOP(LSXS32, vilvl_w, vmulwev_d_w)
+-    EXT_MUL_BINOP(LSXU8, vilvl_b, vmulwev_h_bu)
+-    EXT_MUL_BINOP(LSXU16, vilvl_h, vmulwev_w_hu)
+-    EXT_MUL_BINOP(LSXU32, vilvl_w, vmulwev_d_wu)
++    case LSXS8: vextmul(dst, src1, src2, 1, true, false); break;
++    case LSXS16: vextmul(dst, src1, src2, 2, true, false); break;
++    case LSXS32: vextmul(dst, src1, src2, 4, true, false); break;
++    case LSXU8: vextmul(dst, src1, src2, 1, false, false); break;
++    case LSXU16: vextmul(dst, src1, src2, 2, false, false); break;
++    case LSXU32: vextmul(dst, src1, src2, 4, false, false); break;
+     default:
+       UNREACHABLE();
+   }
+@@ -2597,12 +2597,12 @@ void MacroAssembler::ExtMulLow(LSXDataType type, VRegister dst, VRegister src1,
+ void MacroAssembler::ExtMulHigh(LSXDataType type, VRegister dst, VRegister src1,
+                                 VRegister src2) {
+   switch (type) {
+-    EXT_MUL_BINOP(LSXS8, vilvh_b, vmulwev_h_b)
+-    EXT_MUL_BINOP(LSXS16, vilvh_h, vmulwev_w_h)
+-    EXT_MUL_BINOP(LSXS32, vilvh_w, vmulwev_d_w)
+-    EXT_MUL_BINOP(LSXU8, vilvh_b, vmulwev_h_bu)
+-    EXT_MUL_BINOP(LSXU16, vilvh_h, vmulwev_w_hu)
+-    EXT_MUL_BINOP(LSXU32, vilvh_w, vmulwev_d_wu)
++    case LSXS8: vextmul(dst, src1, src2, 1, true, true); break;
++    case LSXS16: vextmul(dst, src1, src2, 2, true, true); break;
++    case LSXS32: vextmul(dst, src1, src2, 4, true, true); break;
++    case LSXU8: vextmul(dst, src1, src2, 1, false, true); break;
++    case LSXU16: vextmul(dst, src1, src2, 2, false, true); break;
++    case LSXU32: vextmul(dst, src1, src2, 4, false, true); break;
+     default:
+       UNREACHABLE();
+   }
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index 5dfcc8a810..ddefbdf659 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -2668,94 +2668,72 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       CpuFeatureScope lsx_scope(masm(), LSX);
+       UseScratchRegisterScope temps(masm());
+       Register TmpReg = temps.Acquire();
+-      Simd128Register scratch = kSimd128ScratchReg;
+-      Simd128Register dst = i.OutputSimd128Register();
+       __ Ld_d(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+-      __ vreplgr2vr_d(scratch, TmpReg);
+-      __ vexth_h_b(dst, scratch);
++      __ vextr(i.OutputSimd128Register(), TmpReg, 1, true);
+       break;
+     }
+     case kE2kS128Load8x8U: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+       UseScratchRegisterScope temps(masm());
+       Register TmpReg = temps.Acquire();
+-      Simd128Register dst = i.OutputSimd128Register();
+-      __ vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+       __ Ld_d(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+-      __ vreplgr2vr_d(dst, TmpReg);
+-      __ vilvl_b(dst, kSimd128RegZero, dst);
++      __ vextr(i.OutputSimd128Register(), TmpReg, 1, false);
+       break;
+     }
+     case kE2kS128Load16x4S: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+       UseScratchRegisterScope temps(masm());
+       Register TmpReg = temps.Acquire();
+-      Simd128Register scratch = kSimd128ScratchReg;
+-      Simd128Register dst = i.OutputSimd128Register();
+       __ Ld_d(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+-      __ vreplgr2vr_d(scratch, TmpReg);
+-      __ vexth_w_h(dst, scratch);
++      __ vextr(i.OutputSimd128Register(), TmpReg, 2, true);
+       break;
+     }
+     case kE2kS128Load16x4U: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+       UseScratchRegisterScope temps(masm());
+       Register TmpReg = temps.Acquire();
+-      Simd128Register dst = i.OutputSimd128Register();
+-      __ vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+       __ Ld_d(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+-      __ vreplgr2vr_d(dst, TmpReg);
+-      __ vilvl_h(dst, kSimd128RegZero, dst);
++      __ vextr(i.OutputSimd128Register(), TmpReg, 2, false);
+       break;
+     }
+     case kE2kS128Load32x2S: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+       UseScratchRegisterScope temps(masm());
+       Register TmpReg = temps.Acquire();
+-      Simd128Register dst = i.OutputSimd128Register();
+-      Simd128Register scratch = kSimd128ScratchReg;
+       __ Ld_d(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+-      __ vreplgr2vr_d(scratch, TmpReg);
+-      __ vexth_d_w(dst, scratch);
++      __ vextr(i.OutputSimd128Register(), TmpReg, 4, true);
+       break;
+     }
+     case kE2kS128Load32x2U: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+       UseScratchRegisterScope temps(masm());
+       Register TmpReg = temps.Acquire();
+-      Simd128Register dst = i.OutputSimd128Register();
+-      __ vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+       __ Ld_d(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+-      __ vreplgr2vr_d(dst, TmpReg);
+-      __ vilvl_w(dst, kSimd128RegZero, dst);
++      __ vextr(i.OutputSimd128Register(), TmpReg, 4, false);
+       break;
+     }
+     case kE2kS128Load32Zero: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+       UseScratchRegisterScope temps(masm());
+       Register TmpReg = temps.Acquire();
+-      Simd128Register dst = i.OutputSimd128Register();
+-      __ vxor_v(dst, dst, dst);
+       __ Ld_wu(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+-      __ vinsgr2vr_w(dst, TmpReg, 0);
++      __ vzext(i.OutputSimd128Register(), TmpReg);
+       break;
+     }
+     case kE2kS128Load64Zero: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+       UseScratchRegisterScope temps(masm());
+       Register TmpReg = temps.Acquire();
+-      Simd128Register dst = i.OutputSimd128Register();
+-      __ vxor_v(dst, dst, dst);
+       __ Ld_d(TmpReg, i.MemoryOperand(), trap_pc_ptr);
+       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+-      __ vinsgr2vr_d(dst, TmpReg, 0);
++      __ vzext(i.OutputSimd128Register(), TmpReg);
+       break;
+     }
+     case kE2kS128LoadLane: {
+@@ -4144,34 +4122,26 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+     }
+     case kE2kI16x8SConvertI8x16Low: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+-      Simd128Register dst = i.OutputSimd128Register();
+-      Simd128Register src = i.InputSimd128Register(0);
+-      __ vilvl_b(kSimd128ScratchReg, src, src);
+-      __ vslli_h(dst, kSimd128ScratchReg, 8);
+-      __ vsrai_h(dst, dst, 8);
++      __ vext(i.OutputSimd128Register(), i.InputSimd128Register(0), 1, true,
++              false);
+       break;
+     }
+     case kE2kI16x8SConvertI8x16High: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+-      Simd128Register dst = i.OutputSimd128Register();
+-      Simd128Register src = i.InputSimd128Register(0);
+-      __ vilvh_b(kSimd128ScratchReg, src, src);
+-      __ vslli_h(dst, kSimd128ScratchReg, 8);
+-      __ vsrai_h(dst, dst, 8);
++      __ vext(i.OutputSimd128Register(), i.InputSimd128Register(0), 1, true,
++              true);
+       break;
+     }
+     case kE2kI16x8UConvertI8x16Low: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+-      __ vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+-      __ vilvl_b(i.OutputSimd128Register(), kSimd128RegZero,
+-                 i.InputSimd128Register(0));
++      __ vext(i.OutputSimd128Register(), i.InputSimd128Register(0), 1, false,
++              false);
+       break;
+     }
+     case kE2kI16x8UConvertI8x16High: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+-      __ vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+-      __ vilvh_b(i.OutputSimd128Register(), kSimd128RegZero,
+-                 i.InputSimd128Register(0));
++      __ vext(i.OutputSimd128Register(), i.InputSimd128Register(0), 1, false,
++              true);
+       break;
+     }
+     case kE2kI32x4SConvertF32x4: {
+@@ -4186,43 +4156,32 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+     }
+     case kE2kI32x4SConvertI16x8Low: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+-      Simd128Register dst = i.OutputSimd128Register();
+-      Simd128Register src = i.InputSimd128Register(0);
+-      __ vilvl_h(kSimd128ScratchReg, src, src);
+-      __ vslli_w(dst, kSimd128ScratchReg, 16);
+-      __ vsrai_w(dst, dst, 16);
++      __ vext(i.OutputSimd128Register(), i.InputSimd128Register(0), 2, true,
++              false);
+       break;
+     }
+     case kE2kI32x4SConvertI16x8High: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+-      Simd128Register dst = i.OutputSimd128Register();
+-      Simd128Register src = i.InputSimd128Register(0);
+-      __ vilvh_h(kSimd128ScratchReg, src, src);
+-      __ vslli_w(dst, kSimd128ScratchReg, 16);
+-      __ vsrai_w(dst, dst, 16);
++      __ vext(i.OutputSimd128Register(), i.InputSimd128Register(0), 2, true,
++              true);
+       break;
+     }
+     case kE2kI32x4UConvertI16x8Low: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+-      __ vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+-      __ vilvl_h(i.OutputSimd128Register(), kSimd128RegZero,
+-                 i.InputSimd128Register(0));
++      __ vext(i.OutputSimd128Register(), i.InputSimd128Register(0), 2, false,
++              false);
+       break;
+     }
+     case kE2kI32x4UConvertI16x8High: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+-      __ vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+-      __ vilvh_h(i.OutputSimd128Register(), kSimd128RegZero,
+-                 i.InputSimd128Register(0));
++      __ vext(i.OutputSimd128Register(), i.InputSimd128Register(0), 2, false,
++              true);
+       break;
+     }
+     case kE2kI64x2SConvertI32x4Low: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+-      Simd128Register dst = i.OutputSimd128Register();
+-      Simd128Register src = i.InputSimd128Register(0);
+-      __ vilvl_w(kSimd128ScratchReg, src, src);
+-      __ vslli_d(dst, kSimd128ScratchReg, 32);
+-      __ vsrai_d(dst, dst, 32);
++      __ vext(i.OutputSimd128Register(), i.InputSimd128Register(0), 4, true,
++              false);
+       break;
+     }
+     case kAtomicAddWord32:
+@@ -4250,18 +4209,14 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       break;
+     case kE2kI64x2SConvertI32x4High: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+-      Simd128Register dst = i.OutputSimd128Register();
+-      Simd128Register src = i.InputSimd128Register(0);
+-      __ vilvh_w(kSimd128ScratchReg, src, src);
+-      __ vslli_d(dst, kSimd128ScratchReg, 32);
+-      __ vsrai_d(dst, dst, 32);
++      __ vext(i.OutputSimd128Register(), i.InputSimd128Register(0), 4, true,
++              true);
+       break;
+     }
+     case kE2kI64x2UConvertI32x4Low: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+-      __ vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+-      __ vilvl_w(i.OutputSimd128Register(), kSimd128RegZero,
+-                 i.InputSimd128Register(0));
++      __ vext(i.OutputSimd128Register(), i.InputSimd128Register(0), 4, false,
++              false);
+       break;
+     }
+     case kAtomicAndWord32:
+@@ -4349,9 +4304,8 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       break;
+     case kE2kI64x2UConvertI32x4High: {
+       CpuFeatureScope lsx_scope(masm(), LSX);
+-      __ vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+-      __ vilvh_w(i.OutputSimd128Register(), kSimd128RegZero,
+-                 i.InputSimd128Register(0));
++      __ vext(i.OutputSimd128Register(), i.InputSimd128Register(0), 4, false,
++              true);
+       break;
+     }
+     case kE2kF32x4UConvertI32x4: {
+diff --git a/chromium/v8/src/wasm/baseline/e2k/liftoff-assembler-e2k-inl.h b/chromium/v8/src/wasm/baseline/e2k/liftoff-assembler-e2k-inl.h
+index e1b93c5e2a..a2e45bb999 100644
+--- a/chromium/v8/src/wasm/baseline/e2k/liftoff-assembler-e2k-inl.h
++++ b/chromium/v8/src/wasm/baseline/e2k/liftoff-assembler-e2k-inl.h
+@@ -2506,30 +2506,20 @@ void LiftoffAssembler::LoadTransform(LiftoffRegister dst, Register src_addr,
+ 
+   if (transform == LoadTransformationKind::kExtend) {
+     Ld_d(scratch, src_op, reinterpret_cast<int*>(trapping_load_pc));
+-    vreplgr2vr_d(kSimd128ScratchReg, scratch);
+-    if (memtype == MachineType::Int8()) {
+-      vexth_h_b(dstReg, kSimd128ScratchReg);
+-    } else if (memtype == MachineType::Uint8()) {
+-      vexth_hu_bu(dstReg, kSimd128ScratchReg);
+-    } else if (memtype == MachineType::Int16()) {
+-      vexth_w_h(dstReg, kSimd128ScratchReg);
+-    } else if (memtype == MachineType::Uint16()) {
+-      vexth_wu_hu(dstReg, kSimd128ScratchReg);
+-    } else if (memtype == MachineType::Int32()) {
+-      vexth_d_w(dstReg, kSimd128ScratchReg);
+-    } else if (memtype == MachineType::Uint32()) {
+-      vexth_du_wu(dstReg, kSimd128ScratchReg);
+-    }
++    int size = memtype == MachineType::Int8() || memtype == MachineType::Uint8()     ? 1
++               : memtype == MachineType::Int16() || memtype == MachineType::Uint16() ? 2
++                                                                                     : 4;
++    bool sign = memtype == MachineType::Int8() || memtype == MachineType::Int16() ||
++                memtype == MachineType::Int32();
++    vextr(dstReg, scratch, size, sign);
+   } else if (transform == LoadTransformationKind::kZeroExtend) {
+-    vxor_v(dstReg, dstReg, dstReg);
+     if (memtype == MachineType::Int32()) {
+       Ld_wu(scratch, src_op, reinterpret_cast<int*>(trapping_load_pc));
+-      vinsgr2vr_w(dstReg, scratch, 0);
+     } else {
+       DCHECK_EQ(MachineType::Int64(), memtype);
+       Ld_d(scratch, src_op, reinterpret_cast<int*>(trapping_load_pc));
+-      vinsgr2vr_d(dstReg, scratch, 0);
+     }
++    vzext(dstReg, scratch);
+   } else {
+     DCHECK_EQ(LoadTransformationKind::kSplat, transform);
+     if (memtype == MachineType::Int8()) {
+@@ -3705,80 +3695,62 @@ void LiftoffAssembler::emit_i16x8_uconvert_i32x4(LiftoffRegister dst,
+ 
+ void LiftoffAssembler::emit_i16x8_sconvert_i8x16_low(LiftoffRegister dst,
+                                                      LiftoffRegister src) {
+-  vilvl_b(kSimd128ScratchReg, src.fp().toV(), src.fp().toV());
+-  vslli_h(dst.fp().toV(), kSimd128ScratchReg, 8);
+-  vsrai_h(dst.fp().toV(), dst.fp().toV(), 8);
++  vext(dst.fp().toV(), src.fp().toV(), 1, true, false);
+ }
+ 
+ void LiftoffAssembler::emit_i16x8_sconvert_i8x16_high(LiftoffRegister dst,
+                                                       LiftoffRegister src) {
+-  vilvh_b(kSimd128ScratchReg, src.fp().toV(), src.fp().toV());
+-  vslli_h(dst.fp().toV(), kSimd128ScratchReg, 8);
+-  vsrai_h(dst.fp().toV(), dst.fp().toV(), 8);
++  vext(dst.fp().toV(), src.fp().toV(), 1, true, true);
+ }
+ 
+ void LiftoffAssembler::emit_i16x8_uconvert_i8x16_low(LiftoffRegister dst,
+                                                      LiftoffRegister src) {
+-  vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+-  vilvl_b(dst.fp().toV(), kSimd128RegZero, src.fp().toV());
++  vext(dst.fp().toV(), src.fp().toV(), 1, false, false);
+ }
+ 
+ void LiftoffAssembler::emit_i16x8_uconvert_i8x16_high(LiftoffRegister dst,
+                                                       LiftoffRegister src) {
+-  vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+-  vilvh_b(dst.fp().toV(), kSimd128RegZero, src.fp().toV());
++  vext(dst.fp().toV(), src.fp().toV(), 1, false, true);
+ }
+ 
+ void LiftoffAssembler::emit_i32x4_sconvert_i16x8_low(LiftoffRegister dst,
+                                                      LiftoffRegister src) {
+-  vilvl_h(kSimd128ScratchReg, src.fp().toV(), src.fp().toV());
+-  vslli_w(dst.fp().toV(), kSimd128ScratchReg, 16);
+-  vsrai_w(dst.fp().toV(), dst.fp().toV(), 16);
++  vext(dst.fp().toV(), src.fp().toV(), 2, true, false);
+ }
+ 
+ void LiftoffAssembler::emit_i32x4_sconvert_i16x8_high(LiftoffRegister dst,
+                                                       LiftoffRegister src) {
+-  vilvh_h(kSimd128ScratchReg, src.fp().toV(), src.fp().toV());
+-  vslli_w(dst.fp().toV(), kSimd128ScratchReg, 16);
+-  vsrai_w(dst.fp().toV(), dst.fp().toV(), 16);
++  vext(dst.fp().toV(), src.fp().toV(), 2, true, true);
+ }
+ 
+ void LiftoffAssembler::emit_i32x4_uconvert_i16x8_low(LiftoffRegister dst,
+                                                      LiftoffRegister src) {
+-  vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+-  vilvl_h(dst.fp().toV(), kSimd128RegZero, src.fp().toV());
++  vext(dst.fp().toV(), src.fp().toV(), 2, false, false);
+ }
+ 
+ void LiftoffAssembler::emit_i32x4_uconvert_i16x8_high(LiftoffRegister dst,
+                                                       LiftoffRegister src) {
+-  vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+-  vilvh_h(dst.fp().toV(), kSimd128RegZero, src.fp().toV());
++  vext(dst.fp().toV(), src.fp().toV(), 2, false, true);
+ }
+ 
+ void LiftoffAssembler::emit_i64x2_sconvert_i32x4_low(LiftoffRegister dst,
+                                                      LiftoffRegister src) {
+-  vilvl_w(kSimd128ScratchReg, src.fp().toV(), src.fp().toV());
+-  vslli_d(dst.fp().toV(), kSimd128ScratchReg, 32);
+-  vsrai_d(dst.fp().toV(), dst.fp().toV(), 32);
++  vext(dst.fp().toV(), src.fp().toV(), 4, true, false);
+ }
+ 
+ void LiftoffAssembler::emit_i64x2_sconvert_i32x4_high(LiftoffRegister dst,
+                                                       LiftoffRegister src) {
+-  vilvh_w(kSimd128ScratchReg, src.fp().toV(), src.fp().toV());
+-  vslli_d(dst.fp().toV(), kSimd128ScratchReg, 32);
+-  vsrai_d(dst.fp().toV(), dst.fp().toV(), 32);
++  vext(dst.fp().toV(), src.fp().toV(), 4, true, true);
+ }
+ 
+ void LiftoffAssembler::emit_i64x2_uconvert_i32x4_low(LiftoffRegister dst,
+                                                      LiftoffRegister src) {
+-  vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+-  vilvl_w(dst.fp().toV(), kSimd128RegZero, src.fp().toV());
++  vext(dst.fp().toV(), src.fp().toV(), 4, false, false);
+ }
+ 
+ void LiftoffAssembler::emit_i64x2_uconvert_i32x4_high(LiftoffRegister dst,
+                                                       LiftoffRegister src) {
+-  vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
+-  vilvh_w(dst.fp().toV(), kSimd128RegZero, src.fp().toV());
++  vext(dst.fp().toV(), src.fp().toV(), 4, false, true);
+ }
+ 
+ void LiftoffAssembler::emit_i8x16_rounding_average_u(LiftoffRegister dst,

@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 03:51:03 +0100
+Subject: [PATCH 37/99] v8: e2k: branch to deoptimization and deferred code in
+ one wide command
+
+A conditional branch is {compare; disp} {ct ? predicate}: not taken it
+costs four cycles, the predicate of the previous command not being ready.
+A branch on the result of a compare of the same command (rbranch ? %cmp0)
+costs one cycle not taken and 14 instead of 6 taken. It is used where the
+branch is almost never taken: deoptimization checks and branches from
+ordinary code into deferred blocks (RareBranchScope). fib(30) under
+TurboFan: 225 -> 200 ms.
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc  |  1 +
+ chromium/v8/src/codegen/e2k/assembler-e2k.h   | 19 +++++++++++++++++++
+ chromium/v8/src/codegen/e2k/e2k_asm.h         |  9 +++++++++
+ chromium/v8/src/codegen/e2k/la_asm.h          | 11 +++++++++--
+ .../backend/e2k/code-generator-e2k.cc         | 16 +++++++++++++++-
+ 5 files changed, 53 insertions(+), 3 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index be7a148d67..d1de627151 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -1082,6 +1082,7 @@ la::Assembler& Assembler::OpenSlots() {
+             : slot_open_ ? kStartOpen
+                          : kStartAsked;
+   l.settled = static_cast<int>(l.la.settled());
++  l.la.set_rare(rare_branch_);
+   return l.la;
+ }
+ 
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index c90d2093c5..64e80fe5d5 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -400,6 +400,23 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   // rd = imm, not patchable.
+   void li(Register rd, int64_t imm);
+ 
++  // Conditional branches on registers (beq..bnez) emitted in this scope are
++  // almost never taken: deoptimization, deferred code. They become one wide
++  // command, the compare and a branch on its result: one cycle when not
++  // taken instead of four, 14 when taken instead of 6.
++  class V8_NODISCARD RareBranchScope {
++   public:
++    RareBranchScope(Assembler* assem, bool rare)
++        : assem_(assem), old_(assem->rare_branch_) {
++      assem_->rare_branch_ = rare;
++    }
++    ~RareBranchScope() { assem_->rare_branch_ = old_; }
++
++   private:
++    Assembler* assem_;
++    bool old_;
++  };
++
+   // --------Branch-and-jump-instructions----------
+   // We don't use likely variant of instructions.
+   void b(int32_t offset);
+@@ -1678,6 +1695,8 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+ 
+   int next_buffer_check_;  // pc offset of next buffer check.
+ 
++  bool rare_branch_ = false;  // See RareBranchScope.
++
+   // Emission of the trampoline pool may be blocked in some code sequences.
+   int trampoline_pool_blocked_nesting_;  // Block emission if this is not zero.
+   int no_trampoline_pool_before_;  // Block emission before this pc offset.
+diff --git a/chromium/v8/src/codegen/e2k/e2k_asm.h b/chromium/v8/src/codegen/e2k/e2k_asm.h
+index 5a3a1cecaa..5ef3ae543c 100644
+--- a/chromium/v8/src/codegen/e2k/e2k_asm.h
++++ b/chromium/v8/src/codegen/e2k/e2k_asm.h
+@@ -221,6 +221,15 @@ class Assembler : public Command {
+   void call(Ctpr c, int wbs, Pred p) { ct(c, p); cs1(0x50000000u | uint32_t(wbs)); }
+   void ibranch(Label* l) { ss(0xc0000020u); cs0(0, l); }
+   void ibranch(Label* l, Pred p) { usep(p); ss(0xc0000000u | cond(p)); cs0(0, l); }
++  // `rbranch l ? %cmpN` / `? ~%cmpN`: taken on the result of the compare this
++  // command has in channel 0, 1, 3 or 4, whatever predicate it writes
++  // (as shows it as `ibranch l ? %MLOCK || %cmpN`).  Not taken it costs one
++  // cycle where a branch on a predicate costs four, taken 14 instead of 6.
++  void rbranch(Label* l, int ch, bool negated) {
++    static const int8_t n[6] = {0, 1, -1, 2, 3, -1};
++    assert(n[ch] >= 0);
++    ss(0xc0000120u | uint32_t(n[ch]) << 1 | uint32_t(negated)); cs0(0, l);
++  }
+   // `ibranch l ? %MLOCK` (as also spells it `rbranch l`): taken when the store
+   // with mas = 2 of this command lost the lock taken by a load with mas = 7.
+   void ibranch_mlock(Label* l) { alone(); ss(0xc0000100u); cs0(0, l); }
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 2179ceeb69..3c29361d64 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -256,6 +256,9 @@ class Assembler : private e2k::Assembler {
+   // ---- branches ------------------------------------------------------------
+   // The target is prepared in %ctpr1 by the first command and taken by the
+   // second: measured faster than a single `ibranch` (see NOTES.md).
++  // beq..bnez given while set_rare(true) are one command, the compare and a
++  // branch on its result: for branches that are almost never taken.
++  void set_rare(bool on) { rare_ = on; }
+   void b(int32_t offset) { Own own(this); C(disp(e2k::ctpr1, to(offset))); L(ct(e2k::ctpr1)); }
+   void bl(int32_t offset) { Own own(this); C(disp(e2k::ctpr1, to(offset))); L(rrd(0, Sreg::nip, D(ra)); ct(e2k::ctpr1)); }
+   void beq(Register rj, Register rd, int32_t offset) { br(&E::cmpedb, false, R(rj), R(rd), offset); }
+@@ -646,7 +649,11 @@ class Assembler : private e2k::Assembler {
+   // LoongArch wants the sign extension.
+   void alu_w(Alu f, Register rd, e2k::Src1 a, e2k::Src2 b) { C((this->*f)(0, a, b, T0)); L(sxt(0, 2, T0, D(rd))); }
+   void set(Cmp f, Register rd, e2k::Src1 a, e2k::Src2 b) { C((this->*f)(0, a, b, PT0)); L(merged(0, 0, 1, D(rd), PT0)); }
+-  void br(Cmp f, bool negate, e2k::Src1 a, e2k::Src2 b, int32_t offset) { Own own(this); C((this->*f)(0, a, b, PT0); disp(e2k::ctpr1, to(offset))); L(ct(e2k::ctpr1, negate ? ~PT0 : PT0)); }
++  void br(Cmp f, bool negate, e2k::Src1 a, e2k::Src2 b, int32_t offset) {
++    Own own(this);
++    if (rare_) { L((this->*f)(0, a, b, PT0); rbranch(to(offset), 0, negate)); return; }
++    C((this->*f)(0, a, b, PT0); disp(e2k::ctpr1, to(offset))); L(ct(e2k::ctpr1, negate ? ~PT0 : PT0));
++  }
+   void pcadd(Register rd, e2k::Src2 bytes) { Own own(this); C(rrd(0, Sreg::ip, T0)); L(addd(0, T0, bytes, D(rd))); }
+   void mod(Alu div, Register rd, Register rj, Register rk) {
+     C(cmpedb(0, R(rk), 0, PT0); (this->*div)(5, R(rj), R(rk), T0); sm(5));
+@@ -725,7 +732,7 @@ class Assembler : private e2k::Assembler {
+   int64_t slot_ = 0, cmd_ = 0, end_ = 0, floor_ = 0;   // floor_: an Own instruction ends there at the earliest
+   int psize_ = 0;
+   int32_t fix_ = 0;
+-  bool fuse_ = false, sealed_ = true;
++  bool fuse_ = false, sealed_ = true, rare_ = false;
+   e2k::Command saved_;
+   Counts counts_ = {0, 0, 0, 0, 0};
+   e2k::Label target_;
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index f0c1d5545e..a9716c46f8 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -4648,6 +4648,17 @@ void CodeGenerator::AssembleArchBranch(Instruction* instr, BranchInfo* branch) {
+   Label* tlabel = branch->true_label;
+   Label* flabel = branch->false_label;
+ 
++  // A branch out of ordinary code into deferred code is rare.
++  bool rare = false;
++  E2kOperandConverter i(this, instr);
++  for (size_t k = 1; k <= 2; k++) {
++    RpoNumber target = i.InputRpo(instr->InputCount() - k);
++    if (GetLabel(target) == tlabel) {
++      rare = instructions()->InstructionBlockAt(target)->IsDeferred() &&
++             !instructions()->InstructionBlockAt(current_block_)->IsDeferred();
++    }
++  }
++  MacroAssembler::RareBranchScope rare_scope(masm(), rare);
+   AssembleBranchToLabels(this, masm(), instr, branch->condition, tlabel, flabel,
+                          branch->fallthru);
+ }
+@@ -4661,7 +4672,10 @@ void CodeGenerator::AssembleArchConditionalBranch(Instruction* instr,
+ 
+ void CodeGenerator::AssembleArchDeoptBranch(Instruction* instr,
+                                             BranchInfo* branch) {
+-  AssembleArchBranch(instr, branch);
++  MacroAssembler::RareBranchScope rare_scope(masm(), true);
++  AssembleBranchToLabels(this, masm(), instr, branch->condition,
++                         branch->true_label, branch->false_label,
++                         branch->fallthru);
+ }
+ 
+ void CodeGenerator::AssembleArchJumpRegardlessOfAssemblyOrder(

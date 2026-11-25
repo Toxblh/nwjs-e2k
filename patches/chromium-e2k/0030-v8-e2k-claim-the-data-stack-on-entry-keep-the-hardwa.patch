@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 00:26:42 +0100
+Subject: [PATCH 30/99] v8: e2k: claim the data stack on entry, keep the
+ hardware stack pointer at sp
+
+The kernel maps the data stack only as far as getsp has gone, so JSEntry
+claims 1.5 MB below the C stack top and releases it at once. Before a C
+call the hardware stack pointer is set to sp - 64 in both directions:
+left low after a deep recursion it made the C++ stack checks throw
+RangeError.
+---
+ chromium/v8/src/codegen/e2k/la_asm.h | 17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 49e8c785b3..0cb28f071f 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -171,6 +171,11 @@ class Assembler : private e2k::Assembler {
+     for (int i = 0; i < 64; i++) if (i < 3 || i >= 12) rest[n++] = e2k::r(i);
+     for (int i = 0; i < 4; i++) rest[n++] = e2k::b(i);
+     for (int i = 0; i < n; i += 6) C(for (int j = 0; j < 6 && i + j < n; j++) addd(j, 0, 0, rest[i + j]));
++    // The kernel grows the data stack only on getsp (a touch below the
++    // mapped part is SIGSEGV) and keeps it grown; the code moves sp without
++    // getsp, so the room is claimed here and given back at once.
++    C(getsp(0, -kStackReserve, T0));
++    C(getsp(0, kStackReserve, T0));
+     LF(getsp(0, 0, R(sp)));
+   }
+   // Return to the C caller of enter() with the value of a0.
+@@ -184,9 +189,10 @@ class Assembler : private e2k::Assembler {
+   // their type.  The callee's window starts at %b[4]: `call` raises SIGILL
+   // unless the caller's window ends at most 8 registers above that start, so
+   // the argument area is the top of the window (measured: wsz - wbs <= 4).  The hardware
+-  // stack pointer is first lowered to 64 bytes below sp (the callee owns that
+-  // area), so C frames go under the frames of this code; the hardware return
+-  // restores it.  Every register of the layer survives the call.
++  // stack pointer is first set to 64 bytes below sp (the callee owns that
++  // area), so C frames go right under the frames of this code. It is moved up
++  // as well as down: C++ measures its stack depth by it, and left low after a
++  // deep recursion it would make V8 report stack overflows.  Every register of the layer survives the call.
+   // ponytail: integer arguments first, then floating point ones; a C function
+   // that mixes them in another order needs the real signature here.
+   void ccall(Register target, int ngp, int nfp, int results) {
+@@ -195,9 +201,7 @@ class Assembler : private e2k::Assembler {
+     C(andd(0, T0, 0xffffffffffffll, T0));        // usd.base
+     C(subd(0, R(sp), T0, T0));
+     C(subd(0, T0, 64, T0));
+-    C(andd(0, T0, -16, T0));
+-    C(sard(0, T0, 63, T1));
+-    C(andd(0, T0, T1, T0));                      // min(sp - 64 - base, 0)
++    C(andd(0, T0, -16, T0));                     // down to sp - 64, or back up to it
+     C(getsp(0, T0, T1));
+     auto arg = [&](int i) { return i >= ngp && i < ngp + nfp ? e2k::r(32 + i - ngp) : e2k::r(4 + i); };
+     C(for (int i = 0; i < 6; i++) addd(i, arg(i), 0, e2k::b(4 + i)));
+@@ -630,6 +634,7 @@ class Assembler : private e2k::Assembler {
+   static constexpr Reg T0 = e2k::b(0), T1 = e2k::b(1), T2 = e2k::b(2), T3 = e2k::b(3);
+   static constexpr Pred PT0 = e2k::pred(8), PT1 = e2k::pred(9);
+   static constexpr int kWindow = 38;   // setwd wsz: %r0..%r75
++  static constexpr int kStackReserve = 1536 * 1024;   // more than V8's --stack-size (984 KB) plus its slack
+   int64_t slot_ = 0, cmd_ = 0;
+   int32_t fix_ = 0;
+   bool in_slot_ = false;

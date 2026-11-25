@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Wed, 7 Oct 2026 20:09:48 +0100
+Subject: [PATCH 04/99] e2k: rust target triple e2kv5, unescape -Zcrate-attr in
+ rustc wrapper
+
+---
+ chromium/build/config/rust.gni                | 4 ++++
+ chromium/build/rust/gni_impl/rustc_wrapper.py | 3 +++
+ chromium/build/rust/known-target-triples.txt  | 2 +-
+ 3 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/chromium/build/config/rust.gni b/chromium/build/config/rust.gni
+index 4998663101..c13a20abc0 100644
+--- a/chromium/build/config/rust.gni
++++ b/chromium/build/config/rust.gni
+@@ -235,6 +235,10 @@ if (is_linux || is_chromeos) {
+     rust_abi_target = "s390x-unknown-linux-gnu"
+   } else if (current_cpu == "loong64") {
+     rust_abi_target = "loongarch64-unknown-linux-gnu"
++  } else if (current_cpu == "e2k") {
++    # The baseline of ALT e2k packages, and the only target the system
++    # rustc ships a standard library for.
++    rust_abi_target = "e2kv5-unknown-linux-gnu"
+   } else {
+     # Best guess for other future platforms.
+     rust_abi_target = current_cpu + "-unknown-linux-gnu"
+diff --git a/chromium/build/rust/gni_impl/rustc_wrapper.py b/chromium/build/rust/gni_impl/rustc_wrapper.py
+index a3f66a6a5d..a12034ecba 100755
+--- a/chromium/build/rust/gni_impl/rustc_wrapper.py
++++ b/chromium/build/rust/gni_impl/rustc_wrapper.py
+@@ -137,6 +137,9 @@ def remove_gn_escaping_from_rsp_args(arg):
+     # `--cfg=feature=\"foo\"` => `--cfg=feature="foo"`
+     arg = arg.replace(r'\"', '"')
+ 
++    # `-Zcrate-attr=feature\(a,b\)` => `-Zcrate-attr=feature(a,b)`
++    arg = arg.replace(r'\(', '(').replace(r'\)', ')')
++
+     # `"foo bar"` => `foo bar` (Rust-style `.rsp` file expects one flag per line
+     # so it doesn't need to worry about escaping whitespace (unlike
+     # default-GN-style `.rsp` file where flags are separated by whitespace).
+diff --git a/chromium/build/rust/known-target-triples.txt b/chromium/build/rust/known-target-triples.txt
+index ad31a08fec..632c9e2c4e 100644
+--- a/chromium/build/rust/known-target-triples.txt
++++ b/chromium/build/rust/known-target-triples.txt
+@@ -29,7 +29,7 @@ i686-linux-android
+ i686-pc-windows-msvc
+ i686-unknown-linux-gnu
+ loongarch64-unknown-linux-gnu
+-e2k-unknown-linux-gnu
++e2kv5-unknown-linux-gnu
+ e2kv4-unknown-linux-gnu
+ e2kv5-unknown-linux-gnu
+ e2kv6-unknown-linux-gnu

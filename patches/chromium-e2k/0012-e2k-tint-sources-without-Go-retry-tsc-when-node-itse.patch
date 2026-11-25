@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Fri, 9 Oct 2026 21:40:22 +0100
+Subject: [PATCH 12/99] e2k: tint sources without Go, retry tsc when node
+ itself crashes
+
+---
+ chromium/third_party/dawn/src/tint/BUILD.gn   | 19 +++++++++++++-----
+ .../src/third_party/typescript/typescript.py  | 20 ++++++++++++-------
+ chromium/third_party/typescript/typescript.py | 14 +++++++++----
+ 3 files changed, 37 insertions(+), 16 deletions(-)
+
+diff --git a/chromium/third_party/dawn/src/tint/BUILD.gn b/chromium/third_party/dawn/src/tint/BUILD.gn
+index 37ab7ca982..d0abce3f8c 100644
+--- a/chromium/third_party/dawn/src/tint/BUILD.gn
++++ b/chromium/third_party/dawn/src/tint/BUILD.gn
+@@ -218,11 +218,20 @@ group("gmock_and_gtest") {
+   public_deps = [ "${dawn_root}/src/utils:gmock_and_gtest" ]
+ }
+ 
+-action("generate_sources") {
+-  script = "${dawn_root}/tools/generate-sources-gn.py"
+-  inputs = tint_generation_dependencies
+-  outputs = tint_generated_sources
+-  args = [ rebase_path(root_gen_dir, root_build_dir) ]
++if (host_cpu == "e2k") {
++  # There is no Go toolchain for e2k: use the pre-generated files checked into
++  # the source tree instead of running the generator.
++  copy("generate_sources") {
++    sources = rebase_path(tint_generated_sources, "${root_gen_dir}/src/tint")
++    outputs = [ "${root_gen_dir}/src/tint/{{source_target_relative}}" ]
++  }
++} else {
++  action("generate_sources") {
++    script = "${dawn_root}/tools/generate-sources-gn.py"
++    inputs = tint_generation_dependencies
++    outputs = tint_generated_sources
++    args = [ rebase_path(root_gen_dir, root_build_dir) ]
++  }
+ }
+ 
+ if (tint_build_benchmarks) {
+diff --git a/chromium/third_party/devtools-frontend/src/third_party/typescript/typescript.py b/chromium/third_party/devtools-frontend/src/third_party/typescript/typescript.py
+index 47ebfbffcb..b4459356f2 100644
+--- a/chromium/third_party/devtools-frontend/src/third_party/typescript/typescript.py
++++ b/chromium/third_party/devtools-frontend/src/third_party/typescript/typescript.py
+@@ -48,13 +48,19 @@ def _GetCommand():
+ 
+ def RunTypeScriptRaw(cmd_parts, stdout=None):
+     cmd = _GetCommand() + cmd_parts
+-    process = subprocess.Popen(cmd,
+-                               cwd=os.getcwd(),
+-                               stdout=subprocess.PIPE,
+-                               stderr=subprocess.PIPE,
+-                               universal_newlines=True,
+-                               encoding='utf-8')
+-    stdout, stderr = process.communicate()
++    # Node on e2k occasionally miscompiles tsc and dies with a bogus internal
++    # error (uncaught exception or signal); real diagnostics go to stdout and
++    # never print the Node.js version trailer, so just rerun in that case.
++    for _ in range(3 if platform.machine() == 'e2k' else 1):
++        process = subprocess.Popen(cmd,
++                                   cwd=os.getcwd(),
++                                   stdout=subprocess.PIPE,
++                                   stderr=subprocess.PIPE,
++                                   universal_newlines=True,
++                                   encoding='utf-8')
++        stdout, stderr = process.communicate()
++        if process.returncode >= 0 and '\nNode.js v' not in stderr:
++            break
+     return process.returncode, stdout, stderr
+ 
+ 
+diff --git a/chromium/third_party/typescript/typescript.py b/chromium/third_party/typescript/typescript.py
+index b31394ac7d..9a4637bdfa 100755
+--- a/chromium/third_party/typescript/typescript.py
++++ b/chromium/third_party/typescript/typescript.py
+@@ -36,10 +36,16 @@ def _GetCommand():
+ 
+ def RunTypeScriptRaw(cmd_parts, stdout=None):
+   cmd = _GetCommand() + cmd_parts
+-  process = subprocess.Popen(
+-      cmd, cwd=os.getcwd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+-      universal_newlines=True, encoding='utf-8')
+-  stdout, stderr = process.communicate()
++  # Node on e2k occasionally miscompiles tsc and dies with a bogus internal
++  # error (uncaught exception or signal); real diagnostics go to stdout and
++  # never print the Node.js version trailer, so just rerun in that case.
++  for _ in range(3 if platform.machine() == 'e2k' else 1):
++    process = subprocess.Popen(
++        cmd, cwd=os.getcwd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++        universal_newlines=True, encoding='utf-8')
++    stdout, stderr = process.communicate()
++    if process.returncode >= 0 and '\nNode.js v' not in stderr:
++      break
+   return process.returncode, stdout, stderr
+ 
+ 

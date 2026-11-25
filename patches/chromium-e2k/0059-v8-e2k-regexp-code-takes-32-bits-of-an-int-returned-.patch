@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 17:29:09 +0100
+Subject: [PATCH 59/99] v8: e2k: regexp code takes 32 bits of an int returned
+ by a C function
+
+The case-insensitive comparison returns int and the range-array lookup
+returns uint32_t; the code compared the whole register with zero.  On e2k
+a callee defines only the lower half of the register for such a result
+(clang returns "a + b" of two ints with a 32-bit add that leaves the upper
+half as it was), so a zero result could be read as non-zero.
+---
+ chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc b/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc
+index bc9a081677..a1200467b2 100644
+--- a/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc
++++ b/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc
+@@ -336,6 +336,9 @@ void RegExpMacroAssemblerE2K::CheckNotBackReferenceIgnoreCase(
+               : ExternalReference::re_case_insensitive_compare_non_unicode();
+       CallCFunctionFromIrregexpCode(function, argument_count);
+     }
++    // The function returns int: on e2k the upper half of the register is
++    // whatever the callee left there.
++    __ slli_w(a0, a0, 0);
+ 
+     // Check if function returned non-zero for success or zero for failure.
+     BranchOrBacktrack(on_no_match, eq, a0, Operand(zero_reg));
+@@ -469,6 +472,8 @@ void RegExpMacroAssemblerE2K::CallIsCharacterInRangeArray(
+     CallCFunctionFromIrregexpCode(
+         ExternalReference::re_is_character_in_range_array(), kNumArguments);
+   }
++  // The result is uint32_t: only the lower half of the register is defined.
++  __ slli_w(a0, a0, 0);
+ 
+   __ li(code_pointer(), Operand(masm_->CodeObject()));
+ }

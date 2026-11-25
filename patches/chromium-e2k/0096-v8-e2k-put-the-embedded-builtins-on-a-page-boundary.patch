@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Sat, 17 Oct 2026 00:16:27 +0100
+Subject: [PATCH 96/99] v8: e2k: put the embedded builtins on a page boundary
+
+With short builtin calls the builtins are re-embedded into each code
+range (one per isolate without pointer compression). On Linux V8 maps the
+file pages there with mremap(MREMAP_DONTUNMAP) when the blob starts on a
+page boundary; otherwise it copies the blob, a private dirty copy per
+isolate. Align the blob as on x64 (4 KB pages).
+---
+ .../embedded/platform-embedded-file-writer-generic.cc         | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/chromium/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.cc b/chromium/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.cc
+index 7788468079..08d0f532a0 100644
+--- a/chromium/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.cc
++++ b/chromium/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.cc
+@@ -68,7 +68,7 @@ void PlatformEmbeddedFileWriterGeneric::DeclareSymbolGlobal(const char* name) {
+ }
+ 
+ void PlatformEmbeddedFileWriterGeneric::AlignToCodeAlignment() {
+-#if V8_OS_LINUX && (V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_X64)
++#if V8_OS_LINUX && (V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_E2K)
+   // On these architectures and platforms, we remap the builtins, so need these
+   // to be aligned on a page boundary.
+ #if V8_TARGET_ARCH_ARM64
+@@ -88,7 +88,7 @@ void PlatformEmbeddedFileWriterGeneric::AlignToCodeAlignment() {
+ }
+ 
+ void PlatformEmbeddedFileWriterGeneric::AlignToPageSizeIfNeeded() {
+-#if V8_OS_LINUX && (V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_X64)
++#if V8_OS_LINUX && (V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_E2K)
+   // Since the builtins are remapped, need to pad until the next page boundary.
+ #if V8_TARGET_ARCH_ARM64
+   if (target_os_ == EmbeddedTargetOs::kAndroid) {

@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 16:54:53 +0100
+Subject: [PATCH 58/99] v8: e2k: take the result of an interceptor callback
+ from the C call
+
+CallApiFunctionAndReturn called the callback with no result registers,
+which is right for plain API callbacks and accessors (their result is
+in the frame), but an interceptor callback also returns v8::Intercepted
+and the code tests it. The test read a register the call had not set,
+so a property load through an interceptor handler returned that
+register as a value: in Chrome, element.addEventListener or nodeName of
+embed/object elements, and missing properties of Storage, collections
+and CSSStyleDeclaration read as a number once the load was cached.
+
+Fetch one result for interceptors (also on the profiling path) and
+test only its low 32 bits, the width of v8::Intercepted.
+---
+ chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+index ef22205493..8621420b05 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+@@ -6226,8 +6226,10 @@ void CallApiFunctionAndReturn(MacroAssembler* masm, bool with_profiling,
+   }
+ 
+   __ RecordComment("Call the api function directly.");
+-  // The callback returns nothing: its result is in the frame.
+-  __ StoreReturnAddressAndCall(function_address, 0);
++  // A callback returns nothing, its result is in the frame; an interceptor
++  // also returns v8::Intercepted, which is tested below.
++  const int num_results = handle_interceptor_result ? 1 : 0;
++  __ StoreReturnAddressAndCall(function_address, num_results);
+   __ bind(&done_api_call);
+ 
+   if (handle_interceptor_result) {
+@@ -6238,6 +6240,9 @@ void CallApiFunctionAndReturn(MacroAssembler* masm, bool with_profiling,
+     static_assert(kInterceptedNo == 1 && kInterceptedSize == 4);
+     static_assert(kInterceptedNo == kNotInterceptedSentinel);
+     static_assert(kInterceptedYes == 0);
++    // v8::Intercepted is 32 bits wide: test (and, for kInterceptedNo, return)
++    // only the low half of the result register.
++    __ slli_w(return_value, return_value, 0);
+     __ Branch(&done_reading_result, ne, return_value, Operand(zero_reg));
+   }
+ 
+@@ -6322,7 +6327,7 @@ void CallApiFunctionAndReturn(MacroAssembler* masm, bool with_profiling,
+               __ AsMemOperand(IsolateFieldId::kApiCallbackThunkArgument));
+     }
+     __ li(scratch, thunk_ref);
+-    __ StoreReturnAddressAndCall(scratch, 0);
++    __ StoreReturnAddressAndCall(scratch, num_results);
+     __ Branch(&done_api_call);
+   }
+ 

@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 17:30:33 +0100
+Subject: [PATCH 61/99] v8: e2k: correct the comment on int results in regexp
+ code
+
+Measured after 2974cba274: a 32-bit operation of e2k clears the upper half
+of its destination, so clang returns an int zero-extended, not with stale
+upper bits as that commit said (f(0x1234567800000001, 2) of "a + b" read
+as 64 bits gives 3, and INT_MAX + 1 gives 0x80000000).  The whole-register
+test against zero therefore held with this compiler; what is not
+guaranteed is the sign extension the code generator keeps for 32-bit
+values.  The extension stays, the comment says what was measured.
+---
+ chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc b/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc
+index ca613d0a91..87e09ccb97 100644
+--- a/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc
++++ b/chromium/v8/src/regexp/e2k/regexp-macro-assembler-e2k.cc
+@@ -336,8 +336,8 @@ void RegExpMacroAssemblerE2K::CheckNotBackReferenceIgnoreCase(
+               : ExternalReference::re_case_insensitive_compare_non_unicode();
+       CallCFunctionFromIrregexpCode(function, argument_count);
+     }
+-    // The function returns int: on e2k the upper half of the register is
+-    // whatever the callee left there.
++    // The function returns int: the callee defines its 32 bits (clang gives
++    // them zero-extended), generated code keeps 32-bit values sign-extended.
+     __ slli_w(a0, a0, 0);
+ 
+     // Check if function returned non-zero for success or zero for failure.
+@@ -472,7 +472,7 @@ void RegExpMacroAssemblerE2K::CallIsCharacterInRangeArray(
+     CallCFunctionFromIrregexpCode(
+         ExternalReference::re_is_character_in_range_array(), kNumArguments);
+   }
+-  // The result is uint32_t: only the lower half of the register is defined.
++  // The result is uint32_t: only its 32 bits are defined by the callee.
+   __ slli_w(a0, a0, 0);
+ 
+   __ li(code_pointer(), Operand(masm_->CodeObject()));
+@@ -811,7 +811,7 @@ DirectHandle<HeapObject> RegExpMacroAssemblerE2K::GetCode(
+     __ Sub_d(current_input_offset(), a0, end_of_input_address());
+     // Set a0 to address of char before start of the input string
+     // (effectively string position -1).
+-    // An int parameter: a C caller defines only the lower half of the register.
++    // An int parameter: a C caller defines only its 32 bits.
+     __ Ld_w(a1, MemOperand(frame_pointer(), kStartIndexOffset));
+     __ Sub_d(a0, current_input_offset(), Operand(char_size()));
+     __ slli_d(t1, a1, (mode() == UC16) ? 1 : 0);

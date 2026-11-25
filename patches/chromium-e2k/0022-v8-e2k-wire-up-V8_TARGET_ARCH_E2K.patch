@@ -1,0 +1,784 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Mon, 12 Oct 2026 15:20:40 +0100
+Subject: [PATCH 22/99] v8: e2k: wire up V8_TARGET_ARCH_E2K
+
+Add the e2k target next to the existing e2k host support: target
+detection and the host/target check in v8config.h, the gn source lists
+and defines for v8_current_cpu == "e2k", and the architecture selection
+in shared headers and sources. e2k follows the loong64 choices wherever
+shared code distinguishes architectures. The target is native only,
+there is no simulator.
+---
+ chromium/v8/BUILD.gn                          | 39 ++++++++++++
+ chromium/v8/include/v8-unwinder-state.h       |  2 +-
+ chromium/v8/include/v8config.h                | 11 +++-
+ .../v8/src/base/platform/platform-posix.cc    |  4 ++
+ chromium/v8/src/codegen/assembler-arch.h      |  2 +
+ chromium/v8/src/codegen/assembler-inl.h       |  2 +
+ chromium/v8/src/codegen/assembler.cc          |  2 +-
+ chromium/v8/src/codegen/assembler.h           |  2 +-
+ chromium/v8/src/codegen/constants-arch.h      |  2 +
+ chromium/v8/src/codegen/cpu-features.h        |  5 ++
+ chromium/v8/src/codegen/external-reference.cc |  3 +
+ .../src/codegen/interface-descriptors-inl.h   |  8 ++-
+ chromium/v8/src/codegen/macro-assembler.h     |  3 +
+ .../v8/src/codegen/maglev-safepoint-table.cc  |  2 +
+ chromium/v8/src/codegen/register-arch.h       |  2 +
+ .../v8/src/codegen/register-configuration.cc  |  2 +
+ chromium/v8/src/codegen/reglist.h             |  2 +
+ chromium/v8/src/codegen/reloc-info.cc         |  2 +-
+ chromium/v8/src/common/globals.h              |  4 +-
+ .../v8/src/compiler/backend/bitcast-elider.cc |  2 +-
+ .../src/compiler/backend/instruction-codes.h  |  2 +
+ .../compiler/backend/instruction-selector.cc  | 12 ++--
+ chromium/v8/src/compiler/c-linkage.cc         | 60 +++++++++++++++++++
+ .../load-store-simplification-reducer.h       |  2 +-
+ chromium/v8/src/diagnostics/gdb-jit.cc        |  2 +
+ chromium/v8/src/diagnostics/perf-jit.h        |  3 +
+ chromium/v8/src/execution/frame-constants.h   |  2 +
+ chromium/v8/src/execution/simulator.h         |  4 +-
+ .../src/interpreter/interpreter-assembler.cc  |  2 +-
+ chromium/v8/src/logging/log.cc                |  2 +
+ chromium/v8/src/objects/code.cc               |  2 +-
+ .../src/regexp/regexp-macro-assembler-arch.h  |  3 +
+ .../v8/src/regexp/regexp-macro-assembler.h    |  1 +
+ chromium/v8/src/regexp/regexp.cc              |  3 +
+ chromium/v8/src/runtime/runtime-atomics.cc    |  2 +-
+ 35 files changed, 180 insertions(+), 23 deletions(-)
+
+diff --git a/chromium/v8/BUILD.gn b/chromium/v8/BUILD.gn
+index f09551af17..affbc52db3 100644
+--- a/chromium/v8/BUILD.gn
++++ b/chromium/v8/BUILD.gn
+@@ -1092,6 +1092,7 @@ external_v8_defines = [
+   "V8_TARGET_ARCH_PPC64",
+   "V8_TARGET_ARCH_MIPS64",
+   "V8_TARGET_ARCH_LOONG64",
++  "V8_TARGET_ARCH_E2K",
+ ]
+ 
+ enabled_external_v8_defines = [
+@@ -1195,6 +1196,8 @@ if (v8_current_cpu == "arm64") {
+   enabled_external_v8_defines += [ "V8_TARGET_ARCH_MIPS64" ]
+ } else if (v8_current_cpu == "loong64") {
+   enabled_external_v8_defines += [ "V8_TARGET_ARCH_LOONG64" ]
++} else if (v8_current_cpu == "e2k") {
++  enabled_external_v8_defines += [ "V8_TARGET_ARCH_E2K" ]
+ }
+ 
+ disabled_external_v8_defines = external_v8_defines - enabled_external_v8_defines
+@@ -1733,6 +1736,9 @@ config("toolchain") {
+   if (v8_current_cpu == "loong64") {
+     defines += [ "V8_TARGET_ARCH_LOONG64" ]
+   }
++  if (v8_current_cpu == "e2k") {
++    defines += [ "V8_TARGET_ARCH_E2K" ]
++  }
+ 
+   if (v8_current_cpu == "s390x") {
+     cflags += [ "-ffp-contract=off" ]
+@@ -3513,6 +3519,8 @@ v8_cluster_source_set("v8_initializers") {
+       ### gcmole(loong64) ###
+       "src/builtins/loong64/builtins-loong64.cc",
+     ]
++  } else if (v8_current_cpu == "e2k") {
++    sources += [ "src/builtins/e2k/builtins-e2k.cc" ]
+   } else if (v8_current_cpu == "ppc64") {
+     sources += [
+       ### gcmole(ppc64) ###
+@@ -5294,6 +5302,18 @@ v8_header_set("v8_internal_headers") {
+         "src/baseline/mips64/baseline-compiler-mips64-inl.h",
+       ]
+     }
++  } else if (v8_current_cpu == "e2k") {
++    sources += [
++      "src/codegen/e2k/assembler-e2k-inl.h",
++      "src/codegen/e2k/assembler-e2k.h",
++      "src/codegen/e2k/constants-e2k.h",
++      "src/codegen/e2k/macro-assembler-e2k.h",
++      "src/codegen/e2k/register-e2k.h",
++      "src/codegen/e2k/reglist-e2k.h",
++      "src/compiler/backend/e2k/instruction-codes-e2k.h",
++      "src/execution/e2k/frame-constants-e2k.h",
++      "src/regexp/e2k/regexp-macro-assembler-e2k.h",
++    ]
+   } else if (v8_current_cpu == "loong64") {
+     sources += [
+       ### gcmole(loong64) ###
+@@ -5753,6 +5773,12 @@ if (v8_current_cpu == "x86") {
+     "src/compiler/backend/mips64/instruction-scheduler-mips64.cc",
+     "src/compiler/backend/mips64/instruction-selector-mips64.cc",
+   ]
++} else if (v8_current_cpu == "e2k") {
++  v8_compiler_sources += [
++    "src/compiler/backend/e2k/code-generator-e2k.cc",
++    "src/compiler/backend/e2k/instruction-scheduler-e2k.cc",
++    "src/compiler/backend/e2k/instruction-selector-e2k.cc",
++  ]
+ } else if (v8_current_cpu == "loong64") {
+   v8_compiler_sources += [
+     ### gcmole(loong64) ###
+@@ -6784,6 +6810,19 @@ v8_cluster_source_set("v8_base_without_compiler") {
+       "src/execution/mips64/simulator-mips64.cc",
+       "src/regexp/mips64/regexp-macro-assembler-mips64.cc",
+     ]
++  } else if (v8_current_cpu == "e2k") {
++    sources += [
++      "src/codegen/e2k/assembler-e2k.cc",
++      "src/codegen/e2k/constants-e2k.cc",
++      "src/codegen/e2k/cpu-e2k.cc",
++      "src/codegen/e2k/interface-descriptors-e2k-inl.h",
++      "src/codegen/e2k/macro-assembler-e2k.cc",
++      "src/deoptimizer/e2k/deoptimizer-e2k.cc",
++      "src/diagnostics/e2k/disasm-e2k.cc",
++      "src/diagnostics/e2k/unwinder-e2k.cc",
++      "src/execution/e2k/frame-constants-e2k.cc",
++      "src/regexp/e2k/regexp-macro-assembler-e2k.cc",
++    ]
+   } else if (v8_current_cpu == "loong64") {
+     sources += [
+       ### gcmole(loong64) ###
+diff --git a/chromium/v8/include/v8-unwinder-state.h b/chromium/v8/include/v8-unwinder-state.h
+index 084692f3a4..9b916d8acf 100644
+--- a/chromium/v8/include/v8-unwinder-state.h
++++ b/chromium/v8/include/v8-unwinder-state.h
+@@ -19,7 +19,7 @@ struct CalleeSavedRegisters {
+ };
+ #elif V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_IA32 || V8_TARGET_ARCH_ARM64 ||     \
+     V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_PPC64 || V8_TARGET_ARCH_RISCV64 || \
+-    V8_TARGET_ARCH_S390X || V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_RISCV32
++    V8_TARGET_ARCH_S390X || (V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K) || V8_TARGET_ARCH_RISCV32
+ struct CalleeSavedRegisters {};
+ #else
+ #error Target architecture was not detected as supported by v8
+diff --git a/chromium/v8/include/v8config.h b/chromium/v8/include/v8config.h
+index 9c6ca32838..ee25e8a221 100644
+--- a/chromium/v8/include/v8config.h
++++ b/chromium/v8/include/v8config.h
+@@ -931,7 +931,7 @@ V8 shared library set USING_V8_SHARED.
+ #if !V8_TARGET_ARCH_X64 && !V8_TARGET_ARCH_IA32 && !V8_TARGET_ARCH_ARM && \
+     !V8_TARGET_ARCH_ARM64 && !V8_TARGET_ARCH_MIPS64 &&                    \
+     !V8_TARGET_ARCH_PPC64 && !V8_TARGET_ARCH_S390X &&                     \
+-    !V8_TARGET_ARCH_RISCV64 && !V8_TARGET_ARCH_LOONG64 &&                 \
++    !V8_TARGET_ARCH_RISCV64 && !(V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K) &&                 \
+     !V8_TARGET_ARCH_RISCV32
+ #if defined(_M_X64) || defined(__x86_64__)
+ #define V8_TARGET_ARCH_X64 1
+@@ -945,6 +945,8 @@ V8 shared library set USING_V8_SHARED.
+ #define V8_TARGET_ARCH_MIPS64 1
+ #elif defined(__loongarch_lp64)
+ #define V8_TARGET_ARCH_LOONG64 1
++#elif defined(__e2k__)
++#define V8_TARGET_ARCH_E2K 1
+ #elif defined(_ARCH_PPC64)
+ #define V8_TARGET_ARCH_PPC64 1
+ #elif defined(__s390x__)
+@@ -977,6 +979,8 @@ V8 shared library set USING_V8_SHARED.
+ #define V8_TARGET_ARCH_64_BIT 1
+ #elif V8_TARGET_ARCH_MIPS64
+ #define V8_TARGET_ARCH_64_BIT 1
++#elif V8_TARGET_ARCH_E2K
++#define V8_TARGET_ARCH_64_BIT 1
+ #elif V8_TARGET_ARCH_LOONG64
+ #define V8_TARGET_ARCH_64_BIT 1
+ #elif V8_TARGET_ARCH_PPC64
+@@ -1021,6 +1025,9 @@ arm64 host
+ #if (V8_TARGET_ARCH_RISCV32 && !(V8_HOST_ARCH_IA32 || V8_HOST_ARCH_RISCV32))
+ #error Target architecture riscv32 is only supported on riscv32 and ia32 host
+ #endif
++#if (V8_TARGET_ARCH_E2K && !V8_HOST_ARCH_E2K)
++#error Target architecture e2k is only supported on e2k host
++#endif
+ #if (V8_TARGET_ARCH_LOONG64 && !(V8_HOST_ARCH_X64 || V8_HOST_ARCH_LOONG64))
+ #error Target architecture loong64 is only supported on loong64 and x64 host
+ #endif
+@@ -1034,6 +1041,8 @@ arm64 host
+ #define V8_TARGET_LITTLE_ENDIAN 1
+ #elif V8_TARGET_ARCH_ARM64
+ #define V8_TARGET_LITTLE_ENDIAN 1
++#elif V8_TARGET_ARCH_E2K
++#define V8_TARGET_LITTLE_ENDIAN 1
+ #elif V8_TARGET_ARCH_LOONG64
+ #define V8_TARGET_LITTLE_ENDIAN 1
+ #elif V8_TARGET_ARCH_MIPS64
+diff --git a/chromium/v8/src/base/platform/platform-posix.cc b/chromium/v8/src/base/platform/platform-posix.cc
+index f9224ea31c..1832416915 100644
+--- a/chromium/v8/src/base/platform/platform-posix.cc
++++ b/chromium/v8/src/base/platform/platform-posix.cc
+@@ -425,6 +425,10 @@ void* OS::GetRandomMmapAddr() {
+   // TODO(RISCV): We need more information from the kernel to correctly mask
+   // this address for RISC-V. https://github.com/v8-riscv/v8/issues/375
+   raw_addr &= 0x3FFFF000;
++#elif V8_TARGET_ARCH_E2K
++  // 40 or 47 bits of virtual addressing. Truncate to 38 bits to allow kernel
++  // chance to fulfill request.
++  raw_addr &= uint64_t{0x3FFFFF0000};
+ #elif V8_TARGET_ARCH_LOONG64
+   // 40 or 47 bits of virtual addressing. Truncate to 38 bits to allow kernel
+   // chance to fulfill request.
+diff --git a/chromium/v8/src/codegen/assembler-arch.h b/chromium/v8/src/codegen/assembler-arch.h
+index 0c2c5ef2bb..83d3dc5633 100644
+--- a/chromium/v8/src/codegen/assembler-arch.h
++++ b/chromium/v8/src/codegen/assembler-arch.h
+@@ -19,6 +19,8 @@
+ #include "src/codegen/ppc/assembler-ppc.h"
+ #elif V8_TARGET_ARCH_MIPS64
+ #include "src/codegen/mips64/assembler-mips64.h"
++#elif V8_TARGET_ARCH_E2K
++#include "src/codegen/e2k/assembler-e2k.h"
+ #elif V8_TARGET_ARCH_LOONG64
+ #include "src/codegen/loong64/assembler-loong64.h"
+ #elif V8_TARGET_ARCH_S390X
+diff --git a/chromium/v8/src/codegen/assembler-inl.h b/chromium/v8/src/codegen/assembler-inl.h
+index 85435c5310..1a3b06ed0f 100644
+--- a/chromium/v8/src/codegen/assembler-inl.h
++++ b/chromium/v8/src/codegen/assembler-inl.h
+@@ -20,6 +20,8 @@
+ #include "src/codegen/ppc/assembler-ppc-inl.h"
+ #elif V8_TARGET_ARCH_MIPS64
+ #include "src/codegen/mips64/assembler-mips64-inl.h"
++#elif V8_TARGET_ARCH_E2K
++#include "src/codegen/e2k/assembler-e2k-inl.h"
+ #elif V8_TARGET_ARCH_LOONG64
+ #include "src/codegen/loong64/assembler-loong64-inl.h"
+ #elif V8_TARGET_ARCH_S390X
+diff --git a/chromium/v8/src/codegen/assembler.cc b/chromium/v8/src/codegen/assembler.cc
+index d55a5a7fdd..579629b9ef 100644
+--- a/chromium/v8/src/codegen/assembler.cc
++++ b/chromium/v8/src/codegen/assembler.cc
+@@ -74,7 +74,7 @@ AssemblerOptions AssemblerOptions::Default(Isolate* isolate) {
+   options.enable_simulator_code = !serializer || v8_flags.target_is_simulator;
+ #endif
+ 
+-#if V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_LOONG64 || \
++#if V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64 || (V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K) || \
+     V8_TARGET_ARCH_RISCV64
+   options.code_range_base = isolate->heap()->code_range_base();
+ #endif
+diff --git a/chromium/v8/src/codegen/assembler.h b/chromium/v8/src/codegen/assembler.h
+index 87e29895e6..cfbdd6b0ca 100644
+--- a/chromium/v8/src/codegen/assembler.h
++++ b/chromium/v8/src/codegen/assembler.h
+@@ -401,7 +401,7 @@ class V8_EXPORT_PRIVATE AssemblerBase : public Malloced {
+ // MIPS, LOONG, RISC-V, and PPC64 need to use their own implementations to avoid
+ // the influence of branch trampolines. They provide their implementations in
+ // the architecture-specific assembler subclasses.
+-#if !defined(V8_TARGET_ARCH_MIPS64) && !defined(V8_TARGET_ARCH_LOONG64) &&  \
++#if !defined(V8_TARGET_ARCH_MIPS64) && !(defined(V8_TARGET_ARCH_LOONG64) || defined(V8_TARGET_ARCH_E2K)) &&  \
+     !defined(V8_TARGET_ARCH_RISCV32) && !defined(V8_TARGET_ARCH_RISCV64) && \
+     !defined(V8_TARGET_ARCH_PPC64)
+   int pc_offset_for_safepoint() const { return pc_offset(); }
+diff --git a/chromium/v8/src/codegen/constants-arch.h b/chromium/v8/src/codegen/constants-arch.h
+index b39c9d326a..9f3e78825f 100644
+--- a/chromium/v8/src/codegen/constants-arch.h
++++ b/chromium/v8/src/codegen/constants-arch.h
+@@ -13,6 +13,8 @@
+ #include "src/codegen/ia32/constants-ia32.h"
+ #elif V8_TARGET_ARCH_MIPS64
+ #include "src/codegen/mips64/constants-mips64.h"
++#elif V8_TARGET_ARCH_E2K
++#include "src/codegen/e2k/constants-e2k.h"
+ #elif V8_TARGET_ARCH_LOONG64
+ #include "src/codegen/loong64/constants-loong64.h"
+ #elif V8_TARGET_ARCH_PPC64
+diff --git a/chromium/v8/src/codegen/cpu-features.h b/chromium/v8/src/codegen/cpu-features.h
+index fdaa3e15aa..ddcc87608b 100644
+--- a/chromium/v8/src/codegen/cpu-features.h
++++ b/chromium/v8/src/codegen/cpu-features.h
+@@ -77,6 +77,11 @@ enum CpuFeature {
+   MIPSr6,
+   MIPS_SIMD,  // MSA instructions
+ 
++#elif V8_TARGET_ARCH_E2K
++  FPU,
++  LSX,
++  LASX,
++
+ #elif V8_TARGET_ARCH_LOONG64
+   FPU,
+   LSX,
+diff --git a/chromium/v8/src/codegen/external-reference.cc b/chromium/v8/src/codegen/external-reference.cc
+index 55aa842257..a657d9777e 100644
+--- a/chromium/v8/src/codegen/external-reference.cc
++++ b/chromium/v8/src/codegen/external-reference.cc
+@@ -1090,6 +1090,9 @@ ExternalReference::invoke_named_interceptor_setter_callback() {
+ #elif V8_TARGET_ARCH_MIPS64
+ #define re_stack_check_func \
+   regexp::RegExpMacroAssemblerMIPS::CheckStackGuardState
++#elif V8_TARGET_ARCH_E2K
++#define re_stack_check_func \
++  regexp::RegExpMacroAssemblerE2K::CheckStackGuardState
+ #elif V8_TARGET_ARCH_LOONG64
+ #define re_stack_check_func \
+   regexp::RegExpMacroAssemblerLOONG64::CheckStackGuardState
+diff --git a/chromium/v8/src/codegen/interface-descriptors-inl.h b/chromium/v8/src/codegen/interface-descriptors-inl.h
+index 2f93e57a8a..eba84749dd 100644
+--- a/chromium/v8/src/codegen/interface-descriptors-inl.h
++++ b/chromium/v8/src/codegen/interface-descriptors-inl.h
+@@ -30,6 +30,8 @@
+ #include "src/codegen/s390/interface-descriptors-s390-inl.h"
+ #elif V8_TARGET_ARCH_MIPS64
+ #include "src/codegen/mips64/interface-descriptors-mips64-inl.h"
++#elif V8_TARGET_ARCH_E2K
++#include "src/codegen/e2k/interface-descriptors-e2k-inl.h"
+ #elif V8_TARGET_ARCH_LOONG64
+ #include "src/codegen/loong64/interface-descriptors-loong64-inl.h"
+ #elif V8_TARGET_ARCH_RISCV32 || V8_TARGET_ARCH_RISCV64
+@@ -314,7 +316,7 @@ constexpr RegList WriteBarrierDescriptor::ComputeSavedRegisters(
+   if (slot_address != no_reg && slot_address != SlotAddressRegister()) {
+     saved_registers.set(SlotAddressRegister());
+   }
+-#elif V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_LOONG64 || \
++#elif V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_ARM || (V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K) || \
+     V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_RISCV64 || V8_TARGET_ARCH_RISCV32
+   if (object != ObjectRegister()) saved_registers.set(ObjectRegister());
+   // The slot address is always clobbered.
+@@ -464,7 +466,7 @@ constexpr auto BaselineOutOfLinePrologueDescriptor::registers() {
+   // TODO(v8:11421): Implement on other platforms.
+ #if V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_ARM ||       \
+     V8_TARGET_ARCH_PPC64 || V8_TARGET_ARCH_S390X || V8_TARGET_ARCH_RISCV64 || \
+-    V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_RISCV32
++    V8_TARGET_ARCH_MIPS64 || (V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K) || V8_TARGET_ARCH_RISCV32
+   return RegisterArray(
+       kContextRegister, kJSFunctionRegister, kJavaScriptCallArgCountRegister,
+       kJavaScriptCallExtraArg1Register, kJavaScriptCallNewTargetRegister,
+@@ -485,7 +487,7 @@ constexpr auto BaselineLeaveFrameDescriptor::registers() {
+ #if V8_TARGET_ARCH_IA32 || V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64 ||  \
+     V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_PPC64 || V8_TARGET_ARCH_S390X || \
+     V8_TARGET_ARCH_RISCV64 || V8_TARGET_ARCH_MIPS64 ||                    \
+-    V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_RISCV32
++    (V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K) || V8_TARGET_ARCH_RISCV32
+   return RegisterArray(ParamsSizeRegister(), WeightRegister());
+ #else
+   return DefaultRegisterArray();
+diff --git a/chromium/v8/src/codegen/macro-assembler.h b/chromium/v8/src/codegen/macro-assembler.h
+index 14c3038bd0..dcaafe1dfc 100644
+--- a/chromium/v8/src/codegen/macro-assembler.h
++++ b/chromium/v8/src/codegen/macro-assembler.h
+@@ -71,6 +71,9 @@ enum class ArgumentAdaptionMode { kAdapt, kDontAdapt };
+ #elif V8_TARGET_ARCH_MIPS64
+ #include "src/codegen/mips64/constants-mips64.h"
+ #include "src/codegen/mips64/macro-assembler-mips64.h"
++#elif V8_TARGET_ARCH_E2K
++#include "src/codegen/e2k/constants-e2k.h"
++#include "src/codegen/e2k/macro-assembler-e2k.h"
+ #elif V8_TARGET_ARCH_LOONG64
+ #include "src/codegen/loong64/constants-loong64.h"
+ #include "src/codegen/loong64/macro-assembler-loong64.h"
+diff --git a/chromium/v8/src/codegen/maglev-safepoint-table.cc b/chromium/v8/src/codegen/maglev-safepoint-table.cc
+index edff237eaa..bdb78f16ac 100644
+--- a/chromium/v8/src/codegen/maglev-safepoint-table.cc
++++ b/chromium/v8/src/codegen/maglev-safepoint-table.cc
+@@ -169,6 +169,8 @@ void MaglevSafepointTableBuilder::Emit(Assembler* assembler, int stack_slots) {
+ #if V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_ARM64
+   // We cannot emit a const pool within the safepoint table.
+   Assembler::BlockConstPoolScope block_const_pool(assembler);
++#elif defined(V8_TARGET_ARCH_E2K)
++  Assembler::BlockTrampolinePoolScope block_trampoline_pool(assembler);
+ #elif defined(V8_TARGET_ARCH_LOONG64)
+   Assembler::BlockTrampolinePoolScope block_trampoline_pool(assembler);
+ #endif
+diff --git a/chromium/v8/src/codegen/register-arch.h b/chromium/v8/src/codegen/register-arch.h
+index 025f47f165..9583824307 100644
+--- a/chromium/v8/src/codegen/register-arch.h
++++ b/chromium/v8/src/codegen/register-arch.h
+@@ -19,6 +19,8 @@
+ #include "src/codegen/ppc/register-ppc.h"
+ #elif V8_TARGET_ARCH_MIPS64
+ #include "src/codegen/mips64/register-mips64.h"
++#elif V8_TARGET_ARCH_E2K
++#include "src/codegen/e2k/register-e2k.h"
+ #elif V8_TARGET_ARCH_LOONG64
+ #include "src/codegen/loong64/register-loong64.h"
+ #elif V8_TARGET_ARCH_S390X
+diff --git a/chromium/v8/src/codegen/register-configuration.cc b/chromium/v8/src/codegen/register-configuration.cc
+index 65ad837f58..5e7629cc55 100644
+--- a/chromium/v8/src/codegen/register-configuration.cc
++++ b/chromium/v8/src/codegen/register-configuration.cc
+@@ -91,6 +91,8 @@ static int get_num_allocatable_double_registers() {
+       kMaxAllocatableDoubleRegisterCount;
+ #elif V8_TARGET_ARCH_MIPS64
+       kMaxAllocatableDoubleRegisterCount;
++#elif V8_TARGET_ARCH_E2K
++      kMaxAllocatableDoubleRegisterCount;
+ #elif V8_TARGET_ARCH_LOONG64
+       kMaxAllocatableDoubleRegisterCount;
+ #elif V8_TARGET_ARCH_PPC64
+diff --git a/chromium/v8/src/codegen/reglist.h b/chromium/v8/src/codegen/reglist.h
+index 798b282f7e..b8d2b79add 100644
+--- a/chromium/v8/src/codegen/reglist.h
++++ b/chromium/v8/src/codegen/reglist.h
+@@ -17,6 +17,8 @@
+ #include "src/codegen/ppc/reglist-ppc.h"
+ #elif V8_TARGET_ARCH_MIPS64
+ #include "src/codegen/mips64/reglist-mips64.h"
++#elif V8_TARGET_ARCH_E2K
++#include "src/codegen/e2k/reglist-e2k.h"
+ #elif V8_TARGET_ARCH_LOONG64
+ #include "src/codegen/loong64/reglist-loong64.h"
+ #elif V8_TARGET_ARCH_S390X
+diff --git a/chromium/v8/src/codegen/reloc-info.cc b/chromium/v8/src/codegen/reloc-info.cc
+index c4b1166101..6ec1294bee 100644
+--- a/chromium/v8/src/codegen/reloc-info.cc
++++ b/chromium/v8/src/codegen/reloc-info.cc
+@@ -245,7 +245,7 @@ bool RelocInfo::OffHeapTargetIsCodedSpecially() {
+   return false;
+ #elif defined(V8_TARGET_ARCH_IA32) || defined(V8_TARGET_ARCH_MIPS64) ||   \
+     defined(V8_TARGET_ARCH_PPC64) || defined(V8_TARGET_ARCH_S390X) ||     \
+-    defined(V8_TARGET_ARCH_RISCV64) || defined(V8_TARGET_ARCH_LOONG64) || \
++    defined(V8_TARGET_ARCH_RISCV64) || (defined(V8_TARGET_ARCH_LOONG64) || defined(V8_TARGET_ARCH_E2K)) || \
+     defined(V8_TARGET_ARCH_RISCV32)
+   return true;
+ #endif
+diff --git a/chromium/v8/src/common/globals.h b/chromium/v8/src/common/globals.h
+index d4090c65e0..3a49c5812c 100644
+--- a/chromium/v8/src/common/globals.h
++++ b/chromium/v8/src/common/globals.h
+@@ -355,7 +355,7 @@ const size_t kShortBuiltinCallsOldSpaceSizeThreshold = size_t{2} * GB;
+ // to add support for IA32, because it has a totally different approach
+ // (using FP stack).
+ #if defined(V8_TARGET_ARCH_X64) || defined(V8_TARGET_ARCH_ARM64) ||      \
+-    defined(V8_TARGET_ARCH_MIPS64) || defined(V8_TARGET_ARCH_LOONG64) || \
++    defined(V8_TARGET_ARCH_MIPS64) || (defined(V8_TARGET_ARCH_LOONG64) || defined(V8_TARGET_ARCH_E2K)) || \
+     defined(V8_TARGET_ARCH_RISCV64)
+ #define V8_ENABLE_FP_PARAMS_IN_C_LINKAGE 1
+ #endif
+@@ -515,7 +515,7 @@ constexpr bool kPlatformRequiresCodeRange = true;
+ #if V8_HOST_ARCH_PPC64 && V8_TARGET_ARCH_PPC64 && V8_OS_LINUX
+ constexpr size_t kMaximalCodeRangeSize = 512 * MB;
+ constexpr size_t kMinExpectedOSPageSize = 64 * KB;  // OS page on PPC Linux
+-#elif V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_RISCV64
++#elif V8_TARGET_ARCH_ARM64 || (V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K) || V8_TARGET_ARCH_RISCV64
+ constexpr size_t kMaximalCodeRangeSize =
+     (COMPRESS_POINTERS_BOOL && !V8_EXTERNAL_CODE_SPACE_BOOL) ? 128 * MB
+                                                              : 256 * MB;
+diff --git a/chromium/v8/src/compiler/backend/bitcast-elider.cc b/chromium/v8/src/compiler/backend/bitcast-elider.cc
+index 9ea483cc62..ac1e47d0c7 100644
+--- a/chromium/v8/src/compiler/backend/bitcast-elider.cc
++++ b/chromium/v8/src/compiler/backend/bitcast-elider.cc
+@@ -21,7 +21,7 @@ bool IsBitcast(Node* node) {
+ }
+ 
+ bool OwnedByWord32Op(Node* node) {
+-#if V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_RISCV64
++#if (V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K) || V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_RISCV64
+   return false;
+ #else
+   for (Node* const use : node->uses()) {
+diff --git a/chromium/v8/src/compiler/backend/instruction-codes.h b/chromium/v8/src/compiler/backend/instruction-codes.h
+index 49e9b6e0ef..e2ded18435 100644
+--- a/chromium/v8/src/compiler/backend/instruction-codes.h
++++ b/chromium/v8/src/compiler/backend/instruction-codes.h
+@@ -15,6 +15,8 @@
+ #include "src/compiler/backend/ia32/instruction-codes-ia32.h"
+ #elif V8_TARGET_ARCH_MIPS64
+ #include "src/compiler/backend/mips64/instruction-codes-mips64.h"
++#elif V8_TARGET_ARCH_E2K
++#include "src/compiler/backend/e2k/instruction-codes-e2k.h"
+ #elif V8_TARGET_ARCH_LOONG64
+ #include "src/compiler/backend/loong64/instruction-codes-loong64.h"
+ #elif V8_TARGET_ARCH_X64
+diff --git a/chromium/v8/src/compiler/backend/instruction-selector.cc b/chromium/v8/src/compiler/backend/instruction-selector.cc
+index 651477d0f6..6530d4fea2 100644
+--- a/chromium/v8/src/compiler/backend/instruction-selector.cc
++++ b/chromium/v8/src/compiler/backend/instruction-selector.cc
+@@ -1253,7 +1253,7 @@ void InstructionSelector::InitializeCallBuffer(
+       // immediate argument on all architectures.
+ #if defined(V8_TARGET_ARCH_X64) || defined(V8_TARGET_ARCH_ARM) ||       \
+     defined(V8_TARGET_ARCH_ARM64) || defined(V8_TARGET_ARCH_PPC64) ||   \
+-    defined(V8_TARGET_ARCH_S390X) || defined(V8_TARGET_ARCH_LOONG64) || \
++    defined(V8_TARGET_ARCH_S390X) || (defined(V8_TARGET_ARCH_LOONG64) || defined(V8_TARGET_ARCH_E2K)) || \
+     defined(V8_TARGET_ARCH_RISCV64)
+       if (this->IsHeapConstant(callee)) {
+         buffer->instruction_args.push_back(g.UseImmediate(callee));
+@@ -1857,7 +1857,7 @@ void InstructionSelector::VisitBitcastSmiToWord(OpIndex node) {
+   // the register allocator verifier.
+   // Loong64/RISCV64 port needs this gap move to sign-extend the Smis in 64-bit
+   // registers.
+-#if defined(DEBUG) || defined(V8_TARGET_ARCH_LOONG64) || \
++#if defined(DEBUG) || (defined(V8_TARGET_ARCH_LOONG64) || defined(V8_TARGET_ARCH_E2K)) || \
+     defined(V8_TARGET_ARCH_RISCV64)
+   OperandGenerator g(this);
+   Emit(kArchNop, g.DefineSameAsFirst(node),
+@@ -1975,7 +1975,7 @@ void InstructionSelector::VisitWord32AtomicPairCompareExchange(OpIndex node) {
+ 
+ #if !V8_TARGET_ARCH_X64 && !V8_TARGET_ARCH_ARM64 && !V8_TARGET_ARCH_MIPS64 && \
+     !V8_TARGET_ARCH_S390X && !V8_TARGET_ARCH_PPC64 &&                         \
+-    !V8_TARGET_ARCH_RISCV64 && !V8_TARGET_ARCH_LOONG64
++    !V8_TARGET_ARCH_RISCV64 && !(V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K)
+ 
+ VISIT_UNSUPPORTED_OP(Word64AtomicLoad)
+ VISIT_UNSUPPORTED_OP(Word64AtomicStore)
+@@ -2000,7 +2000,7 @@ IF_SIMD128(VISIT_UNSUPPORTED_OP, I64x2ReplaceLaneI32Pair)
+ 
+ #if !V8_TARGET_ARCH_X64 && !V8_TARGET_ARCH_S390X && !V8_TARGET_ARCH_PPC64
+ #if !V8_TARGET_ARCH_ARM64
+-#if !V8_TARGET_ARCH_MIPS64 && !V8_TARGET_ARCH_LOONG64 && \
++#if !V8_TARGET_ARCH_MIPS64 && !(V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K) && \
+     !V8_TARGET_ARCH_RISCV32 && !V8_TARGET_ARCH_RISCV64
+ 
+ IF_SIMD128(VISIT_UNSUPPORTED_OP, I64x2Splat)
+@@ -3570,7 +3570,7 @@ void InstructionSelector::VisitNode(OpIndex node) {
+             DCHECK(SmiValuesAre31Bits());
+ // On the LoongArch64 platform, 32-bit integers should always be
+ // sign-extended.
+-#if V8_TARGET_ARCH_LOONG64
++#if (V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K)
+             return VisitTruncateInt64ToInt32(node);
+ #else
+             return VisitBitcastSmiToWord(node);
+@@ -3593,7 +3593,7 @@ void InstructionSelector::VisitNode(OpIndex node) {
+         case multi(Rep::Compressed(), Rep::Word32()):
+           MarkAsWord32(node);
+           if (cast.kind == TaggedBitcastOp::Kind::kSmi) {
+-#if V8_TARGET_ARCH_LOONG64
++#if (V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K)
+             return VisitTruncateInt64ToInt32(node);
+ #else
+             return VisitBitcastSmiToWord(node);
+diff --git a/chromium/v8/src/compiler/c-linkage.cc b/chromium/v8/src/compiler/c-linkage.cc
+index f5a40efc57..17ae1a7b34 100644
+--- a/chromium/v8/src/compiler/c-linkage.cc
++++ b/chromium/v8/src/compiler/c-linkage.cc
+@@ -73,6 +73,16 @@ namespace {
+ #define CALLEE_SAVE_REGISTERS C_CALL_CALLEE_SAVE_REGISTERS
+ #define CALLEE_SAVE_FP_REGISTERS C_CALL_CALLEE_SAVE_FP_REGISTERS
+ 
++#elif V8_TARGET_ARCH_E2K
++// ===========================================================================
++// == e2k ================================================================
++// ===========================================================================
++#define PARAM_REGISTERS a0, a1, a2, a3, a4, a5, a6, a7
++#define FP_PARAM_REGISTERS f0, f1, f2, f3, f4, f5, f6, f7
++#define FP_RETURN_REGISTER f0
++#define CALLEE_SAVE_REGISTERS C_CALL_CALLEE_SAVE_REGISTERS
++#define CALLEE_SAVE_FP_REGISTERS C_CALL_CALLEE_SAVE_FP_REGISTERS
++
+ #elif V8_TARGET_ARCH_LOONG64
+ // ===========================================================================
+ // == loong64 ================================================================
+@@ -163,6 +173,56 @@ void BuildParameterLocations(const MachineSignature* msig,
+     }
+   }
+ }
++#elif defined(V8_TARGET_ARCH_E2K)
++// As defined in
++// https://loongson.github.io/LoongArch-Documentation/LoongArch-ELF-ABI-EN.html#_procedure_calling_convention
++// Loongarch calling convention uses GP to pass floating-point arguments when no
++// FP is available.
++void BuildParameterLocations(const MachineSignature* msig,
++                             size_t kFPParamRegisterCount,
++                             size_t kParamRegisterCount,
++                             const DoubleRegister* kFPParamRegisters,
++                             const v8::internal::Register* kParamRegisters,
++                             LocationSignature::Builder* out_locations) {
++#ifdef STACK_SHADOW_WORDS
++  int stack_offset = STACK_SHADOW_WORDS;
++#else
++  int stack_offset = 0;
++#endif
++  size_t num_params = 0;
++  size_t num_fp_params = 0;
++  for (size_t i = 0; i < msig->parameter_count(); i++) {
++    MachineType type = msig->GetParam(i);
++    if (IsFloatingPoint(type.representation())) {
++      if (num_fp_params < kFPParamRegisterCount) {
++        out_locations->AddParam(LinkageLocation::ForRegister(
++            kFPParamRegisters[num_fp_params].code(), type));
++        ++num_fp_params;
++      } else if (num_params < kParamRegisterCount) {
++        // ForNullRegister represents a floating-point param that should be put
++        // into the GPR, and reg_code is the negative of encoding of the
++        // GPR, and the maximum is -4.
++        out_locations->AddParam(LinkageLocation::ForNullRegister(
++            -kParamRegisters[num_params].code(), type));
++        ++num_params;
++      } else {
++        out_locations->AddParam(
++            LinkageLocation::ForCallerFrameSlot(-1 - stack_offset, type));
++        stack_offset++;
++      }
++    } else {
++      if (num_params < kParamRegisterCount) {
++        out_locations->AddParam(LinkageLocation::ForRegister(
++            kParamRegisters[num_params].code(), type));
++        ++num_params;
++      } else {
++        out_locations->AddParam(
++            LinkageLocation::ForCallerFrameSlot(-1 - stack_offset, type));
++        stack_offset++;
++      }
++    }
++  }
++}
+ #elif defined(V8_TARGET_ARCH_LOONG64)
+ // As defined in
+ // https://loongson.github.io/LoongArch-Documentation/LoongArch-ELF-ABI-EN.html#_procedure_calling_convention
+diff --git a/chromium/v8/src/compiler/turboshaft/load-store-simplification-reducer.h b/chromium/v8/src/compiler/turboshaft/load-store-simplification-reducer.h
+index 97811c7f80..f6b15eff68 100644
+--- a/chromium/v8/src/compiler/turboshaft/load-store-simplification-reducer.h
++++ b/chromium/v8/src/compiler/turboshaft/load-store-simplification-reducer.h
+@@ -22,7 +22,7 @@ namespace v8::internal::compiler::turboshaft {
+ // architecture-compatible ones.
+ #define V8_TARGET_ARCH_RESTRICTIVE_LOAD_STORE                             \
+   V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_RISCV64 || \
+-      V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_MIPS64 ||                  \
++      (V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K) || V8_TARGET_ARCH_MIPS64 ||                  \
+       V8_TARGET_ARCH_PPC64 || V8_TARGET_ARCH_RISCV32
+ 
+ struct LoadStoreSimplificationConfiguration {
+diff --git a/chromium/v8/src/diagnostics/gdb-jit.cc b/chromium/v8/src/diagnostics/gdb-jit.cc
+index db0c48f3b9..17c2e83cb8 100644
+--- a/chromium/v8/src/diagnostics/gdb-jit.cc
++++ b/chromium/v8/src/diagnostics/gdb-jit.cc
+@@ -1122,6 +1122,8 @@ class DebugInfoSection : public DebugSection {
+       UNIMPLEMENTED();
+ #elif V8_TARGET_ARCH_MIPS64
+       UNIMPLEMENTED();
++#elif V8_TARGET_ARCH_E2K
++      UNIMPLEMENTED();
+ #elif V8_TARGET_ARCH_LOONG64
+       UNIMPLEMENTED();
+ #elif V8_TARGET_ARCH_PPC64 && V8_OS_LINUX
+diff --git a/chromium/v8/src/diagnostics/perf-jit.h b/chromium/v8/src/diagnostics/perf-jit.h
+index 686a972c59..9a5f19d7eb 100644
+--- a/chromium/v8/src/diagnostics/perf-jit.h
++++ b/chromium/v8/src/diagnostics/perf-jit.h
+@@ -91,6 +91,7 @@ class PerfJitLogger : public CodeEventLogger {
+   static const uint32_t kElfMachARM = 40;
+   static const uint32_t kElfMachMIPS64 = 8;
+   static const uint32_t kElfMachLOONG64 = 258;
++  static const uint32_t kElfMachE2K = 175;  // EM_MCST_ELBRUS
+   static const uint32_t kElfMachARM64 = 183;
+   static const uint32_t kElfMachS390x = 22;
+   static const uint32_t kElfMachPPC64 = 21;
+@@ -105,6 +106,8 @@ class PerfJitLogger : public CodeEventLogger {
+     return kElfMachARM;
+ #elif V8_TARGET_ARCH_MIPS64
+     return kElfMachMIPS64;
++#elif V8_TARGET_ARCH_E2K
++    return kElfMachE2K;
+ #elif V8_TARGET_ARCH_LOONG64
+     return kElfMachLOONG64;
+ #elif V8_TARGET_ARCH_ARM64
+diff --git a/chromium/v8/src/execution/frame-constants.h b/chromium/v8/src/execution/frame-constants.h
+index 3dbf91d6fe..5569ed8ab5 100644
+--- a/chromium/v8/src/execution/frame-constants.h
++++ b/chromium/v8/src/execution/frame-constants.h
+@@ -859,6 +859,8 @@ inline static int FrameSlotToFPOffset(int slot) {
+ #include "src/execution/ppc/frame-constants-ppc.h"
+ #elif V8_TARGET_ARCH_MIPS64
+ #include "src/execution/mips64/frame-constants-mips64.h"
++#elif V8_TARGET_ARCH_E2K
++#include "src/execution/e2k/frame-constants-e2k.h"
+ #elif V8_TARGET_ARCH_LOONG64
+ #include "src/execution/loong64/frame-constants-loong64.h"
+ #elif V8_TARGET_ARCH_S390X
+diff --git a/chromium/v8/src/execution/simulator.h b/chromium/v8/src/execution/simulator.h
+index fddf7915b2..c71ad9af2a 100644
+--- a/chromium/v8/src/execution/simulator.h
++++ b/chromium/v8/src/execution/simulator.h
+@@ -14,8 +14,8 @@
+ #include "src/utils/utils.h"
+ #endif
+ 
+-#if V8_TARGET_ARCH_IA32 || V8_TARGET_ARCH_X64
+-// No simulator for ia32 or x64.
++#if V8_TARGET_ARCH_IA32 || V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_E2K
++// No simulator for ia32, x64 or e2k.
+ #elif V8_TARGET_ARCH_ARM64
+ #include "src/execution/arm64/simulator-arm64.h"
+ #elif V8_TARGET_ARCH_ARM
+diff --git a/chromium/v8/src/interpreter/interpreter-assembler.cc b/chromium/v8/src/interpreter/interpreter-assembler.cc
+index b8fbf96e0b..799b840ab9 100644
+--- a/chromium/v8/src/interpreter/interpreter-assembler.cc
++++ b/chromium/v8/src/interpreter/interpreter-assembler.cc
+@@ -1647,7 +1647,7 @@ bool InterpreterAssembler::TargetSupportsUnalignedAccess() {
+   return false;
+ #elif V8_TARGET_ARCH_IA32 || V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_S390X || \
+     V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_PPC64 ||  \
+-    V8_TARGET_ARCH_LOONG64
++    (V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K)
+   return true;
+ #else
+ #error "Unknown Architecture"
+diff --git a/chromium/v8/src/logging/log.cc b/chromium/v8/src/logging/log.cc
+index 773c24fa95..fbf257d80c 100644
+--- a/chromium/v8/src/logging/log.cc
++++ b/chromium/v8/src/logging/log.cc
+@@ -749,6 +749,8 @@ void LowLevelLogger::LogCodeInfo() {
+   const char arch[] = "arm";
+ #elif V8_TARGET_ARCH_PPC64
+   const char arch[] = "ppc64";
++#elif V8_TARGET_ARCH_E2K
++  const char arch[] = "e2k";
+ #elif V8_TARGET_ARCH_LOONG64
+   const char arch[] = "loong64";
+ #elif V8_TARGET_ARCH_ARM64
+diff --git a/chromium/v8/src/objects/code.cc b/chromium/v8/src/objects/code.cc
+index 20b4a94559..c2c42388a9 100644
+--- a/chromium/v8/src/objects/code.cc
++++ b/chromium/v8/src/objects/code.cc
+@@ -122,7 +122,7 @@ bool Code::IsIsolateIndependent(Isolate* isolate) {
+ #elif defined(V8_TARGET_ARCH_X64) || defined(V8_TARGET_ARCH_ARM64) ||  \
+     defined(V8_TARGET_ARCH_ARM) || defined(V8_TARGET_ARCH_S390X) ||    \
+     defined(V8_TARGET_ARCH_IA32) || defined(V8_TARGET_ARCH_RISCV64) || \
+-    defined(V8_TARGET_ARCH_LOONG64) || defined(V8_TARGET_ARCH_RISCV32)
++    (defined(V8_TARGET_ARCH_LOONG64) || defined(V8_TARGET_ARCH_E2K)) || defined(V8_TARGET_ARCH_RISCV32)
+   for (RelocIterator it(this, kModeMask); !it.done(); it.next()) {
+     // On these platforms we emit relative builtin-to-builtin
+     // jumps for isolate independent builtins in the snapshot. They are later
+diff --git a/chromium/v8/src/regexp/regexp-macro-assembler-arch.h b/chromium/v8/src/regexp/regexp-macro-assembler-arch.h
+index 9f51800b47..bfae2356f3 100644
+--- a/chromium/v8/src/regexp/regexp-macro-assembler-arch.h
++++ b/chromium/v8/src/regexp/regexp-macro-assembler-arch.h
+@@ -25,6 +25,9 @@ static constexpr bool kUnalignedReadSupported = true;
+ #elif V8_TARGET_ARCH_MIPS64
+ #include "src/regexp/mips64/regexp-macro-assembler-mips64.h"
+ static constexpr bool kUnalignedReadSupported = false;
++#elif V8_TARGET_ARCH_E2K
++#include "src/regexp/e2k/regexp-macro-assembler-e2k.h"
++static constexpr bool kUnalignedReadSupported = true;
+ #elif V8_TARGET_ARCH_LOONG64
+ #include "src/regexp/loong64/regexp-macro-assembler-loong64.h"
+ static constexpr bool kUnalignedReadSupported = true;
+diff --git a/chromium/v8/src/regexp/regexp-macro-assembler.h b/chromium/v8/src/regexp/regexp-macro-assembler.h
+index d513bec6db..cb95e8c965 100644
+--- a/chromium/v8/src/regexp/regexp-macro-assembler.h
++++ b/chromium/v8/src/regexp/regexp-macro-assembler.h
+@@ -302,6 +302,7 @@ class RegExpMacroAssembler {
+   V(ARM64)                      \
+   V(MIPS)                       \
+   V(LOONG64)                    \
++  V(E2K)                        \
+   V(RISCV)                      \
+   V(RISCV32)                    \
+   V(S390)                       \
+diff --git a/chromium/v8/src/regexp/regexp.cc b/chromium/v8/src/regexp/regexp.cc
+index 4aad8d5b57..7bf9076f2c 100644
+--- a/chromium/v8/src/regexp/regexp.cc
++++ b/chromium/v8/src/regexp/regexp.cc
+@@ -1044,6 +1044,9 @@ std::unique_ptr<regexp::RegExpMacroAssembler> CreateNativeMacroAssembler(
+ #elif V8_TARGET_ARCH_RISCV32
+   macro_assembler.reset(new regexp::RegExpMacroAssemblerRISCV(
+       isolate, zone, mode, output_register_count));
++#elif V8_TARGET_ARCH_E2K
++  macro_assembler.reset(new regexp::RegExpMacroAssemblerE2K(
++      isolate, zone, mode, output_register_count));
+ #elif V8_TARGET_ARCH_LOONG64
+   macro_assembler.reset(new regexp::RegExpMacroAssemblerLOONG64(
+       isolate, zone, mode, output_register_count));
+diff --git a/chromium/v8/src/runtime/runtime-atomics.cc b/chromium/v8/src/runtime/runtime-atomics.cc
+index 99b17949d7..95967912bc 100644
+--- a/chromium/v8/src/runtime/runtime-atomics.cc
++++ b/chromium/v8/src/runtime/runtime-atomics.cc
+@@ -21,7 +21,7 @@ namespace internal {
+ 
+ // Other platforms have CSA support, see builtins-sharedarraybuffer-gen.h.
+ #if V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_PPC64 || V8_TARGET_ARCH_S390X || \
+-    V8_TARGET_ARCH_LOONG64
++    (V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K)
+ 
+ namespace {
+ 

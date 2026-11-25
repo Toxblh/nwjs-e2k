@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 04:16:16 +0100
+Subject: [PATCH 38/99] v8: e2k: shorter return: max(argc) by a compare and a
+ merge, no jump to a shared return
+
+The count of arguments to drop, max(argc, parameter count), took six
+slots (li, slt, maskeqz, masknez, or); maxi_d is a compare and a merge.
+Return sites are no longer canonicalized: the jump to the one return
+sequence cost more than the sequence itself. A truncation to 32 bits of
+an arithmetic shift by 32 or more that has other users is the shift
+itself. fib(30) under TurboFan: 200 -> 171 ms.
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc  |  3 +++
+ chromium/v8/src/codegen/e2k/assembler-e2k.h   |  2 ++
+ chromium/v8/src/codegen/e2k/la_asm.h          |  2 ++
+ .../backend/e2k/code-generator-e2k.cc         | 19 +++----------
+ .../backend/e2k/instruction-selector-e2k.cc   | 27 +++++++++++--------
+ 5 files changed, 26 insertions(+), 27 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index d1de627151..c7a8ea76b8 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -1130,6 +1130,9 @@ void Assembler::TailCallC(int arg, int32_t offset) {
+ }
+ void Assembler::li64(Register rd, int64_t imm) { LA(li64(rd, imm)); }
+ void Assembler::li(Register rd, int64_t imm) { LA(li(rd, imm)); }
++void Assembler::maxi_d(Register rd, Register rj, int32_t imm) {
++  LA(maxi_d(rd, rj, imm));
++}
+ 
+ void Assembler::b(int32_t offset) { LA(b(offset)); }
+ void Assembler::bl(int32_t offset) { LA(bl(offset)); }
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index 64e80fe5d5..3b21d830e5 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -399,6 +399,8 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   void li64(Register rd, int64_t imm);
+   // rd = imm, not patchable.
+   void li(Register rd, int64_t imm);
++  // rd = max(rj, imm), signed.
++  void maxi_d(Register rd, Register rj, int32_t imm);
+ 
+   // Conditional branches on registers (beq..bnez) emitted in this scope are
+   // almost never taken: deoptimization, deferred code. They become one wide
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 3c29361d64..16c4591fca 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -299,6 +299,8 @@ class Assembler : private e2k::Assembler {
+   void slt(Register rd, Register rj, Register rk) { set(&E::cmpldb, rd, R(rj), R(rk)); }
+   void sltu(Register rd, Register rj, Register rk) { set(&E::cmpbdb, rd, R(rj), R(rk)); }
+   void slti(Register rd, Register rj, int32_t si12) { set(&E::cmpldb, rd, R(rj), si12); }
++  // Not LoongArch: rd = max(rj, imm), signed.
++  void maxi_d(Register rd, Register rj, int32_t imm) { C(cmpldb(0, R(rj), imm, PT0)); L(merged(0, R(rj), imm, D(rd), PT0)); }
+   void sltui(Register rd, Register rj, int32_t si12) { set(&E::cmpbdb, rd, R(rj), si12); }
+   // pc is the address of this slot.  pcaddi counts in instructions, pcaddu18i
+   // in units of 2^16 instructions (it pairs with jirl); pcaddu12i and
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index a9716c46f8..820c28ab45 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -5303,17 +5303,8 @@ void CodeGenerator::AssembleReturn(InstructionOperand* additional_pop_count) {
+   if (call_descriptor->IsCFunctionCall()) {
+     AssembleDeconstructFrame();
+   } else if (frame_access_state()->has_frame()) {
+-    // Canonicalize JSFunction return sites for now unless they have an variable
+-    // number of stack slot pops.
+-    if (additional_pop_count->IsImmediate() &&
+-        g.ToConstant(additional_pop_count).ToInt32() == 0) {
+-      if (return_label_.is_bound()) {
+-        __ Branch(&return_label_);
+-        return;
+-      } else {
+-        __ bind(&return_label_);
+-      }
+-    }
++    // Return sites are not canonicalized: a jump to the one return sequence
++    // costs more cycles than the sequence takes slots.
+     if (drop_jsargs) {
+       // Get the actual argument count
+       __ Ld_d(t0, MemOperand(fp, StandardFrameConstants::kArgCOffset));
+@@ -5323,11 +5314,7 @@ void CodeGenerator::AssembleReturn(InstructionOperand* additional_pop_count) {
+   if (drop_jsargs) {
+     // We must pop all arguments from the stack (including the receiver). This
+     // number of arguments is given by max(1 + argc_reg, parameter_count).
+-    if (parameter_slots > 1) {
+-      __ li(t1, parameter_slots);
+-      __ slt(t2, t0, t1);
+-      __ Movn(t0, t1, t2);
+-    }
++    if (parameter_slots > 1) __ maxi_d(t0, t0, parameter_slots);
+     __ Alsl_d(sp, t0, sp, kSystemPointerSizeLog2);
+   } else if (additional_pop_count->IsImmediate()) {
+     int additional_count = g.ToConstant(additional_pop_count).ToInt32();
+diff --git a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+index 9832c0adaa..2f522ac8f6 100644
+--- a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+@@ -1907,22 +1907,27 @@ void InstructionSelector::VisitTruncateInt64ToInt32(OpIndex node) {
+   E2kOperandGenerator g(this);
+   // TODO(e2k): Check TruncateInt64ToInt32 in VisitNode
+   OpIndex value = this->Get(node).input(0);
+-  if (CanCover(node, value)) {
+-    if (Get(value).Is<Opmask::kWord64ShiftRightArithmetic>()) {
+-      const ShiftOp& shift = Cast<ShiftOp>(value);
+-      auto shift_value = shift.right();
+-      if (CanCover(value, shift.left()) &&
+-          TryEmitExtendingLoad(this, value, node)) {
+-        return;
+-      } else if (int64_t constant;
+-                 MatchSignedIntegralConstant(shift_value, &constant)) {
+-        if (constant >= 32 && constant <= 63) {
++  if (Get(value).Is<Opmask::kWord64ShiftRightArithmetic>()) {
++    const ShiftOp& shift = Cast<ShiftOp>(value);
++    auto shift_value = shift.right();
++    bool cover = CanCover(node, value);
++    if (cover && CanCover(value, shift.left()) &&
++        TryEmitExtendingLoad(this, value, node)) {
++      return;
++    } else if (int64_t constant;
++               MatchSignedIntegralConstant(shift_value, &constant)) {
++      if (constant >= 32 && constant <= 63) {
++        if (cover) {
+           // After smi untagging no need for truncate. Combine sequence.
+           Emit(kE2kSra_d, g.DefineAsRegister(node),
+                g.UseRegister(shift.left()),
+                g.UseImmediate(static_cast<int32_t>(constant)));
+-          return;
++        } else {
++          // The shift has other users; its result is a sign-extended 32-bit
++          // value already.
++          EmitIdentity(node);
+         }
++        return;
+       }
+     }
+   }

@@ -1,0 +1,39 @@
+#!/bin/sh
+# xs-el gen [args] | build [targets] | status | shell cmd — Electron (and NW.js with XS_PROJ=nw) for e2k-v5 on the x86 server.
+# Tree ~/elnw/${XS_PROJ:-el}/src (hard-linked copy of the e2k Chromium 154 tree + project sources), out dir
+# out/${XS_OUT:-e2k-electron}; wrapper copy ~/elnw/xbin (v5, per-compile timeout + -O1 retry as in v4, js2c -O0);
+# snapshot generators (mksnapshot, v8_context_snapshot_generator, torque) run on an Elbrus through the xs-rexec queue; Rust from the seed /x/rseed/<out dir>.
+P=${XS_PROJ:-el}; XS_TREE=$HOME/elnw/$P/src; OUT=out/${XS_OUT:-e2k-electron}; OPT=${XS_OPT:--O2}
+U=xs-build-$P; LOG=$HOME/elnw/build-$P-${XS_OUT:-e2k-electron}.log
+RX="export XS_RUSTC_MISS_FAIL=${XS_RUSTC_MISS_FAIL:-1} XS_DISTCC_HOSTS=\"${XS_DISTCC_HOSTS:---localslots=6 --localslots_cpp=48 localhost/6}\" XS_REXEC=mksnapshot:v8_context_snapshot_generator:torque:node_mksnapshot PATH=\$PATH:/opt/node22/bin"
+ENTER() { cd ~/xtools && podman run --rm -i --name "$1" --network=${XS_NET:-none} --cap-add SYS_ADMIN --security-opt seccomp=unconfined \
+  --ulimit stack=-1:-1 --pids-limit=-1 \
+  -v $XS_TREE:/usr/src/chromium -v $HOME/e2k-root:/e2k:ro -v $HOME/e2k-x86/mcst:/opt/mcst:ro \
+  -v $HOME/xtools:/x -v $HOME/elnw/xbin:/x/bin -v $HOME/e2k-root/usr/lib/lccrt/lib/e2k64:/usr/lib/lccrt/lib/e2k64:ro -v $HOME/e2k-root/usr/include:/usr/include:ro -v $HOME/e2k-root/etc/sysconfig/kernel:/etc/sysconfig/kernel:ro -v $HOME/e2k-root/usr/lib/rustlib:/usr/lib/rustlib:ro -v $HOME/e2k-root/usr/lib/llvm-21.1:/usr/lib/llvm-21.1:ro -v $HOME/xtools/usrbin/node:/usr/bin/node:ro -v $HOME/xtools/node-v22.20.0-linux-x64:/opt/node22:ro -v $HOME/elnw/usrbin/rustc:/usr/bin/rustc:ro -v ${XS_RUST_REF:-$HOME/chromium/out/e2k-rel3}:/ref:ro \
+  -v $HOME/xtools/usrbin/bindgen:/usr/bin/bindgen:ro -v $HOME/xtools/usrbin/rustfmt:/usr/bin/rustfmt:ro -v $HOME/xtools/usrbin/gperf:/usr/bin/gperf:ro \
+  -v $HOME/xtools/usrbin/eu-strip:/usr/bin/eu-strip:ro -v /tmp/xs-tmp:/tmp -w /usr/src/chromium \
+  localhost/e2k-xbuild:1 /x/bin/xs-init bash -c "$2"; }
+case $1 in
+gen)
+  A=${2:-$HOME/elnw/args-$P.gn}
+  mkdir -p $XS_TREE/$OUT
+  { cat "$A"; echo 'rust_sysroot_absolute = "/usr"'; echo 'rustc_version = "rustc-1.87.0"'; echo 'host_cpu = "e2k"'; } > $XS_TREE/$OUT/args.gn.new
+  cmp -s $XS_TREE/$OUT/args.gn.new $XS_TREE/$OUT/args.gn && rm $XS_TREE/$OUT/args.gn.new || mv $XS_TREE/$OUT/args.gn.new $XS_TREE/$OUT/args.gn
+  ENTER xs-gen-$P ". /x/xs-env; export CFLAGS=$OPT CXXFLAGS=$OPT; gn --script-executable=/usr/bin/python3 gen $OUT 2>&1 | tail -60" ;;
+build)
+  shift
+  systemctl --user is-active -q $U && { echo "$U already running" >&2; exit 1; }
+  [ -f $LOG ] && mv $LOG $LOG.prev
+  T=${*:-electron}
+  systemd-run --user --unit=$U --collect -p StandardOutput=file:$LOG -p StandardError=file:$LOG \
+    sh -c "s=\$(date +%s); XS_NET=host XS_TREE=$XS_TREE XS_PROJ=$P XS_OUT=${XS_OUT:-e2k-electron} $HOME/elnw/bin/xs-el _in \"$T\"; echo rc=\$? time=\$(( \$(date +%s) - s ))" ;;
+_in)
+  ENTER $U ". /x/xs-env; $RX; export CFLAGS=$OPT CXXFLAGS=$OPT; NINJA_STATUS='[%f/%t %es] ' ninja -C $OUT -k ${K:-0} -j ${J:-150} $2" ;;
+status)
+  echo "unit $U: $(systemctl --user is-active $U)"
+  tail -c 3000 $LOG 2>/dev/null | tr '\r' '\n' | grep -v '^$' | tail -n 6 | cut -c1-300
+  grep -a -c 'FAILED' $LOG 2>/dev/null ;;
+shell)
+  shift; ENTER xs-sh-$P-$$ ". /x/xs-env; $RX; export CFLAGS=$OPT CXXFLAGS=$OPT; $*" ;;
+*) echo "usage: $0 gen [args] | build [targets] | status | shell cmd" >&2; exit 2 ;;
+esac

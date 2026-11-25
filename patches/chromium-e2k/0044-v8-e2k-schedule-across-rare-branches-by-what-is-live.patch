@@ -1,0 +1,374 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 09:07:13 +0100
+Subject: [PATCH 44/99] v8: e2k: schedule across rare branches by what is live
+ at the deoptimization exit
+
+A rare branch (compare + rbranch in one wide command) used to end the
+scheduling window: nothing given after it could go into its command or
+above, because the layer did not know what the code at its target reads.
+In hot loops nearly every window ended this way.
+
+RareBranchScope now takes a mask of the registers that are live at the
+target. For a deoptimization check these are the registers that are
+never allocated (but for the scratch ones) and the register inputs of
+the instruction, which is all a translation can name. What follows the
+check may be scheduled into its command or above it if the target
+cannot tell: it is no store, no transfer of control, writes no live
+register or flag, and loads only from the frame at a known offset (any
+other address may be valid only because the check passed). Other rare
+branches (deferred code, stack checks) keep everything live.
+
+The compare of a rare branch writes its own scratch predicate, the
+command of a linked rare branch does not move when something joins
+above it, and the continue label after a deoptimization check is bound
+only when something refers to it, so that it does not close the window.
+
+mjsunit default, stress, jit_fuzzing, --always-osr, --gc-stress and
+always_sparkplug: the same failures as before the change.
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc  |  9 ++-
+ chromium/v8/src/codegen/e2k/assembler-e2k.h   | 19 ++++-
+ chromium/v8/src/codegen/e2k/e2k_asm.h         |  5 +-
+ chromium/v8/src/codegen/e2k/la_asm.h          | 77 ++++++++++++++-----
+ .../v8/src/compiler/backend/code-generator.cc |  7 +-
+ .../backend/e2k/code-generator-e2k.cc         | 20 ++++-
+ 6 files changed, 110 insertions(+), 27 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index fdce0bb62a..64ffcc1243 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -996,8 +996,9 @@ void PrintStats() {
+   fprintf(stderr, "e2k sched: windows by wide commands, 1 to 16:");
+   for (int i = 1; i <= 16; i++) fprintf(stderr, " %ld", w[i]);
+   fprintf(stderr,
+-          "\ne2k sched: windows ended by a rare branch %ld, a transfer %ld, a "
+-          "state register %ld, their length %ld, from outside %ld\n",
++          "\ne2k sched: rare branches inside windows %ld; windows ended by a "
++          "transfer %ld, a state register %ld, their length %ld, from outside "
++          "%ld\n",
+           w[17], w[18], w[19], w[20], w[21]);
+   fprintf(stderr,
+           "e2k fuse: %ld instructions (%ld with slots of their own), %ld "
+@@ -1084,7 +1085,7 @@ la::Assembler& Assembler::OpenSlots() {
+             : slot_open_ ? kStartOpen
+                          : kStartAsked;
+   l.settled = static_cast<int>(l.la.settled());
+-  l.la.set_rare(rare_branch_);
++  l.la.set_rare(rare_branch_, rare_live_);
+   // An instruction of a counted sequence keeps its slots.
+   if (l.label && !blocked) l.la.defer_link();
+   return l.la;
+@@ -1112,6 +1113,8 @@ void Assembler::EmitSlots(const la::Assembler& la) {
+       L->link_to(pos);
+     }
+     target_at_put(pos, target, false);
++    // The window may go on after a rare branch and write it again.
++    l.la.set_link_offset((target - pos) / kInstrSize);
+   }
+   if (stats_level) {
+     const la::Assembler::Counts& c = la.counts();
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index 3b21d830e5..8bdb0f5d7f 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -406,17 +406,29 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   // almost never taken: deoptimization, deferred code. They become one wide
+   // command, the compare and a branch on its result: one cycle when not
+   // taken instead of four, 14 when taken instead of 6.
++  // `live` is what the code at the target reads besides memory: bit n is
++  // general register n, bit 32 + n double register n. Instructions emitted
++  // after the branch may then be scheduled above it if they are pure and
++  // write none of these. kAllLive: not known, everything is.
++  static constexpr uint64_t kAllLive = ~uint64_t{0};
+   class V8_NODISCARD RareBranchScope {
+    public:
+-    RareBranchScope(Assembler* assem, bool rare)
+-        : assem_(assem), old_(assem->rare_branch_) {
++    RareBranchScope(Assembler* assem, bool rare, uint64_t live = kAllLive)
++        : assem_(assem),
++          old_(assem->rare_branch_),
++          old_live_(assem->rare_live_) {
+       assem_->rare_branch_ = rare;
++      assem_->rare_live_ = live;
++    }
++    ~RareBranchScope() {
++      assem_->rare_branch_ = old_;
++      assem_->rare_live_ = old_live_;
+     }
+-    ~RareBranchScope() { assem_->rare_branch_ = old_; }
+ 
+    private:
+     Assembler* assem_;
+     bool old_;
++    uint64_t old_live_;
+   };
+ 
+   // --------Branch-and-jump-instructions----------
+@@ -1698,6 +1710,7 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   int next_buffer_check_;  // pc offset of next buffer check.
+ 
+   bool rare_branch_ = false;  // See RareBranchScope.
++  uint64_t rare_live_ = kAllLive;
+ 
+   // Emission of the trampoline pool may be blocked in some code sequences.
+   int trampoline_pool_blocked_nesting_;  // Block emission if this is not zero.
+diff --git a/chromium/v8/src/codegen/e2k/e2k_asm.h b/chromium/v8/src/codegen/e2k/e2k_asm.h
+index 321e6d581f..e2aaf424d6 100644
+--- a/chromium/v8/src/codegen/e2k/e2k_asm.h
++++ b/chromium/v8/src/codegen/e2k/e2k_asm.h
+@@ -334,6 +334,9 @@ class Assembler : public Command {
+   void defp(Pred p) { note_.pdef |= 1u << p.n; if (pdef_ >> p.n & 1) bad_ = true; gpdef_ |= 1u << p.n; }
+   void first() { note_.solo = true; if (join_ && !sched_) bad_ = true; }   // only in the operations a command starts with
+   void alone() { first(); alone_ = true; }           // and nothing joins them either
++  // The compare an rbranch of this command takes its condition from: the
++  // branch names the channel, so the compare stays in it.
++  int pinned() const { static const int8_t c[4] = {0, 1, 3, 4}; return has_ss_ && (ss_ & 0x1e0) == 0x120 ? c[ss_ >> 1 & 3] : -1; }
+   int taken(int ch) {
+     if (join_) ch = bad_ ? -1 : map_[ch];
+     assert(bad_ || (ch >= 0 && als_mask_ >> ch & 1));
+@@ -380,7 +383,7 @@ class Assembler : public Command {
+       if (int ch = pref[i]; can >> ch & 1 && !(als_mask_ >> ch & 1) && mem_ok(mem, ch)) return map_[wish] = int8_t(ch);
+     for (int i = 0; i < 6; i++) {
+       int ch = pref[i];
+-      if (!(can >> ch & 1) || !(als_mask_ >> ch & 1)) continue;
++      if (!(can >> ch & 1) || !(als_mask_ >> ch & 1) || ch == pinned()) continue;
+       for (int to = 5; to >= 0; to--) {
+         if (als_mask_ >> to & 1 || !((op_[ch].plain | op_[ch].ales) >> to & 1)) continue;
+         if (sched_ && to / 3 != ch / 3) continue;     // its users count on the lane
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 2fbeddb4c8..d5d8c6347f 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -140,8 +140,9 @@ class Assembler : private e2k::Assembler {
+     win_.clear(); ends_ = 0;
+   }
+   // How many windows of 1..16 wide commands there have been, then how many
+-  // were ended by a rare branch, a transfer of control, an operation on a
+-  // state register, their length, a seal() from outside.
++  // rare branches they had inside and how many were ended by a transfer of
++  // control, an operation on a state register, their length, a seal() from
++  // outside.
+   enum { kRare = 17, kTransfer, kState, kLength, kOutside };
+   static inline long windows[22] = {};
+   // Everything before this offset stays as it is whatever comes next.
+@@ -154,6 +155,13 @@ class Assembler : private e2k::Assembler {
+   // a branch keeps its slots to itself.
+   int64_t link_pos() const { return link_; }
+   void defer_link() { defer_ = true; }
++  // The offset the caller has put into the branch at link_pos().  The window
++  // goes on after a rare branch and its command may be written again.
++  void set_link_offset(int32_t offset) {
++    if (size_t(branch_) >= win_.size()) return;
++    e2k::Command& c = win_[branch_].c;
++    c.cs0_ = (c.cs0_ & 0xf0000000u) | (uint32_t(offset * (kSlot / 8)) & 0x0fffffffu); c.cs0_label_ = nullptr;
++  }
+   // Instructions (those that keep their slots apart), wide commands, commands
+   // joined to and bytes so far; clear() does not reset them.
+   struct Counts { long instructions, own, commands, joined, bytes; };
+@@ -287,8 +295,12 @@ class Assembler : private e2k::Assembler {
+   // The target is prepared in %ctpr1 by the first command and taken by the
+   // second: measured faster than a single `ibranch` (see NOTES.md).
+   // beq..bnez given while set_rare(true) are one command, the compare and a
+-  // branch on its result: for branches that are almost never taken.
+-  void set_rare(bool on) { rare_ = on; }
++  // branch on its result: for branches that are almost never taken.  `live`
++  // says what the code at the target reads, for the scheduler: bit n is %rn
++  // (LA r<n>, f<n - 32>); memory always is.  kAllLive: not known, every
++  // register and fcc0..7.
++  static constexpr uint64_t kAllLive = ~uint64_t(0);
++  void set_rare(bool on, uint64_t live = kAllLive) { rare_ = on; live_ = live; }
+   void b(int32_t offset) {
+     if (later()) { C(disp(e2k::ctpr1, &target_)); L(ct(e2k::ctpr1)); return; }
+     Own own(this); C(disp(e2k::ctpr1, to(offset))); L(ct(e2k::ctpr1));
+@@ -694,10 +706,16 @@ class Assembler : private e2k::Assembler {
+   //   offset (had the register changed in between, the load would follow the
+   //   change and the change the store).  Within a command memory is accessed
+   //   in channel order (e2k_asm.h, mem_ok);
+-  // - a transfer of control runs last and ends the window; so does a rare
+-  //   branch (everything before it has run when it is taken, nothing after
+-  //   it has: which registers are live at its target is not known here), an
+-  //   operation on a state register or with CS1, and logic on predicates.
++  // - a transfer of control runs last and ends the window; so does an
++  //   operation on a state register or with CS1, and logic on predicates;
++  // - a rare branch runs after everything given before it and before the
++  //   next branch.  When it is taken its whole command has run, so what is
++  //   given after it goes into its command or above only if the code at the
++  //   target cannot tell: no store, no write of a register (or flag) that is
++  //   live there (set_rare), and no load but from the frame ([sp + n],
++  //   [fp + n]): any other address may be good only because the check
++  //   passed.  The branch has been linked by then (set_link_offset), so
++  //   nothing above may move its command either (stays).
+   // Times are kept after the window is sealed: the code usually runs on, and
+   // a wrong guess costs time only.
+   //
+@@ -741,8 +759,10 @@ class Assembler : private e2k::Assembler {
+       if (g.pdef >> p & 1) t = std::max(t, t_puse_[p]);
+     }
+     for (int c = 1; c < 4; c++) if (g.ctuse >> c & 1) t = std::max(t, t_ctdef_[c] + 1);
++    if (g.ss || g.solo) t = std::max(t, t_rare_);
+     for (int i = 0; i < g.nmem; i++) {
+       if (g.mem[i].store) { t = std::max({t, t_load_, t_store_ + 1}); continue; }
++      if (!g.mem[i].known || (g.mem[i].base != R(sp).code && g.mem[i].base != R(fp).code)) t = std::max(t, t_rare_);
+       t = std::max(t, t_old_store_ + 1);
+       for (const Store& s : stores_) if (int a = apart(g.mem[i], s); a < 2) t = std::max(t, s.t + 1 + a);
+     }
+@@ -774,6 +794,11 @@ class Assembler : private e2k::Assembler {
+     for (int i = 0; i < g.ndef; i++) reg_[g.def[i].code] = Seen{t, t, g.def[i].kind, uint8_t(g.ch[g.def[i].op] / 3)};
+     for (int p = 0; p < 32; p++) if (g.pdef >> p & 1) t_pdef_[p] = t_puse_[p] = t;
+     for (int c = 1; c < 4; c++) if (g.ctdef >> c & 1) t_ctdef_[c] = t;
++    if (!g.rare) return;
++    // The target reads what is live there after this command.
++    for (int i = 0; i < 64; i++) if (live_ >> i & 1) reg_[0x80 | i].use = std::max(reg_[0x80 | i].use, t + 1);
++    if (live_ == kAllLive) for (int p = 0; p < 8; p++) t_puse_[p] = std::max(t_puse_[p], t + 1);
++    t_load_ = std::max(t_load_, t + 1); t_rare_ = t + 1;
+   }
+   bool schedule() {
+     int n = int(win_.size());
+@@ -783,8 +808,8 @@ class Assembler : private e2k::Assembler {
+       solo_ = g.solo && !g.ss;
+       int t = earliest(g) - now_;
+       at_ = solo_ ? n : g.ss ? std::max(t, n - 1) : t;
+-      if (solo_ || g.ss) ends_ = g.rare ? kRare : g.ss ? kTransfer : kState;
+-    } else if (joined() && size() <= kMaxCommand) {
++      if (g.rare) windows[kRare]++; else if (solo_ || g.ss) ends_ = g.ss ? kTransfer : kState;
++    } else if (joined() && size() <= kMaxCommand && stays(at_, size(), has_cs0_)) {
+       return put(*this, noted());
+     } else if (at_ >= first_new_) {
+       return put(lone_, group_);  // it does not go into an empty command either
+@@ -793,7 +818,7 @@ class Assembler : private e2k::Assembler {
+     }
+     drop();
+     while (!solo_ && !fits_at(group_, now_ + at_)) at_++;
+-    while (int(win_.size()) <= at_) { win_.push_back(Placed{empty_, 8, 0}); counts_.commands++; }
++    while (int(win_.size()) <= at_) { win_.push_back(Placed{empty_, 8, 0, false}); counts_.commands++; }
+     if (solo_) return put(lone_, group_);
+     static_cast<e2k::Command&>(*this) = win_[at_].c;
+     extend(lanes_); note();
+@@ -802,14 +827,27 @@ class Assembler : private e2k::Assembler {
+   bool put(const e2k::Command& c, const e2k::Note& g) {
+     static_cast<e2k::Command&>(*this) = c;
+     counts_.joined += at_ < first_new_;
+-    win_[at_] = Placed{c, size(), 0};
++    win_[at_].c = c; win_[at_].size = size();
++    if (g.rare) win_[at_].linked = true;
+     drop();
+     seen(g, now_ + at_);
+     if (g.cs0) branch_ = at_;
+-    if (g.ss && !g.puse) now_ += 8;          // the code after it is reached from elsewhere
++    if (g.ss && !g.puse && !g.rare) now_ += 8;   // the code after it is reached from elsewhere
+     dirty_ = std::min(dirty_, at_);
+     return true;
+   }
++  // Whether the commands with rare branches, which have been linked where they
++  // are, stay there with command `at` being `size` bytes long (see layout).
++  bool stays(int at, int size, bool cs0) const {
++    int64_t pos = window_;
++    for (int i = 0; i < int(win_.size()); i++) {
++      int s = i == at ? size : win_[i].size;
++      if ((i == at ? cs0 : win_[i].c.has_cs0_) || s > kSlot) pos = up(pos);
++      if (win_[i].linked && pos != win_[i].pos) return false;
++      pos += s;
++    }
++    return true;
++  }
+   // Writes the commands that changed.  A command with a displacement starts
+   // a slot, where the branch is looked for, and so does a long one; the
+   // command before is stretched up to there, the last one to the end of its slot.
+@@ -856,14 +894,16 @@ class Assembler : private e2k::Assembler {
+   void set(Cmp f, Register rd, e2k::Src1 a, e2k::Src2 b) { C((this->*f)(0, a, b, PT0)); L(merged(0, 0, 1, D(rd), PT0)); }
+   void br(Cmp f, bool negate, e2k::Src1 a, e2k::Src2 b, int32_t offset) {
+     // Scheduled, the compare and the target go as early as they can, the
+-    // transfer stays last; a rare branch stays one command.
++    // transfer stays last; a rare branch stays one command.  Its compare
++    // writes the other scratch predicate: the compare of the next ordinary
++    // branch need not wait for it.
+     if (later()) {
+-      if (rare_) { L((this->*f)(0, a, b, PT0); rbranch(&target_, 0, negate)); return; }
++      if (rare_) { L((this->*f)(0, a, b, PT1); rbranch(&target_, 0, negate)); return; }
+       C((this->*f)(0, a, b, PT0)); C(disp(e2k::ctpr1, &target_)); L(ct(e2k::ctpr1, negate ? ~PT0 : PT0));
+       return;
+     }
+     Own own(this);
+-    if (rare_) { L((this->*f)(0, a, b, PT0); rbranch(to(offset), 0, negate)); return; }
++    if (rare_) { L((this->*f)(0, a, b, PT1); rbranch(to(offset), 0, negate)); return; }
+     C((this->*f)(0, a, b, PT0); disp(e2k::ctpr1, to(offset))); L(ct(e2k::ctpr1, negate ? ~PT0 : PT0));
+   }
+   void brc(Pred p, int32_t offset) {
+@@ -953,8 +993,9 @@ class Assembler : private e2k::Assembler {
+   enum { kPlain, kFuse, kSched };
+   int mode_ = kPlain;
+   bool sealed_ = true, rare_ = false;
++  uint64_t live_ = kAllLive;
+   e2k::Command saved_;
+-  struct Placed { e2k::Command c; int size; int64_t pos; };
++  struct Placed { e2k::Command c; int size; int64_t pos; bool linked; };   // linked: its place is known outside
+   std::vector<Placed> win_;
+   e2k::Command empty_, lone_;              // lone_: the current group as a command of its own
+   e2k::Note group_;
+@@ -965,7 +1006,7 @@ class Assembler : private e2k::Assembler {
+   bool solo_ = false, defer_ = false;
+   uint8_t lanes_[8];
+   Seen reg_[256] = {};
+-  int t_pdef_[32] = {}, t_puse_[32] = {}, t_ctdef_[4] = {}, t_load_ = 0, t_store_ = 0, t_old_store_ = 0;
++  int t_pdef_[32] = {}, t_puse_[32] = {}, t_ctdef_[4] = {}, t_load_ = 0, t_store_ = 0, t_old_store_ = 0, t_rare_ = 0;
+   Store stores_[4] = {};
+   Counts counts_ = {0, 0, 0, 0, 0};
+   e2k::Label target_;
+diff --git a/chromium/v8/src/compiler/backend/code-generator.cc b/chromium/v8/src/compiler/backend/code-generator.cc
+index beaf879890..c0f5504777 100644
+--- a/chromium/v8/src/compiler/backend/code-generator.cc
++++ b/chromium/v8/src/compiler/backend/code-generator.cc
+@@ -864,7 +864,12 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleInstruction(
+       branch.hinted = true;
+       branch.fallthru = true;
+       AssembleArchDeoptBranch(instr, &branch);
+-      masm()->bind(exit->continue_label());
++#if V8_TARGET_ARCH_E2K
++      // Nothing branches here, and a label ends the window instructions
++      // are scheduled in: what follows could not go above the check.
++      if (exit->continue_label()->is_linked())
++#endif
++        masm()->bind(exit->continue_label());
+ #ifdef V8_DUMPLING
+       if (v8_flags.turbofan_dumping) {
+         FrameStateDescriptor* descriptor =
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index 2761893986..085584779e 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -10,6 +10,7 @@
+ #include "src/codegen/machine-type.h"
+ #include "src/codegen/macro-assembler.h"
+ #include "src/codegen/optimized-compilation-info.h"
++#include "src/codegen/register-configuration.h"
+ #include "src/compiler/backend/code-generator-impl.h"
+ #include "src/compiler/backend/code-generator.h"
+ #include "src/compiler/backend/gap-resolver.h"
+@@ -4671,7 +4672,24 @@ void CodeGenerator::AssembleArchConditionalBranch(Instruction* instr,
+ 
+ void CodeGenerator::AssembleArchDeoptBranch(Instruction* instr,
+                                             BranchInfo* branch) {
+-  MacroAssembler::RareBranchScope rare_scope(masm(), true);
++  // The deoptimizer reads the frame and the registers the translation of
++  // this exit names, which are inputs of the instruction; of the others it
++  // needs those that are never allocated, but for the scratch ones. What
++  // follows the check and writes only the rest may run before it.
++  uint64_t live =
++      ~(uint64_t{static_cast<uint32_t>(
++            RegisterConfiguration::Default()->allocatable_general_codes_mask())} |
++        uint64_t{1} << t6.code() | uint64_t{1} << t7.code() |
++        uint64_t{1} << t8.code() | uint64_t{0xffffffff} << 32);
++  for (size_t k = 0; k < instr->InputCount(); k++) {
++    InstructionOperand* op = instr->InputAt(k);
++    if (op->IsRegister()) {
++      live |= uint64_t{1} << LocationOperand::cast(op)->register_code();
++    } else if (op->IsFPRegister()) {
++      live |= uint64_t{1} << (32 + LocationOperand::cast(op)->register_code());
++    }
++  }
++  MacroAssembler::RareBranchScope rare_scope(masm(), true, live);
+   AssembleBranchToLabels(this, masm(), instr, branch->condition,
+                          branch->true_label, branch->false_label,
+                          branch->fallthru);

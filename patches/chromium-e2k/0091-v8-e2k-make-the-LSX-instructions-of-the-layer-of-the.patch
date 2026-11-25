@@ -1,0 +1,5127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Sat, 17 Oct 2026 01:26:37 +0100
+Subject: [PATCH 91/99] v8: e2k: make the LSX instructions of the layer of the
+ qp operations of e2k-v5
+
+WebAssembly SIMD on e2k: the 128-bit instructions of the backend (copied
+from loong64) are LoongArch LSX.  la_asm.h now has the 222 of them that
+V8 uses, made of the 128-bit (qp) operations of e2k-v5 (opcodes-qp.inc,
+read back from GNU as by simd/gen_qp.py in the lab), with the semantics
+measured on 8SV.  CpuFeatures::SupportsSimd128() is true.
+
+- Loads and stores go through two ldd/std: ldqp/stqp want 16-byte
+  alignment.
+- No vector register is written by a 64-bit operation: a qp read soon
+  after can see a stale high half.
+- No literal operands in qp operations but where 64 bits are read: the
+  high half of a literal is undefined.
+- Unused LSX instructions are UNIMPLEMENTED().
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc | 2028 ++++++------------
+ chromium/v8/src/codegen/e2k/e2k_asm.h        |   22 +
+ chromium/v8/src/codegen/e2k/la_asm.h         |  750 ++++++-
+ chromium/v8/src/codegen/e2k/opcodes-qp.inc   |  187 ++
+ 4 files changed, 1633 insertions(+), 1354 deletions(-)
+ create mode 100644 chromium/v8/src/codegen/e2k/opcodes-qp.inc
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index f29ad297c7..ef15a5d351 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -33,14 +33,15 @@ namespace v8 {
+ namespace internal {
+ 
+ bool CpuFeatures::SupportsSimd128() {
+-  // The 128-bit instructions of the backend are still those of LoongArch
+-  // (LSX), which the assembler turns into a trap: WebAssembly modules that
+-  // use simd128 are refused.
+-  return false;
++  // The 128-bit instructions of the backend (LoongArch LSX) are made of the
++  // qp operations of e2k-v5 by the layer (la_asm.h), which every target of
++  // this port has.
++  return true;
+ }
+ 
+ void CpuFeatures::ProbeImpl(bool cross_compile) {
+   supported_.Add(FPU);
++  supported_.Add(LSX);
+ 
+   // Only use statically determined features for cross compile (snapshot).
+   if (cross_compile) return;
+@@ -1518,3376 +1519,2701 @@ void Assembler::fldx_d(FPURegister fd, Register rj, Register rk) { LA(fldx_d(fd,
+ void Assembler::fstx_s(FPURegister fd, Register rj, Register rk) { LA(fstx_s(fd, rj, rk)); }
+ void Assembler::fstx_d(FPURegister fd, Register rj, Register rk) { LA(fstx_d(fd, rj, rk)); }
+ 
+-#undef LA
+ 
+ void Assembler::vfmadd_s(VRegister vd, VRegister vj, VRegister vk,
+                          VRegister va) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFMADD_S, va, vk, vj, vd);
++  LA(vfmadd_s(vd, vj, vk, va));
+ }
+ 
+ void Assembler::vfmadd_d(VRegister vd, VRegister vj, VRegister vk,
+                          VRegister va) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFMADD_D, va, vk, vj, vd);
++  LA(vfmadd_d(vd, vj, vk, va));
+ }
+ 
+ void Assembler::vfmsub_s(VRegister vd, VRegister vj, VRegister vk,
+                          VRegister va) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFMSUB_S, va, vk, vj, vd);
++  LA(vfmsub_s(vd, vj, vk, va));
+ }
+ 
+ void Assembler::vfmsub_d(VRegister vd, VRegister vj, VRegister vk,
+                          VRegister va) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFMSUB_D, va, vk, vj, vd);
++  LA(vfmsub_d(vd, vj, vk, va));
+ }
+ 
+ void Assembler::vfnmadd_s(VRegister vd, VRegister vj, VRegister vk,
+                           VRegister va) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFNMADD_S, va, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfnmadd_d(VRegister vd, VRegister vj, VRegister vk,
+                           VRegister va) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFNMADD_D, va, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfnmsub_s(VRegister vd, VRegister vj, VRegister vk,
+                           VRegister va) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFNMSUB_S, va, vk, vj, vd);
++  LA(vfnmsub_s(vd, vj, vk, va));
+ }
+ 
+ void Assembler::vfnmsub_d(VRegister vd, VRegister vj, VRegister vk,
+                           VRegister va) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFNMSUB_D, va, vk, vj, vd);
++  LA(vfnmsub_d(vd, vj, vk, va));
+ }
+ 
+ void Assembler::vfcmp_cond_s(FPUCondition cond, VRegister vd, VRegister vj,
+                              VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenCmp(VFCMP_COND_S, cond, vk, vj, vd);
++  LA(vfcmp_cond_s(cond, vd, vj, vk));
+ }
+ 
+ void Assembler::vfcmp_cond_d(FPUCondition cond, VRegister vd, VRegister vj,
+                              VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenCmp(VFCMP_COND_D, cond, vk, vj, vd);
++  LA(vfcmp_cond_d(cond, vd, vj, vk));
+ }
+ 
+ void Assembler::vbitsel_v(VRegister vd, VRegister vj, VRegister vk,
+                           VRegister va) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VBITSEL_V, va, vk, vj, vd);
++  LA(vbitsel_v(vd, vj, vk, va));
+ }
+ 
+ void Assembler::vshuf_b(VRegister vd, VRegister vj, VRegister vk,
+                         VRegister va) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSHUF_B, va, vk, vj, vd);
++  LA(vshuf_b(vd, vj, vk, va));
+ }
+ 
+ void Assembler::vld(VRegister vd, Register rj, int32_t si12) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VLD, si12, rj, vd, 12);
++  LA(vld(vd, rj, si12));
+ }
+ 
+ void Assembler::vst(VRegister vd, Register rj, int32_t si12) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VST, si12, rj, vd, 12);
++  LA(vst(vd, rj, si12));
+ }
+ 
+ void Assembler::vldrepl_d(VRegister vd, Register rj, int32_t si9) {
+-  DCHECK(IsEnabled(LSX));
+-  DCHECK(is_int12(si9) && ((si9 & 0x7) == 0));
+-  GenImm(VLDREPL_D, si9 >> 3, rj, vd, 9);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vldrepl_w(VRegister vd, Register rj, int32_t si10) {
+-  DCHECK(IsEnabled(LSX));
+-  DCHECK(is_int12(si10) && ((si10 & 0x3) == 0));
+-  GenImm(VLDREPL_W, si10 >> 2, rj, vd, 10);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vldrepl_h(VRegister vd, Register rj, int32_t si11) {
+-  DCHECK(IsEnabled(LSX));
+-  DCHECK(is_int12(si11) && ((si11 & 0x1) == 0));
+-  GenImm(VLDREPL_H, si11 >> 1, rj, vd, 11);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vldrepl_b(VRegister vd, Register rj, int32_t si12) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VLDREPL_B, si12, rj, vd, 12);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vstelm_d(VRegister vd, Register rj, int32_t si8, int32_t idx) {
+-  DCHECK(IsEnabled(LSX));
+-  DCHECK(is_int11(si8) && ((si8 & 0x7) == 0));
+-  GenImm(VSTELM_D, idx, si8 >> 3, rj, vd, kIdx1Bits);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vstelm_w(VRegister vd, Register rj, int32_t si8, int32_t idx) {
+-  DCHECK(IsEnabled(LSX));
+-  DCHECK(is_int10(si8) && ((si8 & 0x3) == 0));
+-  GenImm(VSTELM_W, idx, si8 >> 2, rj, vd, kIdx2Bits);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vstelm_h(VRegister vd, Register rj, int32_t si8, int32_t idx) {
+-  DCHECK(IsEnabled(LSX));
+-  DCHECK(is_int9(si8) && ((si8 & 0x1) == 0));
+-  GenImm(VSTELM_H, idx, si8 >> 1, rj, vd, kIdx3Bits);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vstelm_b(VRegister vd, Register rj, int32_t si8, int32_t idx) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSTELM_B, idx, si8, rj, vd, kIdx4Bits);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vldx(VRegister vd, Register rj, Register rk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VLDX, rk, rj, vd);
++  LA(vldx(vd, rj, rk));
+ }
+ 
+ void Assembler::vstx(VRegister vd, Register rj, Register rk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSTX, rk, rj, vd);
++  LA(vstx(vd, rj, rk));
+ }
+ 
+ void Assembler::vseq_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSEQ_B, vk, vj, vd);
++  LA(vseq_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vseq_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSEQ_H, vk, vj, vd);
++  LA(vseq_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vseq_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSEQ_W, vk, vj, vd);
++  LA(vseq_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vseq_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSEQ_D, vk, vj, vd);
++  LA(vseq_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vsle_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLE_B, vk, vj, vd);
++  LA(vsle_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vsle_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLE_H, vk, vj, vd);
++  LA(vsle_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vsle_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLE_W, vk, vj, vd);
++  LA(vsle_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vsle_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLE_D, vk, vj, vd);
++  LA(vsle_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vsle_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLE_BU, vk, vj, vd);
++  LA(vsle_bu(vd, vj, vk));
+ }
+ 
+ void Assembler::vsle_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLE_HU, vk, vj, vd);
++  LA(vsle_hu(vd, vj, vk));
+ }
+ 
+ void Assembler::vsle_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLE_WU, vk, vj, vd);
++  LA(vsle_wu(vd, vj, vk));
+ }
+ 
+ void Assembler::vsle_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLE_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslt_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLT_B, vk, vj, vd);
++  LA(vslt_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vslt_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLT_H, vk, vj, vd);
++  LA(vslt_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vslt_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLT_W, vk, vj, vd);
++  LA(vslt_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vslt_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLT_D, vk, vj, vd);
++  LA(vslt_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vslt_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLT_BU, vk, vj, vd);
++  LA(vslt_bu(vd, vj, vk));
+ }
+ 
+ void Assembler::vslt_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLT_HU, vk, vj, vd);
++  LA(vslt_hu(vd, vj, vk));
+ }
+ 
+ void Assembler::vslt_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLT_WU, vk, vj, vd);
++  LA(vslt_wu(vd, vj, vk));
+ }
+ 
+ void Assembler::vslt_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLT_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vadd_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADD_B, vk, vj, vd);
++  LA(vadd_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vadd_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADD_H, vk, vj, vd);
++  LA(vadd_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vadd_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADD_W, vk, vj, vd);
++  LA(vadd_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vadd_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADD_D, vk, vj, vd);
++  LA(vadd_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vsub_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUB_B, vk, vj, vd);
++  LA(vsub_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vsub_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUB_H, vk, vj, vd);
++  LA(vsub_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vsub_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUB_W, vk, vj, vd);
++  LA(vsub_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vsub_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUB_D, vk, vj, vd);
++  LA(vsub_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vaddwev_h_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWEV_H_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwev_w_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWEV_W_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwev_d_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWEV_D_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwev_q_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWEV_Q_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwev_h_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWEV_H_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwev_w_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWEV_W_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwev_d_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWEV_D_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwev_q_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWEV_Q_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwod_h_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWOD_H_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwod_w_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWOD_W_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwod_d_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWOD_D_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwod_q_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWOD_Q_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwod_h_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWOD_H_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwod_w_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWOD_W_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwod_d_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWOD_D_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwod_q_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWOD_Q_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwev_h_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWEV_H_BU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwev_w_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWEV_W_HU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwev_d_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWEV_D_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwev_q_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWEV_Q_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwev_h_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWEV_H_BU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwev_w_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWEV_W_HU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwev_d_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWEV_D_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwev_q_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWEV_Q_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwod_h_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWOD_H_BU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwod_w_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWOD_W_HU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwod_d_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWOD_D_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwod_q_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWOD_Q_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwod_h_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWOD_H_BU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwod_w_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWOD_W_HU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwod_d_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWOD_D_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubwod_q_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUBWOD_Q_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwev_h_bu_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWEV_H_BU_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwev_w_hu_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWEV_W_HU_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwev_d_wu_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWEV_D_WU_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwev_q_du_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWEV_Q_DU_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwod_h_bu_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWOD_H_BU_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwod_w_hu_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWOD_W_HU_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwod_d_wu_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWOD_D_WU_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddwod_q_du_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDWOD_Q_DU_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsadd_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSADD_B, vk, vj, vd);
++  LA(vsadd_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vsadd_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSADD_H, vk, vj, vd);
++  LA(vsadd_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vsadd_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSADD_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsadd_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSADD_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssub_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSUB_B, vk, vj, vd);
++  LA(vssub_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vssub_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSUB_H, vk, vj, vd);
++  LA(vssub_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vssub_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSUB_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssub_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSUB_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsadd_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSADD_BU, vk, vj, vd);
++  LA(vsadd_bu(vd, vj, vk));
+ }
+ 
+ void Assembler::vsadd_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSADD_HU, vk, vj, vd);
++  LA(vsadd_hu(vd, vj, vk));
+ }
+ 
+ void Assembler::vsadd_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSADD_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsadd_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSADD_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssub_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSUB_BU, vk, vj, vd);
++  LA(vssub_bu(vd, vj, vk));
+ }
+ 
+ void Assembler::vssub_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSUB_HU, vk, vj, vd);
++  LA(vssub_hu(vd, vj, vk));
+ }
+ 
+ void Assembler::vssub_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSUB_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssub_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSUB_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vhaddw_h_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHADDW_H_B, vk, vj, vd);
++  LA(vhaddw_h_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vhaddw_w_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHADDW_W_H, vk, vj, vd);
++  LA(vhaddw_w_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vhaddw_d_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHADDW_D_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vhaddw_q_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHADDW_Q_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vhsubw_h_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHSUBW_H_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vhsubw_w_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHSUBW_W_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vhsubw_d_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHSUBW_D_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vhsubw_q_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHSUBW_Q_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vhaddw_hu_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHADDW_HU_BU, vk, vj, vd);
++  LA(vhaddw_hu_bu(vd, vj, vk));
+ }
+ 
+ void Assembler::vhaddw_wu_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHADDW_WU_HU, vk, vj, vd);
++  LA(vhaddw_wu_hu(vd, vj, vk));
+ }
+ 
+ void Assembler::vhaddw_du_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHADDW_DU_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vhaddw_qu_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHADDW_QU_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vhsubw_hu_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHSUBW_HU_BU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vhsubw_wu_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHSUBW_WU_HU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vhsubw_du_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHSUBW_DU_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vhsubw_qu_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VHSUBW_QU_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vadda_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDA_B, vk, vj, vd);
++  LA(vadda_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vadda_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDA_H, vk, vj, vd);
++  LA(vadda_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vadda_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDA_W, vk, vj, vd);
++  LA(vadda_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vadda_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADDA_D, vk, vj, vd);
++  LA(vadda_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vabsd_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VABSD_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vabsd_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VABSD_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vabsd_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VABSD_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vabsd_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VABSD_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vabsd_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VABSD_BU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vabsd_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VABSD_HU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vabsd_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VABSD_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vabsd_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VABSD_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vavg_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVG_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vavg_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVG_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vavg_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVG_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vavg_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVG_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vavg_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVG_BU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vavg_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVG_HU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vavg_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVG_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vavg_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVG_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vavgr_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVGR_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vavgr_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVGR_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vavgr_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVGR_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vavgr_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVGR_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vavgr_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVGR_BU, vk, vj, vd);
++  LA(vavgr_bu(vd, vj, vk));
+ }
+ 
+ void Assembler::vavgr_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVGR_HU, vk, vj, vd);
++  LA(vavgr_hu(vd, vj, vk));
+ }
+ 
+ void Assembler::vavgr_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVGR_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vavgr_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAVGR_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmax_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMAX_B, vk, vj, vd);
++  LA(vmax_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vmax_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMAX_H, vk, vj, vd);
++  LA(vmax_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vmax_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMAX_W, vk, vj, vd);
++  LA(vmax_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vmax_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMAX_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmin_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMIN_B, vk, vj, vd);
++  LA(vmin_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vmin_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMIN_H, vk, vj, vd);
++  LA(vmin_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vmin_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMIN_W, vk, vj, vd);
++  LA(vmin_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vmin_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMIN_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmax_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMAX_BU, vk, vj, vd);
++  LA(vmax_bu(vd, vj, vk));
+ }
+ 
+ void Assembler::vmax_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMAX_HU, vk, vj, vd);
++  LA(vmax_hu(vd, vj, vk));
+ }
+ 
+ void Assembler::vmax_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMAX_WU, vk, vj, vd);
++  LA(vmax_wu(vd, vj, vk));
+ }
+ 
+ void Assembler::vmax_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMAX_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmin_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMIN_BU, vk, vj, vd);
++  LA(vmin_bu(vd, vj, vk));
+ }
+ 
+ void Assembler::vmin_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMIN_HU, vk, vj, vd);
++  LA(vmin_hu(vd, vj, vk));
+ }
+ 
+ void Assembler::vmin_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMIN_WU, vk, vj, vd);
++  LA(vmin_wu(vd, vj, vk));
+ }
+ 
+ void Assembler::vmin_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMIN_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmul_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMUL_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmul_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMUL_H, vk, vj, vd);
++  LA(vmul_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vmul_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMUL_W, vk, vj, vd);
++  LA(vmul_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vmul_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMUL_D, vk, vj, vd);
++  LA(vmul_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vmuh_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMUH_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmuh_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMUH_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmuh_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMUH_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmuh_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMUH_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmuh_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMUH_BU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmuh_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMUH_HU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmuh_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMUH_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmuh_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMUH_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwev_h_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWEV_H_B, vk, vj, vd);
++  LA(vmulwev_h_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vmulwev_w_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWEV_W_H, vk, vj, vd);
++  LA(vmulwev_w_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vmulwev_d_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWEV_D_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwev_q_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWEV_Q_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwod_h_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWOD_H_B, vk, vj, vd);
++  LA(vmulwod_h_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vmulwod_w_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWOD_W_H, vk, vj, vd);
++  LA(vmulwod_w_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vmulwod_d_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWOD_D_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwod_q_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWOD_Q_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwev_h_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWEV_H_BU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwev_w_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWEV_W_HU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwev_d_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWEV_D_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwev_q_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWEV_Q_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwod_h_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWOD_H_BU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwod_w_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWOD_W_HU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwod_d_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWOD_D_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwod_q_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWOD_Q_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwev_h_bu_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWEV_H_BU_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwev_w_hu_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWEV_W_HU_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwev_d_wu_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWEV_D_WU_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwev_q_du_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWEV_Q_DU_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwod_h_bu_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWOD_H_BU_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwod_w_hu_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWOD_W_HU_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwod_d_wu_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWOD_D_WU_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmulwod_q_du_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMULWOD_Q_DU_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmadd_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADD_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmadd_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADD_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmadd_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADD_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmadd_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADD_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmsub_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMSUB_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmsub_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMSUB_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmsub_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMSUB_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmsub_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMSUB_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwev_h_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWEV_H_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwev_w_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWEV_W_H, vk, vj, vd);
++  LA(vmaddwev_w_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vmaddwev_d_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWEV_D_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwev_q_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWEV_Q_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwod_h_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWOD_H_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwod_w_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWOD_W_H, vk, vj, vd);
++  LA(vmaddwod_w_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vmaddwod_d_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWOD_D_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwod_q_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWOD_Q_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwev_h_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWEV_H_BU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwev_w_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWEV_W_HU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwev_d_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWEV_D_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwev_q_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWEV_Q_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwod_h_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWOD_H_BU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwod_w_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWOD_W_HU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwod_d_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWOD_D_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwod_q_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWOD_Q_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwev_h_bu_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWEV_H_BU_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwev_w_hu_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWEV_W_HU_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwev_d_wu_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWEV_D_WU_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwev_q_du_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWEV_Q_DU_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwod_h_bu_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWOD_H_BU_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwod_w_hu_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWOD_W_HU_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwod_d_wu_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWOD_D_WU_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaddwod_q_du_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMADDWOD_Q_DU_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vdiv_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VDIV_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vdiv_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VDIV_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vdiv_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VDIV_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vdiv_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VDIV_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmod_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMOD_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmod_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMOD_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmod_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMOD_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmod_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMOD_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vdiv_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VDIV_BU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vdiv_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VDIV_HU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vdiv_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VDIV_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vdiv_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VDIV_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmod_bu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMOD_BU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmod_hu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMOD_HU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmod_wu(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMOD_WU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmod_du(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMOD_DU, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsll_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLL_B, vk, vj, vd);
++  LA(vsll_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vsll_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLL_H, vk, vj, vd);
++  LA(vsll_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vsll_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLL_W, vk, vj, vd);
++  LA(vsll_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vsll_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSLL_D, vk, vj, vd);
++  LA(vsll_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vsrl_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRL_B, vk, vj, vd);
++  LA(vsrl_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vsrl_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRL_H, vk, vj, vd);
++  LA(vsrl_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vsrl_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRL_W, vk, vj, vd);
++  LA(vsrl_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vsrl_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRL_D, vk, vj, vd);
++  LA(vsrl_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vsra_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRA_B, vk, vj, vd);
++  LA(vsra_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vsra_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRA_H, vk, vj, vd);
++  LA(vsra_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vsra_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRA_W, vk, vj, vd);
++  LA(vsra_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vsra_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRA_D, vk, vj, vd);
++  LA(vsra_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vrotr_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VROTR_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vrotr_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VROTR_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vrotr_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VROTR_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vrotr_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VROTR_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlr_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRLR_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlr_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRLR_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlr_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRLR_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlr_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRLR_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrar_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRAR_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrar_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRAR_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrar_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRAR_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrar_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRAR_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrln_b_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRLN_B_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrln_h_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRLN_H_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrln_w_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRLN_W_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsran_b_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRAN_B_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsran_h_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRAN_H_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsran_w_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRAN_W_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlrn_b_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRLRN_B_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlrn_h_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRLRN_H_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlrn_w_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRLRN_W_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrarn_b_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRARN_B_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrarn_h_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRARN_H_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrarn_w_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSRARN_W_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrln_b_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRLN_B_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrln_h_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRLN_H_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrln_w_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRLN_W_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssran_b_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRAN_B_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssran_h_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRAN_H_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssran_w_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRAN_W_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlrn_b_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRLRN_B_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlrn_h_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRLRN_H_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlrn_w_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRLRN_W_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrarn_b_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRARN_B_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrarn_h_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRARN_H_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrarn_w_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRARN_W_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrln_bu_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRLN_BU_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrln_hu_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRLN_HU_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrln_wu_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRLN_WU_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssran_bu_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRAN_BU_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssran_hu_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRAN_HU_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssran_wu_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRAN_WU_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlrn_bu_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRLRN_BU_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlrn_hu_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRLRN_HU_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlrn_wu_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRLRN_WU_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrarn_bu_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRARN_BU_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrarn_hu_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRARN_HU_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrarn_wu_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSSRARN_WU_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitclr_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VBITCLR_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitclr_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VBITCLR_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitclr_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VBITCLR_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitclr_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VBITCLR_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitset_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VBITSET_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitset_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VBITSET_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitset_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VBITSET_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitset_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VBITSET_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitrev_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VBITREV_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitrev_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VBITREV_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitrev_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VBITREV_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitrev_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VBITREV_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vpackev_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPACKEV_B, vk, vj, vd);
++  LA(vpackev_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vpackev_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPACKEV_H, vk, vj, vd);
++  LA(vpackev_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vpackev_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPACKEV_W, vk, vj, vd);
++  LA(vpackev_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vpackev_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPACKEV_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vpackod_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPACKOD_B, vk, vj, vd);
++  LA(vpackod_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vpackod_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPACKOD_H, vk, vj, vd);
++  LA(vpackod_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vpackod_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPACKOD_W, vk, vj, vd);
++  LA(vpackod_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vpackod_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPACKOD_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vilvl_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VILVL_B, vk, vj, vd);
++  LA(vilvl_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vilvl_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VILVL_H, vk, vj, vd);
++  LA(vilvl_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vilvl_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VILVL_W, vk, vj, vd);
++  LA(vilvl_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vilvl_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VILVL_D, vk, vj, vd);
++  LA(vilvl_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vilvh_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VILVH_B, vk, vj, vd);
++  LA(vilvh_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vilvh_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VILVH_H, vk, vj, vd);
++  LA(vilvh_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vilvh_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VILVH_W, vk, vj, vd);
++  LA(vilvh_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vilvh_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VILVH_D, vk, vj, vd);
++  LA(vilvh_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vpickev_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPICKEV_B, vk, vj, vd);
++  LA(vpickev_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vpickev_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPICKEV_H, vk, vj, vd);
++  LA(vpickev_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vpickev_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPICKEV_W, vk, vj, vd);
++  LA(vpickev_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vpickev_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPICKEV_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vpickod_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPICKOD_B, vk, vj, vd);
++  LA(vpickod_b(vd, vj, vk));
+ }
+ 
+ void Assembler::vpickod_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPICKOD_H, vk, vj, vd);
++  LA(vpickod_h(vd, vj, vk));
+ }
+ 
+ void Assembler::vpickod_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPICKOD_W, vk, vj, vd);
++  LA(vpickod_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vpickod_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPICKOD_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vreplve_b(VRegister vd, VRegister vj, Register rk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VREPLVE_B, rk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vreplve_h(VRegister vd, VRegister vj, Register rk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VREPLVE_H, rk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vreplve_w(VRegister vd, VRegister vj, Register rk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VREPLVE_W, rk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vreplve_d(VRegister vd, VRegister vj, Register rk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VREPLVE_D, rk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vand_v(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VAND_V, vk, vj, vd);
++  LA(vand_v(vd, vj, vk));
+ }
+ 
+ void Assembler::vor_v(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VOR_V, vk, vj, vd);
++  LA(vor_v(vd, vj, vk));
+ }
+ 
+ void Assembler::vxor_v(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VXOR_V, vk, vj, vd);
++  LA(vxor_v(vd, vj, vk));
+ }
+ 
+ void Assembler::vnor_v(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VNOR_V, vk, vj, vd);
++  LA(vnor_v(vd, vj, vk));
+ }
+ 
+ void Assembler::vandn_v(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VANDN_V, vk, vj, vd);
++  LA(vandn_v(vd, vj, vk));
+ }
+ 
+ void Assembler::vorn_v(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VORN_V, vk, vj, vd);
++  LA(vorn_v(vd, vj, vk));
+ }
+ 
+ void Assembler::vfrstp_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRSTP_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfrstp_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRSTP_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vadd_q(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VADD_Q, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsub_q(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSUB_Q, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsigncov_b(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSIGNCOV_B, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsigncov_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSIGNCOV_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsigncov_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSIGNCOV_W, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsigncov_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSIGNCOV_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfadd_s(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFADD_S, vk, vj, vd);
++  LA(vfadd_s(vd, vj, vk));
+ }
+ 
+ void Assembler::vfadd_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFADD_D, vk, vj, vd);
++  LA(vfadd_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vfsub_s(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFSUB_S, vk, vj, vd);
++  LA(vfsub_s(vd, vj, vk));
+ }
+ 
+ void Assembler::vfsub_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFSUB_D, vk, vj, vd);
++  LA(vfsub_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vfmul_s(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFMUL_S, vk, vj, vd);
++  LA(vfmul_s(vd, vj, vk));
+ }
+ 
+ void Assembler::vfmul_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFMUL_D, vk, vj, vd);
++  LA(vfmul_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vfdiv_s(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFDIV_S, vk, vj, vd);
++  LA(vfdiv_s(vd, vj, vk));
+ }
+ 
+ void Assembler::vfdiv_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFDIV_D, vk, vj, vd);
++  LA(vfdiv_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vfmax_s(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFMAX_S, vk, vj, vd);
++  LA(vfmax_s(vd, vj, vk));
+ }
+ 
+ void Assembler::vfmax_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFMAX_D, vk, vj, vd);
++  LA(vfmax_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vfmin_s(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFMIN_S, vk, vj, vd);
++  LA(vfmin_s(vd, vj, vk));
+ }
+ 
+ void Assembler::vfmin_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFMIN_D, vk, vj, vd);
++  LA(vfmin_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vfmaxa_s(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFMAXA_S, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfmaxa_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFMAXA_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfmina_s(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFMINA_S, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfmina_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFMINA_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfcvt_h_s(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFCVT_H_S, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfcvt_s_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFCVT_S_D, vk, vj, vd);
++  LA(vfcvt_s_d(vd, vj, vk));
+ }
+ 
+ void Assembler::vffint_s_l(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFFINT_S_L, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftint_w_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINT_W_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrm_w_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRM_W_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrp_w_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRP_W_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrz_w_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRZ_W_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrne_w_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRNE_W_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vshuf_h(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSHUF_H, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vshuf_w(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSHUF_W, vk, vj, vd);
++  LA(vshuf_w(vd, vj, vk));
+ }
+ 
+ void Assembler::vshuf_d(VRegister vd, VRegister vj, VRegister vk) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSHUF_D, vk, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vseqi_b(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSEQI_B, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vseqi_h(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSEQI_H, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vseqi_w(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSEQI_W, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vseqi_d(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSEQI_D, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslei_b(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLEI_B, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslei_h(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLEI_H, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslei_w(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLEI_W, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslei_d(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLEI_D, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslei_bu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLEI_BU, ui5, vj, vd, 5);
++  LA(vslei_bu(vd, vj, ui5));
+ }
+ 
+ void Assembler::vslei_hu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLEI_HU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslei_wu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLEI_WU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslei_du(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLEI_DU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslti_b(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLTI_B, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslti_h(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLTI_H, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslti_w(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLTI_W, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslti_d(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLTI_D, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslti_bu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLTI_BU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslti_hu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLTI_HU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslti_wu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLTI_WU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vslti_du(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLTI_DU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vaddi_bu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VADDI_BU, ui5, vj, vd, 5);
++  LA(vaddi_bu(vd, vj, ui5));
+ }
+ 
+ void Assembler::vaddi_hu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VADDI_HU, ui5, vj, vd, 5);
++  LA(vaddi_hu(vd, vj, ui5));
+ }
+ 
+ void Assembler::vaddi_wu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VADDI_WU, ui5, vj, vd, 5);
++  LA(vaddi_wu(vd, vj, ui5));
+ }
+ 
+ void Assembler::vaddi_du(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VADDI_DU, ui5, vj, vd, 5);
++  LA(vaddi_du(vd, vj, ui5));
+ }
+ 
+ void Assembler::vsubi_bu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSUBI_BU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubi_hu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSUBI_HU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubi_wu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSUBI_WU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsubi_du(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSUBI_DU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbsll_v(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VBSLL_V, ui5, vj, vd, 5);
++  LA(vbsll_v(vd, vj, ui5));
+ }
+ 
+ void Assembler::vbsrl_v(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VBSRL_V, ui5, vj, vd, 5);
++  LA(vbsrl_v(vd, vj, ui5));
+ }
+ 
+ void Assembler::vmaxi_b(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMAXI_B, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaxi_h(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMAXI_H, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaxi_w(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMAXI_W, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaxi_d(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMAXI_D, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmini_b(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMINI_B, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmini_h(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMINI_H, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmini_w(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMINI_W, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmini_d(VRegister vd, VRegister vj, int32_t si5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMINI_D, si5, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaxi_bu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMAXI_BU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaxi_hu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMAXI_HU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaxi_wu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMAXI_WU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmaxi_du(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMAXI_DU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmini_bu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMINI_BU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmini_hu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMINI_HU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmini_wu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMINI_WU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmini_du(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VMINI_DU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfrstpi_b(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VFRSTPI_B, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfrstpi_h(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VFRSTPI_H, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vclo_b(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VCLO_B, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vclo_h(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VCLO_H, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vclo_w(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VCLO_W, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vclo_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VCLO_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vclz_b(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VCLZ_B, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vclz_h(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VCLZ_H, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vclz_w(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VCLZ_W, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vclz_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VCLZ_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vpcnt_b(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPCNT_B, vj, vd);
++  LA(vpcnt_b(vd, vj));
+ }
+ 
+ void Assembler::vpcnt_h(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPCNT_H, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vpcnt_w(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPCNT_W, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vpcnt_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VPCNT_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vneg_b(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VNEG_B, vj, vd);
++  LA(vneg_b(vd, vj));
+ }
+ 
+ void Assembler::vneg_h(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VNEG_H, vj, vd);
++  LA(vneg_h(vd, vj));
+ }
+ 
+ void Assembler::vneg_w(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VNEG_W, vj, vd);
++  LA(vneg_w(vd, vj));
+ }
+ 
+ void Assembler::vneg_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VNEG_D, vj, vd);
++  LA(vneg_d(vd, vj));
+ }
+ 
+ void Assembler::vmskltz_b(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMSKLTZ_B, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmskltz_h(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMSKLTZ_H, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmskltz_w(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMSKLTZ_W, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmskltz_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMSKLTZ_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmskgez_b(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMSKGEZ_B, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vmsknz_b(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VMSKNZ_B, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vseteqz_v(CFRegister cd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSETEQZ_V, vj, cd);
++  LA(vseteqz_v(cd, vj));
+ }
+ 
+ void Assembler::vsetnez_v(CFRegister cd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSETNEZ_V, vj, cd);
++  LA(vsetnez_v(cd, vj));
+ }
+ 
+ void Assembler::vsetanyeqz_b(CFRegister cd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSETANYEQZ_B, vj, cd);
++  LA(vsetanyeqz_b(cd, vj));
+ }
+ 
+ void Assembler::vsetanyeqz_h(CFRegister cd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSETANYEQZ_H, vj, cd);
++  LA(vsetanyeqz_h(cd, vj));
+ }
+ 
+ void Assembler::vsetanyeqz_w(CFRegister cd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSETANYEQZ_W, vj, cd);
++  LA(vsetanyeqz_w(cd, vj));
+ }
+ 
+ void Assembler::vsetanyeqz_d(CFRegister cd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSETANYEQZ_D, vj, cd);
++  LA(vsetanyeqz_d(cd, vj));
+ }
+ 
+ void Assembler::vsetallnez_b(CFRegister cd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSETALLNEZ_B, vj, cd);
++  LA(vsetallnez_b(cd, vj));
+ }
+ 
+ void Assembler::vsetallnez_h(CFRegister cd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSETALLNEZ_H, vj, cd);
++  LA(vsetallnez_h(cd, vj));
+ }
+ 
+ void Assembler::vsetallnez_w(CFRegister cd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSETALLNEZ_W, vj, cd);
++  LA(vsetallnez_w(cd, vj));
+ }
+ 
+ void Assembler::vsetallnez_d(CFRegister cd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VSETALLNEZ_D, vj, cd);
++  LA(vsetallnez_d(cd, vj));
+ }
+ 
+ void Assembler::vflogb_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFLOGB_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vflogb_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFLOGB_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfclass_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFCLASS_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfclass_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFCLASS_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfsqrt_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFSQRT_S, vj, vd);
++  LA(vfsqrt_s(vd, vj));
+ }
+ 
+ void Assembler::vfsqrt_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFSQRT_D, vj, vd);
++  LA(vfsqrt_d(vd, vj));
+ }
+ 
+ void Assembler::vfrecip_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRECIP_S, vj, vd);
++  LA(vfrecip_s(vd, vj));
+ }
+ 
+ void Assembler::vfrecip_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRECIP_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfrsqrt_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRSQRT_S, vj, vd);
++  LA(vfrsqrt_s(vd, vj));
+ }
+ 
+ void Assembler::vfrsqrt_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRSQRT_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfrint_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRINT_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfrint_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRINT_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfrintrm_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRINTRM_S, vj, vd);
++  LA(vfrintrm_s(vd, vj));
+ }
+ 
+ void Assembler::vfrintrm_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRINTRM_D, vj, vd);
++  LA(vfrintrm_d(vd, vj));
+ }
+ 
+ void Assembler::vfrintrp_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRINTRP_S, vj, vd);
++  LA(vfrintrp_s(vd, vj));
+ }
+ 
+ void Assembler::vfrintrp_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRINTRP_D, vj, vd);
++  LA(vfrintrp_d(vd, vj));
+ }
+ 
+ void Assembler::vfrintrz_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRINTRZ_S, vj, vd);
++  LA(vfrintrz_s(vd, vj));
+ }
+ 
+ void Assembler::vfrintrz_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRINTRZ_D, vj, vd);
++  LA(vfrintrz_d(vd, vj));
+ }
+ 
+ void Assembler::vfrintrne_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRINTRNE_S, vj, vd);
++  LA(vfrintrne_s(vd, vj));
+ }
+ 
+ void Assembler::vfrintrne_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFRINTRNE_D, vj, vd);
++  LA(vfrintrne_d(vd, vj));
+ }
+ 
+ void Assembler::vfcvtl_s_h(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFCVTL_S_H, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfcvth_s_h(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFCVTH_S_H, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vfcvtl_d_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFCVTL_D_S, vj, vd);
++  LA(vfcvtl_d_s(vd, vj));
+ }
+ 
+ void Assembler::vfcvth_d_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFCVTH_D_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vffint_s_w(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFFINT_S_W, vj, vd);
++  LA(vffint_s_w(vd, vj));
+ }
+ 
+ void Assembler::vffint_s_wu(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFFINT_S_WU, vj, vd);
++  LA(vffint_s_wu(vd, vj));
+ }
+ 
+ void Assembler::vffint_d_l(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFFINT_D_L, vj, vd);
++  LA(vffint_d_l(vd, vj));
+ }
+ 
+ void Assembler::vffint_d_lu(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFFINT_D_LU, vj, vd);
++  LA(vffint_d_lu(vd, vj));
+ }
+ 
+ void Assembler::vffintl_d_w(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFFINTL_D_W, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vffinth_d_w(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFFINTH_D_W, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftint_w_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINT_W_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftint_l_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINT_L_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrm_w_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRM_W_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrm_l_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRM_L_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrp_w_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRP_W_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrp_l_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRP_L_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrz_w_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRZ_W_S, vj, vd);
++  LA(vftintrz_w_s(vd, vj));
+ }
+ 
+ void Assembler::vftintrz_l_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRZ_L_D, vj, vd);
++  LA(vftintrz_l_d(vd, vj));
+ }
+ 
+ void Assembler::vftintrne_w_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRNE_W_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrne_l_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRNE_L_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftint_wu_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINT_WU_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftint_lu_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINT_LU_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrz_wu_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRZ_WU_S, vj, vd);
++  LA(vftintrz_wu_s(vd, vj));
+ }
+ 
+ void Assembler::vftintrz_lu_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRZ_LU_D, vj, vd);
++  LA(vftintrz_lu_d(vd, vj));
+ }
+ 
+ void Assembler::vftintl_l_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTL_L_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftinth_l_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTH_L_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrml_l_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRML_L_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrmh_l_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRMH_L_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrpl_l_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRPL_L_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrph_l_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRPH_L_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrzl_l_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRZL_L_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrzh_l_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRZH_L_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrnel_l_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRNEL_L_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vftintrneh_l_s(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VFTINTRNEH_L_S, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vexth_h_b(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VEXTH_H_B, vj, vd);
++  LA(vexth_h_b(vd, vj));
+ }
+ 
+ void Assembler::vexth_w_h(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VEXTH_W_H, vj, vd);
++  LA(vexth_w_h(vd, vj));
+ }
+ 
+ void Assembler::vexth_d_w(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VEXTH_D_W, vj, vd);
++  LA(vexth_d_w(vd, vj));
+ }
+ 
+ void Assembler::vexth_q_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VEXTH_Q_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vexth_hu_bu(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VEXTH_HU_BU, vj, vd);
++  LA(vexth_hu_bu(vd, vj));
+ }
+ 
+ void Assembler::vexth_wu_hu(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VEXTH_WU_HU, vj, vd);
++  LA(vexth_wu_hu(vd, vj));
+ }
+ 
+ void Assembler::vexth_du_wu(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VEXTH_DU_WU, vj, vd);
++  LA(vexth_du_wu(vd, vj));
+ }
+ 
+ void Assembler::vexth_qu_du(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VEXTH_QU_DU, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vreplgr2vr_b(VRegister vd, Register rj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VREPLGR2VR_B, rj, vd);
++  LA(vreplgr2vr_b(vd, rj));
+ }
+ 
+ void Assembler::vreplgr2vr_h(VRegister vd, Register rj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VREPLGR2VR_H, rj, vd);
++  LA(vreplgr2vr_h(vd, rj));
+ }
+ 
+ void Assembler::vreplgr2vr_w(VRegister vd, Register rj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VREPLGR2VR_W, rj, vd);
++  LA(vreplgr2vr_w(vd, rj));
+ }
+ 
+ void Assembler::vreplgr2vr_d(VRegister vd, Register rj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VREPLGR2VR_D, rj, vd);
++  LA(vreplgr2vr_d(vd, rj));
+ }
+ 
+ void Assembler::vrotri_b(VRegister vd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VROTRI_B, ui3, vj, vd, 3);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vrotri_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VROTRI_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vrotri_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VROTRI_W, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vrotri_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VROTRI_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlri_b(VRegister vd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLRI_B, ui3, vj, vd, 3);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlri_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLRI_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlri_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLRI_W, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlri_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLRI_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrari_b(VRegister vd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRARI_B, ui3, vj, vd, 3);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrari_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRARI_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrari_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRARI_W, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrari_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRARI_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vinsgr2vr_b(VRegister vd, Register rj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VINSGR2VR_B, ui4, rj, vd, 4);
++  LA(vinsgr2vr_b(vd, rj, ui4));
+ }
+ 
+ void Assembler::vinsgr2vr_h(VRegister vd, Register rj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VINSGR2VR_H, ui3, rj, vd, 3);
++  LA(vinsgr2vr_h(vd, rj, ui3));
+ }
+ 
+ void Assembler::vinsgr2vr_w(VRegister vd, Register rj, uint32_t ui2) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VINSGR2VR_W, ui2, rj, vd, 2);
++  LA(vinsgr2vr_w(vd, rj, ui2));
+ }
+ 
+ void Assembler::vinsgr2vr_d(VRegister vd, Register rj, uint32_t ui1) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VINSGR2VR_D, ui1, rj, vd, 1);
++  LA(vinsgr2vr_d(vd, rj, ui1));
+ }
+ 
+ void Assembler::vpickve2gr_b(Register rd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VPICKVE2GR_B, ui4, vj, rd, 4);
++  LA(vpickve2gr_b(rd, vj, ui4));
+ }
+ 
+ void Assembler::vpickve2gr_h(Register rd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VPICKVE2GR_H, ui3, vj, rd, 3);
++  LA(vpickve2gr_h(rd, vj, ui3));
+ }
+ 
+ void Assembler::vpickve2gr_w(Register rd, VRegister vj, uint32_t ui2) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VPICKVE2GR_W, ui2, vj, rd, 2);
++  LA(vpickve2gr_w(rd, vj, ui2));
+ }
+ 
+ void Assembler::vpickve2gr_d(Register rd, VRegister vj, uint32_t ui1) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VPICKVE2GR_D, ui1, vj, rd, 1);
++  LA(vpickve2gr_d(rd, vj, ui1));
+ }
+ 
+ void Assembler::vpickve2gr_bu(Register rd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VPICKVE2GR_BU, ui4, vj, rd, 4);
++  LA(vpickve2gr_bu(rd, vj, ui4));
+ }
+ 
+ void Assembler::vpickve2gr_hu(Register rd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VPICKVE2GR_HU, ui3, vj, rd, 3);
++  LA(vpickve2gr_hu(rd, vj, ui3));
+ }
+ 
+ void Assembler::vpickve2gr_wu(Register rd, VRegister vj, uint32_t ui2) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VPICKVE2GR_WU, ui2, vj, rd, 2);
++  LA(vpickve2gr_wu(rd, vj, ui2));
+ }
+ 
+ void Assembler::vpickve2gr_du(Register rd, VRegister vj, uint32_t ui1) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VPICKVE2GR_DU, ui1, vj, rd, 1);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vreplvei_b(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VREPLVEI_B, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vreplvei_h(VRegister vd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VREPLVEI_H, ui3, vj, vd, 3);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vreplvei_w(VRegister vd, VRegister vj, uint32_t ui2) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VREPLVEI_W, ui2, vj, vd, 2);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vreplvei_d(VRegister vd, VRegister vj, uint32_t ui1) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VREPLVEI_D, ui1, vj, vd, 1);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsllwil_h_b(VRegister vd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLLWIL_H_B, ui3, vj, vd, 3);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsllwil_w_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLLWIL_W_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsllwil_d_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLLWIL_D_W, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vextl_q_d(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VEXTL_Q_D, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsllwil_hu_bu(VRegister vd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLLWIL_HU_BU, ui3, vj, vd, 3);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsllwil_wu_hu(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLLWIL_WU_HU, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsllwil_du_wu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLLWIL_DU_WU, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vextl_qu_du(VRegister vd, VRegister vj) {
+-  DCHECK(IsEnabled(LSX));
+-  GenRegister(VEXTL_QU_DU, vj, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitclri_b(VRegister vd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VBITCLRI_B, ui3, vj, vd, 3);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitclri_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VBITCLRI_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitclri_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VBITCLRI_W, ui5, vj, vd, 5);
++  LA(vbitclri_w(vd, vj, ui5));
+ }
+ 
+ void Assembler::vbitclri_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VBITCLRI_D, ui6, vj, vd, 6);
++  LA(vbitclri_d(vd, vj, ui6));
+ }
+ 
+ void Assembler::vbitseti_b(VRegister vd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VBITSETI_B, ui3, vj, vd, 3);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitseti_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VBITSETI_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitseti_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VBITSETI_W, ui5, vj, vd, 5);
++  LA(vbitseti_w(vd, vj, ui5));
+ }
+ 
+ void Assembler::vbitseti_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VBITSETI_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitrevi_b(VRegister vd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VBITREVI_B, ui3, vj, vd, 3);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitrevi_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VBITREVI_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitrevi_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VBITREVI_W, ui5, vj, vd, 5);
++  LA(vbitrevi_w(vd, vj, ui5));
+ }
+ 
+ void Assembler::vbitrevi_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VBITREVI_D, ui6, vj, vd, 6);
++  LA(vbitrevi_d(vd, vj, ui6));
+ }
+ 
+ void Assembler::vsat_b(VRegister vd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSAT_B, ui3, vj, vd, 3);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsat_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSAT_H, ui4, vj, vd, 4);
++  LA(vsat_h(vd, vj, ui4));
+ }
+ 
+ void Assembler::vsat_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSAT_W, ui5, vj, vd, 5);
++  LA(vsat_w(vd, vj, ui5));
+ }
+ 
+ void Assembler::vsat_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSAT_D, ui6, vj, vd, 6);
++  LA(vsat_d(vd, vj, ui6));
+ }
+ 
+ void Assembler::vsat_bu(VRegister vd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSAT_BU, ui3, vj, vd, 3);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsat_hu(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSAT_HU, ui4, vj, vd, 4);
++  LA(vsat_hu(vd, vj, ui4));
+ }
+ 
+ void Assembler::vsat_wu(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSAT_WU, ui5, vj, vd, 5);
++  LA(vsat_wu(vd, vj, ui5));
+ }
+ 
+ void Assembler::vsat_du(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSAT_DU, ui6, vj, vd, 6);
++  LA(vsat_du(vd, vj, ui6));
+ }
+ 
+ void Assembler::vslli_b(VRegister vd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLLI_B, ui3, vj, vd, 3);
++  LA(vslli_b(vd, vj, ui3));
+ }
+ 
+ void Assembler::vslli_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLLI_H, ui4, vj, vd, 4);
++  LA(vslli_h(vd, vj, ui4));
+ }
+ 
+ void Assembler::vslli_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLLI_W, ui5, vj, vd, 5);
++  LA(vslli_w(vd, vj, ui5));
+ }
+ 
+ void Assembler::vslli_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSLLI_D, ui6, vj, vd, 6);
++  LA(vslli_d(vd, vj, ui6));
+ }
+ 
+ void Assembler::vsrli_b(VRegister vd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLI_B, ui3, vj, vd, 3);
++  LA(vsrli_b(vd, vj, ui3));
+ }
+ 
+ void Assembler::vsrli_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLI_H, ui4, vj, vd, 4);
++  LA(vsrli_h(vd, vj, ui4));
+ }
+ 
+ void Assembler::vsrli_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLI_W, ui5, vj, vd, 5);
++  LA(vsrli_w(vd, vj, ui5));
+ }
+ 
+ void Assembler::vsrli_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLI_D, ui6, vj, vd, 6);
++  LA(vsrli_d(vd, vj, ui6));
+ }
+ 
+ void Assembler::vsrai_b(VRegister vd, VRegister vj, uint32_t ui3) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRAI_B, ui3, vj, vd, 3);
++  LA(vsrai_b(vd, vj, ui3));
+ }
+ 
+ void Assembler::vsrai_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRAI_H, ui4, vj, vd, 4);
++  LA(vsrai_h(vd, vj, ui4));
+ }
+ 
+ void Assembler::vsrai_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRAI_W, ui5, vj, vd, 5);
++  LA(vsrai_w(vd, vj, ui5));
+ }
+ 
+ void Assembler::vsrai_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRAI_D, ui6, vj, vd, 6);
++  LA(vsrai_d(vd, vj, ui6));
+ }
+ 
+ void Assembler::vsrlni_b_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLNI_B_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlni_h_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLNI_H_W, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlni_w_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLNI_W_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlni_d_q(VRegister vd, VRegister vj, uint32_t ui7) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLNI_D_Q, ui7, vj, vd, 7);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlrni_b_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLRNI_B_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlrni_h_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLRNI_H_W, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlrni_w_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLRNI_W_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrlrni_d_q(VRegister vd, VRegister vj, uint32_t ui7) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRLRNI_D_Q, ui7, vj, vd, 7);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlni_b_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLNI_B_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlni_h_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLNI_H_W, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlni_w_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLNI_W_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlni_d_q(VRegister vd, VRegister vj, uint32_t ui7) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLNI_D_Q, ui7, vj, vd, 7);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlni_bu_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLNI_BU_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlni_hu_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLNI_HU_W, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlni_wu_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLNI_WU_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlni_du_q(VRegister vd, VRegister vj, uint32_t ui7) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLNI_DU_Q, ui7, vj, vd, 7);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlrni_b_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLRNI_B_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlrni_h_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLRNI_H_W, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlrni_w_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLRNI_W_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlrni_d_q(VRegister vd, VRegister vj, uint32_t ui7) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLRNI_D_Q, ui7, vj, vd, 7);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlrni_bu_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLRNI_BU_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlrni_hu_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLRNI_HU_W, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlrni_wu_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLRNI_WU_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrlrni_du_q(VRegister vd, VRegister vj, uint32_t ui7) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRLRNI_DU_Q, ui7, vj, vd, 7);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrani_b_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRANI_B_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrani_h_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRANI_H_W, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrani_w_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRANI_W_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrani_d_q(VRegister vd, VRegister vj, uint32_t ui7) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRANI_D_Q, ui7, vj, vd, 7);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrarni_b_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRARNI_B_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrarni_h_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRARNI_H_W, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrarni_w_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRARNI_W_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vsrarni_d_q(VRegister vd, VRegister vj, uint32_t ui7) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSRARNI_D_Q, ui7, vj, vd, 7);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrani_b_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRANI_B_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrani_h_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRANI_H_W, ui5, vj, vd, 5);
++  LA(vssrani_h_w(vd, vj, ui5));
+ }
+ 
+ void Assembler::vssrani_w_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRANI_W_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrani_d_q(VRegister vd, VRegister vj, uint32_t ui7) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRANI_D_Q, ui7, vj, vd, 7);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrani_bu_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRANI_BU_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrani_hu_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRANI_HU_W, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrani_wu_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRANI_WU_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrani_du_q(VRegister vd, VRegister vj, uint32_t ui7) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRANI_DU_Q, ui7, vj, vd, 7);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrarni_b_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRARNI_B_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrarni_h_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRARNI_H_W, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrarni_w_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRARNI_W_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrarni_d_q(VRegister vd, VRegister vj, uint32_t ui7) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRARNI_D_Q, ui7, vj, vd, 7);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrarni_bu_h(VRegister vd, VRegister vj, uint32_t ui4) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRARNI_BU_H, ui4, vj, vd, 4);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrarni_hu_w(VRegister vd, VRegister vj, uint32_t ui5) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRARNI_HU_W, ui5, vj, vd, 5);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrarni_wu_d(VRegister vd, VRegister vj, uint32_t ui6) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRARNI_WU_D, ui6, vj, vd, 6);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vssrarni_du_q(VRegister vd, VRegister vj, uint32_t ui7) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSSRARNI_DU_Q, ui7, vj, vd, 7);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vextrins_d(VRegister vd, VRegister vj, uint32_t ui8) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VEXTRINS_D, ui8, vj, vd, 8);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vextrins_w(VRegister vd, VRegister vj, uint32_t ui8) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VEXTRINS_W, ui8, vj, vd, 8);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vextrins_h(VRegister vd, VRegister vj, uint32_t ui8) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VEXTRINS_H, ui8, vj, vd, 8);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vextrins_b(VRegister vd, VRegister vj, uint32_t ui8) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VEXTRINS_B, ui8, vj, vd, 8);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vshuf4i_b(VRegister vd, VRegister vj, uint32_t ui8) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSHUF4I_B, ui8, vj, vd, 8);
++  LA(vshuf4i_b(vd, vj, ui8));
+ }
+ 
+ void Assembler::vshuf4i_h(VRegister vd, VRegister vj, uint32_t ui8) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSHUF4I_H, ui8, vj, vd, 8);
++  LA(vshuf4i_h(vd, vj, ui8));
+ }
+ 
+ void Assembler::vshuf4i_w(VRegister vd, VRegister vj, uint32_t ui8) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSHUF4I_W, ui8, vj, vd, 8);
++  LA(vshuf4i_w(vd, vj, ui8));
+ }
+ 
+ void Assembler::vshuf4i_d(VRegister vd, VRegister vj, uint32_t ui8) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VSHUF4I_D, ui8, vj, vd, 8);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vbitseli_b(VRegister vd, VRegister vj, uint32_t ui8) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VBITSELI_B, ui8, vj, vd, 8);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vandi_b(VRegister vd, VRegister vj, uint32_t ui8) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VANDI_B, ui8, vj, vd, 8);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vori_b(VRegister vd, VRegister vj, uint32_t ui8) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VORI_B, ui8, vj, vd, 8);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vxori_b(VRegister vd, VRegister vj, uint32_t ui8) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VXORI_B, ui8, vj, vd, 8);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vnori_b(VRegister vd, VRegister vj, uint32_t ui8) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VNORI_B, ui8, vj, vd, 8);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vldi(VRegister vd, int32_t i13) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VLDI, i13, vd);
++  UNIMPLEMENTED();
+ }
+ 
+ void Assembler::vpermi_w(VRegister vd, VRegister vj, uint32_t ui8) {
+-  DCHECK(IsEnabled(LSX));
+-  GenImm(VPERMI_W, ui8, vj, vd, 8);
++  UNIMPLEMENTED();
+ }
+ 
++#undef LA
++
+ void Assembler::AdjustBaseAndOffset(MemOperand* src) {
+   // is_int12 must be passed a signed value, hence the static cast below.
+   if ((!src->hasIndexReg() && is_int12(src->offset())) || src->hasIndexReg()) {
+diff --git a/chromium/v8/src/codegen/e2k/e2k_asm.h b/chromium/v8/src/codegen/e2k/e2k_asm.h
+index 64a8f85e22..da706d7f53 100644
+--- a/chromium/v8/src/codegen/e2k/e2k_asm.h
++++ b/chromium/v8/src/codegen/e2k/e2k_asm.h
+@@ -72,7 +72,16 @@ struct Op { uint8_t cop, opce, opc2, opce2; bool w32; uint8_t plain, ales, kind;
+ enum : uint8_t { kInt, kInt32, kLoad, kMul, kFp, kFpToInt, kMade = 7, kForInt = 0, kForFp = 8, kForMul = 16, kFor = 24, kR32 = 32 };
+ constexpr bool starts(const char* s, const char* p) { return !*p || (*s == *p && starts(s + 1, p + 1)); }
+ constexpr bool within(const char* s, const char* p) { return *s && (starts(s, p) || within(s + 1, p)); }
++// The 128-bit operations (opcodes-qp.inc; ideas/101-qp-cost): integer ones
++// take 1 cycle, multiplies, multiply-adds, sums of differences and qpsgn2mskb
++// 5, floating-point ones (compares, min/max and conversions too) 5.
++constexpr uint8_t kind_of_qp(const char* n) {
++  bool fp = starts(n, "qpf") || starts(n, "qpisto") || starts(n, "qpidto");
++  bool mul = within(n, "mul") || within(n, "madd") || within(n, "sad") || starts(n, "qpsgn2") || starts(n, "qphmin");
++  return uint8_t(fp ? kFp | kForFp : mul ? kMul | kForInt : kInt | kForInt);
++}
+ constexpr uint8_t kind_of(const char* n, bool w32) {
++  if (starts(n, "qp")) return kind_of_qp(n);
+   bool load = starts(n, "ld"), store = starts(n, "st"), fp = *n == 'f', to_fp = starts(n, "isto") || starts(n, "idto");
+   bool mul = !fp && (within(n, "mul") || within(n, "div") || within(n, "mod")), to_int = fp && within(n, "toi") && !within(n, "toif");
+   return uint8_t((load ? kLoad : mul ? kMul : to_int ? kFpToInt : fp || to_fp ? kFp : w32 && !starts(n, "sxt") ? kInt32 : kInt) |
+@@ -227,6 +236,10 @@ class Assembler : public Command {
+ #define E2K_ALOPF16(name, op) \
+   void name(int ch, Sreg s, Reg d) { first(); def(d.code); alop(op, ch, uint8_t(s), 0, d.code); }
+ #include "opcodes.inc"
++// The 128-bit operations.  ldqp and stqp are not used: they want addresses
++// that are multiples of 16 (SIGBUS otherwise, ideas/99) and the scheduler
++// does not know them as memory operations (they take ALES).
++#include "opcodes-qp.inc"
+ #undef E2K_ALOPF1
+ #undef E2K_ALOPF11
+ #undef E2K_ALOPF3
+@@ -242,6 +255,15 @@ class Assembler : public Command {
+ 
+   // dst = address of label
+   void lea(int ch, Label* l, Reg d) { addd(ch, 0, l, d); }
++  // `qplog_<table>`, 128 bits: bit i of the result is bit (a << 2 | b << 1 |
++  // c) of `table`, a, b, c being bit i of s1, s2, s3 (measured, simd/sem2):
++  // 0xf0 is s1, 0xcc s2, 0xaa s3, 0xca s1 ? s2 : s3.  The table is part of
++  // the opcode: its low seven bits are the cop, the high one is in opc2.
++  void qplog(int ch, int table, Src1 s1, Src2 s2, Reg s3, Reg d) {
++    assert(table >= 0 && table < 256);
++    Op o{uint8_t(table & 0x7f), 0, uint8_t(0x12 | table >> 7), 0, false, 0x00, 0x1b, uint8_t(kInt | kForInt)};
++    use(s1.code); use(s3.code); def(d.code); alop(o, ch, s1.code, s2, d.code, s3.code);
++  }
+   // Modifiers of the operation already placed in channel `ch`.
+   void sm(int ch) { if ((ch = taken(ch)) >= 0) als_[ch] |= 0x80000000u; }             // `op,ch,sm`
+   void when(int ch, Pred p) { usep(p); if ((ch = taken(ch)) >= 0) { rlp_[ch] = p; rlp_mask_ |= 1 << ch; } }  // `op ? %pred`
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index b5ce37ed0b..f41108926d 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -72,6 +72,16 @@ class FPURegister {
+  private:
+   int code_;
+ };
++// LSX vr<n> is f<n> (the same e2k register, which is 128 bits wide).
++class VRegister {
++ public:
++  constexpr explicit VRegister(int code) : code_(code) {}
++  constexpr int code() const { return code_; }
++  constexpr bool operator==(VRegister o) const { return code_ == o.code_; }
++  constexpr bool operator!=(VRegister o) const { return code_ != o.code_; }
++ private:
++  int code_;
++};
+ enum CFRegister { FCC0, FCC1, FCC2, FCC3, FCC4, FCC5, FCC6, FCC7 };
+ struct FPUControlRegister { int code; };
+ constexpr FPUControlRegister FCSR0{0}, FCSR1{1}, FCSR2{2}, FCSR3{3};
+@@ -218,9 +228,8 @@ class Assembler : private e2k::Assembler {
+     assert(nargs >= 0 && nargs <= 8);
+     Own own(this);
+     // nfx = 0: the window is spilled with the high halves of the registers
+-    // (128 bits on e2k-v5); with nfx = 1 a spill on an interrupt or a deep
+-    // call now and then loses them (v8-e2k-lab simd/test_lsx: 11-15 wrong
+-    // results in 304 800 with nfx = 1, none with nfx = 0).
++    // (128-bit values of wasm SIMD); with nfx = 1 a spill on an interrupt
++    // or a deep call loses them (simd/test_lsx: sporadic zero high halves).
+     C(setwd(kWindow, false); setbn(5, 32, 0));
+     C(for (int i = 4; i < 8; i++) addd(i - 4, i < nargs ? Src1(e2k::r(i)) : Src1(0), 0, e2k::r(4 + i)));
+     C(for (int i = 0; i < 4; i++) addd(i, i < nargs ? Src1(e2k::r(i)) : Src1(0), 0, e2k::r(4 + i)));
+@@ -686,10 +695,544 @@ class Assembler : private e2k::Assembler {
+   void fstx_s(FPURegister fd, Register rj, Register rk) { L(stw(2, R(rj), R(rk), F(fd))); }
+   void fstx_d(FPURegister fd, Register rj, Register rk) { L(std_(2, R(rj), R(rk), F(fd))); }
+ 
++  // ---- 128 bits: LSX on the qp operations of e2k-v5 ---------------------------
++  // vr<n> is the e2k register of f<n>, which is 128 bits wide.  A 64-bit
++  // operation that reads it sees bits 63..0.  One that writes it keeps bits
++  // 127..64 in the register (ideas/98-qp-upper), but a qp operation that
++  // reads the register within a few cycles may get a stale high half when
++  // the 128-bit value before was written shortly before (simd/exec_one): no
++  // instruction here writes a vector with a scalar operation, every one ends
++  // with a qp operation that writes it whole.  qp operations: the integer ones
++  // go in channels 0 and 3, multiplies and saturating packs in 1 and 4, the
++  // others in 0, 1, 3 and 4 (floating add and multiply in all six).  A
++  // literal operand of a qp operation has a high half that is not defined
++  // (simd/sem3: bytes from around the code): literals only where 64 bits
++  // are read (shift counts, the rounding mode, the halves of qppackdl), and a
++  // zero vector is qppackdl 0, 0.  ldqp and stqp want
++  // addresses that are multiples of 16 (ideas/99), which neither wasm memory
++  // nor V8's frames give: the halves go through ldd and std.  The semantics
++  // are those of LoongArch LSX as V8's loong64 code uses them; where an
++  // operand is assumed to have a shape (a shift count that is the same in
++  // every lane) it is said.
++  void vand_v(VRegister vd, VRegister vj, VRegister vk) { L(qpand(0, V(vj), V(vk), V(vd))); }
++  void vor_v(VRegister vd, VRegister vj, VRegister vk) { L(qpor(0, V(vj), V(vk), V(vd))); }
++  void vxor_v(VRegister vd, VRegister vj, VRegister vk) { L(qpxor(0, V(vj), V(vk), V(vd))); }
++  void vandn_v(VRegister vd, VRegister vj, VRegister vk) { L(qpandn(0, V(vk), V(vj), V(vd))); }   // ~vj & vk; qpandn a, b = a & ~b
++  // qplog tables: bit (a << 2 | b << 1 | c) is the result for bits a, b, c
++  // of the three operands: ~(a | b) = 0x03, a | ~b = 0xf3, a ? b : c = 0xca.
++  void vnor_v(VRegister vd, VRegister vj, VRegister vk) { L(qplog(0, 0x03, V(vj), V(vk), V(vj), V(vd))); }
++  void vorn_v(VRegister vd, VRegister vj, VRegister vk) { L(qplog(0, 0xf3, V(vj), V(vk), V(vj), V(vd))); }
++  // vd = va ? vk : vj, bit by bit.
++  void vbitsel_v(VRegister vd, VRegister vj, VRegister vk, VRegister va) { L(qplog(0, 0xca, V(va), V(vk), V(vj), V(vd))); }
++
++#define LA_V3(name, op, ch) void name(VRegister vd, VRegister vj, VRegister vk) { L(op(ch, V(vj), V(vk), V(vd))); }
++#define LA_V3R(name, op, ch) void name(VRegister vd, VRegister vj, VRegister vk) { L(op(ch, V(vk), V(vj), V(vd))); }
++  LA_V3(vadd_b, qpaddb, 0) LA_V3(vadd_h, qpaddh, 0) LA_V3(vadd_w, qpaddw, 0) LA_V3(vadd_d, qpaddd, 0)
++  LA_V3(vsub_b, qpsubb, 0) LA_V3(vsub_h, qpsubh, 0) LA_V3(vsub_w, qpsubw, 0) LA_V3(vsub_d, qpsubd, 0)
++  LA_V3(vmul_h, qpmullh, 1) LA_V3(vmul_w, qpmullw, 1)
++  LA_V3(vmax_b, qpmaxsb, 0) LA_V3(vmax_h, qpmaxsh, 0) LA_V3(vmax_w, qpmaxsw, 0)
++  LA_V3(vmax_bu, qpmaxub, 0) LA_V3(vmax_hu, qpmaxuh, 0) LA_V3(vmax_wu, qpmaxuw, 0)
++  LA_V3(vmin_b, qpminsb, 0) LA_V3(vmin_h, qpminsh, 0) LA_V3(vmin_w, qpminsw, 0)
++  LA_V3(vmin_bu, qpminub, 0) LA_V3(vmin_hu, qpminuh, 0) LA_V3(vmin_wu, qpminuw, 0)
++  LA_V3(vsadd_b, qpaddsb, 0) LA_V3(vsadd_h, qpaddsh, 0) LA_V3(vsadd_bu, qpaddusb, 0) LA_V3(vsadd_hu, qpaddush, 0)
++  LA_V3(vssub_b, qpsubsb, 0) LA_V3(vssub_h, qpsubsh, 0) LA_V3(vssub_bu, qpsubusb, 0) LA_V3(vssub_hu, qpsubush, 0)
++  LA_V3(vavgr_bu, qpavgusb, 0) LA_V3(vavgr_hu, qpavgush, 0)
++  LA_V3(vseq_b, qpcmpeqb, 0) LA_V3(vseq_h, qpcmpeqh, 0) LA_V3(vseq_w, qpcmpeqw, 0) LA_V3(vseq_d, qpcmpeqd, 0)
++  LA_V3R(vslt_b, qpcmpgtb, 0) LA_V3R(vslt_h, qpcmpgth, 0) LA_V3R(vslt_w, qpcmpgtw, 0) LA_V3R(vslt_d, qpcmpgtd, 0)
++  LA_V3(vfadd_s, qpfadds, 0) LA_V3(vfadd_d, qpfaddd, 0) LA_V3(vfsub_s, qpfsubs, 0) LA_V3(vfsub_d, qpfsubd, 0)
++  LA_V3(vfmul_s, qpfmuls, 0) LA_V3(vfmul_d, qpfmuld, 0)
++#undef LA_V3
++#undef LA_V3R
++  void vneg_b(VRegister vd, VRegister vj) { qzero(T0); L(qpsubb(0, T0, V(vj), V(vd))); }
++  void vneg_h(VRegister vd, VRegister vj) { qzero(T0); L(qpsubh(0, T0, V(vj), V(vd))); }
++  void vneg_w(VRegister vd, VRegister vj) { qzero(T0); L(qpsubw(0, T0, V(vj), V(vd))); }
++  void vneg_d(VRegister vd, VRegister vj) { qzero(T0); L(qpsubd(0, T0, V(vj), V(vd))); }
++  // vaddi_bu vd, vj, 0 is how V8 moves a vector (Vmove).
++  void vaddi_bu(VRegister vd, VRegister vj, int32_t ui5) { addi(&E::qpaddb, 1, vd, vj, ui5); }
++  void vaddi_hu(VRegister vd, VRegister vj, int32_t ui5) { addi(&E::qpaddh, 2, vd, vj, ui5); }
++  void vaddi_wu(VRegister vd, VRegister vj, int32_t ui5) { addi(&E::qpaddw, 4, vd, vj, ui5); }
++  void vaddi_du(VRegister vd, VRegister vj, int32_t ui5) { addi(&E::qpaddd, 8, vd, vj, ui5); }
++  // No 64-bit multiply in qp: the halves on the scalar side.
++  void vmul_d(VRegister vd, VRegister vj, VRegister vk) {
++    C(qpswitchd(0, V(vj), T0); qpswitchd(1, V(vk), T1));
++    C(muld(0, V(vj), V(vk), T2); muld(1, T0, T1, T3));
++    L(qppackdl(0, T3, T2, V(vd)));
++  }
++  // |vj| + |vk|; qpsign x, x is |x| (and -128 stays -128, as in LSX).
++  void vadda_b(VRegister vd, VRegister vj, VRegister vk) { adda(&E::qpsignb, &E::qpaddb, vd, vj, vk); }
++  void vadda_h(VRegister vd, VRegister vj, VRegister vk) { adda(&E::qpsignh, &E::qpaddh, vd, vj, vk); }
++  void vadda_w(VRegister vd, VRegister vj, VRegister vk) { adda(&E::qpsignw, &E::qpaddw, vd, vj, vk); }
++  void vadda_d(VRegister vd, VRegister vj, VRegister vk) {
++    qzero(T1);
++    C(qpcmpgtd(0, T1, V(vj), T0); qpcmpgtd(3, T1, V(vk), T1));     // -1 in the negative lanes
++    C(qpxor(0, V(vj), T0, T2); qpxor(1, V(vk), T1, T3));
++    C(qpsubd(0, T2, T0, T2); qpsubd(3, T3, T1, T3));
++    L(qpaddd(0, T2, T3, V(vd)));
++  }
++
++  // ---- compares: -1 or 0 in every lane
++  void vsle_b(VRegister vd, VRegister vj, VRegister vk) { C(qpcmpgtb(0, V(vj), V(vk), T0)); L(vnot(T0, V(vd))); }
++  void vsle_h(VRegister vd, VRegister vj, VRegister vk) { C(qpcmpgth(0, V(vj), V(vk), T0)); L(vnot(T0, V(vd))); }
++  void vsle_w(VRegister vd, VRegister vj, VRegister vk) { C(qpcmpgtw(0, V(vj), V(vk), T0)); L(vnot(T0, V(vd))); }
++  void vsle_d(VRegister vd, VRegister vj, VRegister vk) { C(qpcmpgtd(0, V(vj), V(vk), T0)); L(vnot(T0, V(vd))); }
++  // Unsigned: vj <= vk when max(vj, vk) == vk, vj < vk when not max(vj, vk) == vj.
++  void vsle_bu(VRegister vd, VRegister vj, VRegister vk) { C(qpmaxub(0, V(vj), V(vk), T0)); L(qpcmpeqb(0, T0, V(vk), V(vd))); }
++  void vsle_hu(VRegister vd, VRegister vj, VRegister vk) { C(qpmaxuh(0, V(vj), V(vk), T0)); L(qpcmpeqh(0, T0, V(vk), V(vd))); }
++  void vsle_wu(VRegister vd, VRegister vj, VRegister vk) { C(qpmaxuw(0, V(vj), V(vk), T0)); L(qpcmpeqw(0, T0, V(vk), V(vd))); }
++  void vslt_bu(VRegister vd, VRegister vj, VRegister vk) { C(qpmaxub(0, V(vj), V(vk), T0)); C(qpcmpeqb(0, T0, V(vj), T0)); L(vnot(T0, V(vd))); }
++  void vslt_hu(VRegister vd, VRegister vj, VRegister vk) { C(qpmaxuh(0, V(vj), V(vk), T0)); C(qpcmpeqh(0, T0, V(vj), T0)); L(vnot(T0, V(vd))); }
++  void vslt_wu(VRegister vd, VRegister vj, VRegister vk) { C(qpmaxuw(0, V(vj), V(vk), T0)); C(qpcmpeqw(0, T0, V(vj), T0)); L(vnot(T0, V(vd))); }
++  void vslei_bu(VRegister vd, VRegister vj, int32_t ui5) {
++    qsplat(T0, 1, uint64_t(ui5));
++    C(qpminub(0, V(vj), T0, T0));
++    L(qpcmpeqb(0, T0, V(vj), V(vd)));
++  }
++  void vfcmp_cond_s(FPUCondition cc, VRegister vd, VRegister vj, VRegister vk) {
++    vfcmp(cc, vd, vj, vk, &E::qpfcmpeqs, &E::qpfcmplts, &E::qpfcmples, &E::qpfcmpuods, &E::qpfcmpneqs, &E::qpfcmpnlts, &E::qpfcmpnles, &E::qpfcmpods);
++  }
++  void vfcmp_cond_d(FPUCondition cc, VRegister vd, VRegister vj, VRegister vk) {
++    vfcmp(cc, vd, vj, vk, &E::qpfcmpeqd, &E::qpfcmpltd, &E::qpfcmpled, &E::qpfcmpuodd, &E::qpfcmpneqd, &E::qpfcmpnltd, &E::qpfcmpnled, &E::qpfcmpodd);
++  }
++
++  // ---- shifts.  qpsll* and the like take the count from the low 64 bits of
++  // their second operand, whole (a count of the lane size or more gives 0);
++  // there is no 64-bit arithmetic shift and no byte shift.
++  void vslli_h(VRegister vd, VRegister vj, int32_t ui4) { L(qpsllh(0, V(vj), ui4 & 15, V(vd))); }
++  void vslli_w(VRegister vd, VRegister vj, int32_t ui5) { L(qpsllw(0, V(vj), ui5 & 31, V(vd))); }
++  void vslli_d(VRegister vd, VRegister vj, int32_t ui6) { L(qpslld(0, V(vj), ui6 & 63, V(vd))); }
++  void vsrli_h(VRegister vd, VRegister vj, int32_t ui4) { L(qpsrlh(0, V(vj), ui4 & 15, V(vd))); }
++  void vsrli_w(VRegister vd, VRegister vj, int32_t ui5) { L(qpsrlw(0, V(vj), ui5 & 31, V(vd))); }
++  void vsrli_d(VRegister vd, VRegister vj, int32_t ui6) { L(qpsrld(0, V(vj), ui6 & 63, V(vd))); }
++  void vsrai_h(VRegister vd, VRegister vj, int32_t ui4) { L(qpsrah(0, V(vj), ui4 & 15, V(vd))); }
++  void vsrai_w(VRegister vd, VRegister vj, int32_t ui5) { L(qpsraw(0, V(vj), ui5 & 31, V(vd))); }
++  void vslli_b(VRegister vd, VRegister vj, int32_t ui3) {
++    ui3 &= 7;
++    C(qpsllh(0, V(vj), ui3, T0));
++    qsplat(T1, 1, 0xffu << ui3);
++    L(qpand(0, T0, T1, V(vd)));
++  }
++  void vsrli_b(VRegister vd, VRegister vj, int32_t ui3) {
++    ui3 &= 7;
++    C(qpsrlh(0, V(vj), ui3, T0));
++    qsplat(T1, 1, 0xffu >> ui3);
++    L(qpand(0, T0, T1, V(vd)));
++  }
++  // The high byte of a 16-bit lane shifted is right; the low one goes up first.
++  void vsrai_b(VRegister vd, VRegister vj, int32_t ui3) {
++    ui3 &= 7;
++    C(qpsrah(0, V(vj), ui3, T0); qpsllh(1, V(vj), 8, T1));
++    C(qpsrah(0, T1, ui3, T1));
++    C(qpsrlh(0, T1, 8, T1));
++    qsplat(T2, 2, 0xff00);
++    L(qplog(0, 0xca, T2, T0, T1, V(vd)));
++  }
++  // The logical shift, ored with the sign spread over the bits that came in.
++  void vsrai_d(VRegister vd, VRegister vj, int32_t ui6) {
++    ui6 &= 63;
++    if (ui6 == 0) { L(qpor(0, V(vj), V(vj), V(vd))); return; }
++    qzero(T1);
++    C(qpsrld(0, V(vj), ui6, T0); qpcmpgtd(3, T1, V(vj), T1));
++    C(qpslld(0, T1, 64 - ui6, T1));
++    L(qpor(0, T0, T1, V(vd)));
++  }
++  // Shifts by a vector: the count is lane 0 of vk.  LSX shifts every lane by
++  // its own count; V8 always splats it (vreplgr2vr before the shift).
++  void vsll_h(VRegister vd, VRegister vj, VRegister vk) { C(andd(0, V(vk), 15, T0)); L(qpsllh(0, V(vj), T0, V(vd))); }
++  void vsll_w(VRegister vd, VRegister vj, VRegister vk) { C(andd(0, V(vk), 31, T0)); L(qpsllw(0, V(vj), T0, V(vd))); }
++  void vsll_d(VRegister vd, VRegister vj, VRegister vk) { C(andd(0, V(vk), 63, T0)); L(qpslld(0, V(vj), T0, V(vd))); }
++  void vsrl_h(VRegister vd, VRegister vj, VRegister vk) { C(andd(0, V(vk), 15, T0)); L(qpsrlh(0, V(vj), T0, V(vd))); }
++  void vsrl_w(VRegister vd, VRegister vj, VRegister vk) { C(andd(0, V(vk), 31, T0)); L(qpsrlw(0, V(vj), T0, V(vd))); }
++  void vsrl_d(VRegister vd, VRegister vj, VRegister vk) { C(andd(0, V(vk), 63, T0)); L(qpsrld(0, V(vj), T0, V(vd))); }
++  void vsra_h(VRegister vd, VRegister vj, VRegister vk) { C(andd(0, V(vk), 15, T0)); L(qpsrah(0, V(vj), T0, V(vd))); }
++  void vsra_w(VRegister vd, VRegister vj, VRegister vk) { C(andd(0, V(vk), 31, T0)); L(qpsraw(0, V(vj), T0, V(vd))); }
++  void vsra_d(VRegister vd, VRegister vj, VRegister vk) { sra_q(vd, vj, V(vk)); }
++  void vsll_b(VRegister vd, VRegister vj, VRegister vk) { shift_b(0, vd, vj, V(vk)); }
++  void vsrl_b(VRegister vd, VRegister vj, VRegister vk) { shift_b(1, vd, vj, V(vk)); }
++  void vsra_b(VRegister vd, VRegister vj, VRegister vk) { shift_b(2, vd, vj, V(vk)); }
++
++  // ---- bits of every lane
++  void vbitseti_w(VRegister vd, VRegister vj, int32_t ui5) { qsplat(T0, 4, 1ull << (ui5 & 31)); L(qpor(0, V(vj), T0, V(vd))); }
++  void vbitclri_w(VRegister vd, VRegister vj, int32_t ui5) { qsplat(T0, 4, ~(1ull << (ui5 & 31))); L(qpand(0, V(vj), T0, V(vd))); }
++  void vbitclri_d(VRegister vd, VRegister vj, int32_t ui6) { qsplat(T0, 8, ~(1ull << (ui6 & 63))); L(qpand(0, V(vj), T0, V(vd))); }
++  void vbitrevi_w(VRegister vd, VRegister vj, int32_t ui5) { qsplat(T0, 4, 1ull << (ui5 & 31)); L(qpxor(0, V(vj), T0, V(vd))); }
++  void vbitrevi_d(VRegister vd, VRegister vj, int32_t ui6) { qsplat(T0, 8, 1ull << (ui6 & 63)); L(qpxor(0, V(vj), T0, V(vd))); }
++  // Counts of the bits of each byte, by a table of the 16 nibbles.
++  void vpcnt_b(VRegister vd, VRegister vj) {
++    qconst(T0, 0x0403030203020201ull, 0x0302020102010100ull);
++    qsplat(T1, 1, 0x0f);
++    C(qpand(0, V(vj), T1, T2); qpsrlh(1, V(vj), 4, T3));
++    C(qpand(0, T3, T1, T3));
++    C(qppermb(0, T0, T0, T2, T2); qppermb(1, T0, T0, T3, T3));
++    L(qpaddb(0, T2, T3, V(vd)));
++  }
++
++  // ---- saturation (vsat_<s> vd, vj, imm: to imm + 1 bits; vsat_<s>u: to imm + 1 bits unsigned)
++  void vsat_h(VRegister vd, VRegister vj, int32_t imm) { sat(&E::qpminsh, &E::qpmaxsh, 2, vd, vj, imm); }
++  void vsat_w(VRegister vd, VRegister vj, int32_t imm) { sat(&E::qpminsw, &E::qpmaxsw, 4, vd, vj, imm); }
++  void vsat_hu(VRegister vd, VRegister vj, int32_t imm) { qsplat(T0, 2, (2ull << imm) - 1); L(qpminuh(0, V(vj), T0, V(vd))); }
++  void vsat_wu(VRegister vd, VRegister vj, int32_t imm) { qsplat(T0, 4, (2ull << imm) - 1); L(qpminuw(0, V(vj), T0, V(vd))); }
++  void vsat_d(VRegister vd, VRegister vj, int32_t imm) {
++    int64_t hi = (int64_t(1) << imm) - 1, lo = -(int64_t(1) << imm);
++    qsplat(T1, 8, uint64_t(hi));
++    qsplat(T2, 8, uint64_t(lo));
++    C(qpcmpgtd(0, V(vj), T1, T0));
++    C(qplog(0, 0xca, T0, T1, V(vj), T0));
++    C(qpcmpgtd(0, T2, T0, T3));
++    L(qplog(0, 0xca, T3, T2, T0, V(vd)));
++  }
++  // Unsigned compare by the signed one with the sign bits flipped.
++  void vsat_du(VRegister vd, VRegister vj, int32_t imm) {
++    uint64_t max = imm >= 63 ? ~0ull : (2ull << imm) - 1;
++    qsplat(T2, 8, 1ull << 63);
++    C(qpxor(0, V(vj), T2, T0));
++    qsplat(T1, 8, max ^ (1ull << 63));
++    C(qpcmpgtd(0, T0, T1, T3));
++    qsplat(T1, 8, max);
++    L(qplog(0, 0xca, T3, T1, V(vj), V(vd)));
++  }
++  // vd.h[0..3] = sat(vd.w[i] >> ui4), vd.h[4..7] = sat(vj.w[i] >> ui4).
++  void vssrani_h_w(VRegister vd, VRegister vj, int32_t ui4) {
++    if (ui4 == 0) { L(qpacksswh(1, V(vj), V(vd), V(vd))); return; }
++    C(qpsraw(0, V(vd), ui4, T0); qpsraw(1, V(vj), ui4, T1));
++    L(qpacksswh(1, T1, T0, V(vd)));
++  }
++
++  // ---- widening.  qpmaddubsh a, b sums the products of signed bytes of a
++  // and unsigned bytes of b pairwise into 16 bits, qpmaddh the products of
++  // 16-bit lanes into 32 (simd/sem2).
++  // vd.h[i] = vj.b[2i + 1] + vk.b[2i] (signed), and the like.
++  void vhaddw_h_b(VRegister vd, VRegister vj, VRegister vk) {
++    if (vj == vk) { qsplat(T0, 1, 1); L(qpmaddubsh(1, V(vj), T0, V(vd))); return; }
++    C(qpsrah(0, V(vj), 8, T0); qpsllh(1, V(vk), 8, T1));
++    C(qpsrah(0, T1, 8, T1));
++    L(qpaddh(0, T0, T1, V(vd)));
++  }
++  void vhaddw_hu_bu(VRegister vd, VRegister vj, VRegister vk) {
++    if (vj == vk) { qsplat(T0, 1, 1); L(qpmaddubsh(1, T0, V(vj), V(vd))); return; }
++    C(qpsrlh(0, V(vj), 8, T0));
++    qsplat(T1, 2, 0xff);
++    C(qpand(0, V(vk), T1, T1));
++    L(qpaddh(0, T0, T1, V(vd)));
++  }
++  void vhaddw_w_h(VRegister vd, VRegister vj, VRegister vk) {
++    if (vj == vk) { qsplat(T0, 2, 1); L(qpmaddh(1, V(vj), T0, V(vd))); return; }
++    C(qpsraw(0, V(vj), 16, T0); qpsllw(1, V(vk), 16, T1));
++    C(qpsraw(0, T1, 16, T1));
++    L(qpaddw(0, T0, T1, V(vd)));
++  }
++  void vhaddw_wu_hu(VRegister vd, VRegister vj, VRegister vk) {
++    C(qpsrlw(0, V(vj), 16, T0));
++    qsplat(T1, 4, 0xffff);
++    C(qpand(0, V(vk), T1, T1));
++    L(qpaddw(0, T0, T1, V(vd)));
++  }
++  // Products of the even (odd) 16-bit lanes: qpmaddh with the other half zero.
++  void vmulwev_w_h(VRegister vd, VRegister vj, VRegister vk) { qsplat(T0, 4, 0x0000ffff); C(qpand(0, V(vj), T0, T0)); L(qpmaddh(1, T0, V(vk), V(vd))); }
++  void vmulwod_w_h(VRegister vd, VRegister vj, VRegister vk) { qsplat(T0, 4, 0xffff0000); C(qpand(0, V(vj), T0, T0)); L(qpmaddh(1, T0, V(vk), V(vd))); }
++  void vmaddwev_w_h(VRegister vd, VRegister vj, VRegister vk) {
++    qsplat(T0, 4, 0x0000ffff); C(qpand(0, V(vj), T0, T0)); C(qpmaddh(1, T0, V(vk), T0)); L(qpaddw(0, V(vd), T0, V(vd)));
++  }
++  void vmaddwod_w_h(VRegister vd, VRegister vj, VRegister vk) {
++    qsplat(T0, 4, 0xffff0000); C(qpand(0, V(vj), T0, T0)); C(qpmaddh(1, T0, V(vk), T0)); L(qpaddw(0, V(vd), T0, V(vd)));
++  }
++  void vmulwev_h_b(VRegister vd, VRegister vj, VRegister vk) {
++    C(qpsllh(0, V(vj), 8, T0); qpsllh(1, V(vk), 8, T1));
++    C(qpsrah(0, T0, 8, T0); qpsrah(1, T1, 8, T1));
++    L(qpmullh(1, T0, T1, V(vd)));
++  }
++  void vmulwod_h_b(VRegister vd, VRegister vj, VRegister vk) {
++    C(qpsrah(0, V(vj), 8, T0); qpsrah(1, V(vk), 8, T1));
++    L(qpmullh(1, T0, T1, V(vd)));
++  }
++  // The high half of vj, each lane widened.
++  void vexth_h_b(VRegister vd, VRegister vj) { qperm1(T0, vj, [](int o) { return 8 + o / 2; }); L(qpsrah(0, T0, 8, V(vd))); }
++  void vexth_w_h(VRegister vd, VRegister vj) { qperm1(T0, vj, [](int o) { return 8 + o / 4 * 2 + o % 2; }); L(qpsraw(0, T0, 16, V(vd))); }
++  void vexth_hu_bu(VRegister vd, VRegister vj) { perm0(vd, vj, [](int o) { return o % 2 ? 16 : 8 + o / 2; }); }
++  void vexth_wu_hu(VRegister vd, VRegister vj) { perm0(vd, vj, [](int o) { return o % 4 >= 2 ? 16 : 8 + o / 4 * 2 + o % 2; }); }
++  void vexth_du_wu(VRegister vd, VRegister vj) { perm0(vd, vj, [](int o) { return o % 8 >= 4 ? 16 : 8 + o / 8 * 4 + o % 4; }); }
++  void vexth_d_w(VRegister vd, VRegister vj) {
++    qconst(T0, idx16([](int o) { return (o % 8 >= 4 ? 16 : 0) + 8 + o / 8 * 4 + o % 4; }));
++    C(qpsraw(0, V(vj), 31, T1));                 // the signs of the lanes
++    L(qppermb(0, T1, V(vj), T0, V(vd)));
++  }
++
++  // ---- lanes
++  void vreplgr2vr_b(VRegister vd, Register rj) { C(andd(0, R(rj), 0xff, T0)); C(muld(0, T0, int64_t(0x0101010101010101ll), T0)); L(qppackdl(0, T0, T0, V(vd))); }
++  void vreplgr2vr_h(VRegister vd, Register rj) { C(andd(0, R(rj), 0xffff, T0)); C(muld(0, T0, int64_t(0x0001000100010001ll), T0)); L(qppackdl(0, T0, T0, V(vd))); }
++  // insfd x, 32 | 32 << 6, y: x rotated right by 32 with the low 32 bits of y.
++  void vreplgr2vr_w(VRegister vd, Register rj) { C(insfd(0, R(rj), 32 | 32 << 6, R(rj), T0)); L(qppackdl(0, T0, T0, V(vd))); }
++  void vreplgr2vr_d(VRegister vd, Register rj) { L(qppackdl(0, R(rj), R(rj), V(vd))); }
++  void vinsgr2vr_b(VRegister vd, Register rj, int32_t ui4) { ins(vd, rj, ui4 & 15, 8); }
++  void vinsgr2vr_h(VRegister vd, Register rj, int32_t ui3) { ins(vd, rj, ui3 & 7, 16); }
++  void vinsgr2vr_w(VRegister vd, Register rj, int32_t ui2) { ins(vd, rj, ui2 & 3, 32); }
++  void vinsgr2vr_d(VRegister vd, Register rj, int32_t ui1) {
++    if (ui1 & 1) { L(qppackdl(0, R(rj), V(vd), V(vd))); return; }
++    C(qpswitchd(0, V(vd), T0));
++    L(qppackdl(0, T0, R(rj), V(vd)));
++  }
++  void vpickve2gr_b(Register rd, VRegister vj, int32_t ui4) { pick(rd, vj, ui4 & 15, 8, true); }
++  void vpickve2gr_h(Register rd, VRegister vj, int32_t ui3) { pick(rd, vj, ui3 & 7, 16, true); }
++  void vpickve2gr_w(Register rd, VRegister vj, int32_t ui2) { pick(rd, vj, ui2 & 3, 32, true); }
++  void vpickve2gr_d(Register rd, VRegister vj, int32_t ui1) { pick(rd, vj, ui1 & 1, 64, true); }
++  void vpickve2gr_bu(Register rd, VRegister vj, int32_t ui4) { pick(rd, vj, ui4 & 15, 8, false); }
++  void vpickve2gr_hu(Register rd, VRegister vj, int32_t ui3) { pick(rd, vj, ui3 & 7, 16, false); }
++  void vpickve2gr_wu(Register rd, VRegister vj, int32_t ui2) { pick(rd, vj, ui2 & 3, 32, false); }
++
++  // ---- permutations, all by qppermb a, b, index: index byte 0-15 takes that
++  // byte of b, 16-31 of a; bit 5 inverts the byte, 6 reverses its bits, 7
++  // gives its sign in all eight (simd/sem2, test_lsx).  The index is a constant made in T0.  LSX element order:
++  // vk gives the even (or low) lanes, vj the odd (or high) ones.
++  void vilvl_b(VRegister vd, VRegister vj, VRegister vk) { ilv(vd, vj, vk, 1, false); }
++  void vilvl_h(VRegister vd, VRegister vj, VRegister vk) { ilv(vd, vj, vk, 2, false); }
++  void vilvl_w(VRegister vd, VRegister vj, VRegister vk) { ilv(vd, vj, vk, 4, false); }
++  void vilvl_d(VRegister vd, VRegister vj, VRegister vk) { ilv(vd, vj, vk, 8, false); }
++  void vilvh_b(VRegister vd, VRegister vj, VRegister vk) { ilv(vd, vj, vk, 1, true); }
++  void vilvh_h(VRegister vd, VRegister vj, VRegister vk) { ilv(vd, vj, vk, 2, true); }
++  void vilvh_w(VRegister vd, VRegister vj, VRegister vk) { ilv(vd, vj, vk, 4, true); }
++  void vilvh_d(VRegister vd, VRegister vj, VRegister vk) { ilv(vd, vj, vk, 8, true); }
++  void vpickev_b(VRegister vd, VRegister vj, VRegister vk) { pickeo(vd, vj, vk, 1, 0); }
++  void vpickev_h(VRegister vd, VRegister vj, VRegister vk) { pickeo(vd, vj, vk, 2, 0); }
++  void vpickev_w(VRegister vd, VRegister vj, VRegister vk) { pickeo(vd, vj, vk, 4, 0); }
++  void vpickod_b(VRegister vd, VRegister vj, VRegister vk) { pickeo(vd, vj, vk, 1, 1); }
++  void vpickod_h(VRegister vd, VRegister vj, VRegister vk) { pickeo(vd, vj, vk, 2, 1); }
++  void vpickod_w(VRegister vd, VRegister vj, VRegister vk) { pickeo(vd, vj, vk, 4, 1); }
++  void vpackev_b(VRegister vd, VRegister vj, VRegister vk) { packeo(vd, vj, vk, 1, 0); }
++  void vpackev_h(VRegister vd, VRegister vj, VRegister vk) { packeo(vd, vj, vk, 2, 0); }
++  void vpackev_w(VRegister vd, VRegister vj, VRegister vk) { packeo(vd, vj, vk, 4, 0); }
++  void vpackod_b(VRegister vd, VRegister vj, VRegister vk) { packeo(vd, vj, vk, 1, 1); }
++  void vpackod_h(VRegister vd, VRegister vj, VRegister vk) { packeo(vd, vj, vk, 2, 1); }
++  void vpackod_w(VRegister vd, VRegister vj, VRegister vk) { packeo(vd, vj, vk, 4, 1); }
++  // vd.e[4g + i] = vj.e[4g + (imm >> 2i & 3)]
++  void vshuf4i_b(VRegister vd, VRegister vj, int32_t ui8) { shuf4i(vd, vj, 1, ui8); }
++  void vshuf4i_h(VRegister vd, VRegister vj, int32_t ui8) { shuf4i(vd, vj, 2, ui8); }
++  void vshuf4i_w(VRegister vd, VRegister vj, int32_t ui8) { shuf4i(vd, vj, 4, ui8); }
++  // Whole-vector byte shifts.
++  void vbsll_v(VRegister vd, VRegister vj, int32_t ui5) { int n = ui5 & 31; perm0(vd, vj, [n](int o) { return o >= n ? o - n : 16; }); }
++  void vbsrl_v(VRegister vd, VRegister vj, int32_t ui5) { int n = ui5 & 31; perm0(vd, vj, [n](int o) { return o + n < 16 ? o + n : 16; }); }
++  // vd.b[i] = va.b[i] & 0xc0 ? 0 : (va.b[i] & 0x1f) < 16 ? vk.b[..] : vj.b[.. - 16].
++  // qppermb by va & 0x1f, then the bytes where va has bit 6 or 7 cleared:
++  // (va | va << 1) is negative there.
++  void vshuf_b(VRegister vd, VRegister vj, VRegister vk, VRegister va) {
++    C(qpsllh(0, V(va), 1, T0));
++    C(qpor(0, T0, V(va), T0));
++    qzero(T1);
++    C(qpcmpgtb(0, T1, T0, T0));
++    qsplat(T1, 1, 0x1f);
++    C(qpand(0, V(va), T1, T1));
++    C(qppermb(0, V(vj), V(vk), T1, T1));
++    L(qpandn(0, T1, T0, V(vd)));
++  }
++  // Not LoongArch: vshuf_b with an index whose bytes are below 32 (a shuffle
++  // known when compiling): one qppermb.
++  void vperm_b(VRegister vd, VRegister vj, VRegister vk, VRegister va) { L(qppermb(0, V(vj), V(vk), V(va), V(vd))); }
++  // vd.w[i] = vd.w[i] & 0xc0 ? 0 : the lane vd.w[i] & 7 of vk (0-3) or vj (4-7).
++  void vshuf_w(VRegister vd, VRegister vj, VRegister vk) {
++    qsplat(T1, 4, 7);
++    C(qpand(0, V(vd), T1, T0));
++    C(qpsllw(0, T0, 2, T0));                     // 4 x the lane: its first byte
++    qconst(T1, idx16([](int o) { return o / 4 * 4; }));
++    C(qppermb(0, T0, T0, T1, T0));
++    qsplat(T1, 4, 0x03020100);
++    C(qpaddb(0, T0, T1, T0));
++    qsplat(T1, 4, 0xc0);
++    C(qpand(0, V(vd), T1, T1));
++    qzero(T2);
++    C(qpcmpeqw(0, T1, T2, T1));
++    C(qppermb(0, V(vj), V(vk), T0, T0));
++    L(qpand(0, T0, T1, V(vd)));
++  }
++
++  // ---- floating point
++  void vfdiv_s(VRegister vd, VRegister vj, VRegister vk) { lanes_s(&E::fdivs, vd, vj, vk); }
++  void vfdiv_d(VRegister vd, VRegister vj, VRegister vk) {
++    C(fdivd(5, V(vj), V(vk), T0); qpswitchd(0, V(vj), T1); qpswitchd(1, V(vk), T2));
++    C(fdivd(5, T1, T2, T1));
++    L(qppackdl(0, T1, T0, V(vd)));
++  }
++  void vfsqrt_s(VRegister vd, VRegister vj) { lanes_s(nullptr, vd, vj, vj); }
++  void vfsqrt_d(VRegister vd, VRegister vj) {
++    C(fsqrtid(5, V(vj), T0); qpswitchd(0, V(vj), T2));
++    C(fsqrttd(5, V(vj), T0, T1));
++    C(fsqrtid(5, T2, T0));
++    C(fsqrttd(5, T2, T0, T2));
++    L(qppackdl(0, T2, T1, V(vd)));
++  }
++  // Exact 1 / x and 1 / sqrt(x) (LSX gives approximations, wasm wants neither exactly).
++  void vfrecip_s(VRegister vd, VRegister vj) { lanes_s(&E::fdivs, vd, vj, vj, true); }
++  void vfrsqrt_s(VRegister vd, VRegister vj) { lanes_s(nullptr, vd, vj, vj, true); }
++  // IEEE maxNum/minNum with -0 < +0 (as fmax_s); both NaN gives the default
++  // NaN, as LoongArch does: V8 canonicalizes with vfmax x, x.
++  void vfmax_s(VRegister vd, VRegister vj, VRegister vk) { fminmax(&E::qpfmaxs, &E::qpand, &E::qpfcmpuods, 0x7fc000007fc00000ull, vd, vj, vk); }
++  void vfmax_d(VRegister vd, VRegister vj, VRegister vk) { fminmax(&E::qpfmaxd, &E::qpand, &E::qpfcmpuodd, 0x7ff8000000000000ull, vd, vj, vk); }
++  void vfmin_s(VRegister vd, VRegister vj, VRegister vk) { fminmax(&E::qpfmins, &E::qpor, &E::qpfcmpuods, 0x7fc000007fc00000ull, vd, vj, vk); }
++  void vfmin_d(VRegister vd, VRegister vj, VRegister vk) { fminmax(&E::qpfmind, &E::qpor, &E::qpfcmpuodd, 0x7ff8000000000000ull, vd, vj, vk); }
++  // Rounding modes of qpfstoifs/qpfdtoifd: 0 nearest even, 1 down, 2 up, 3 to zero.
++  void vfrintrne_s(VRegister vd, VRegister vj) { frint(&E::qpfstoifs, 0, vd, vj); }
++  void vfrintrm_s(VRegister vd, VRegister vj) { frint(&E::qpfstoifs, 1, vd, vj); }
++  void vfrintrp_s(VRegister vd, VRegister vj) { frint(&E::qpfstoifs, 2, vd, vj); }
++  void vfrintrz_s(VRegister vd, VRegister vj) { frint(&E::qpfstoifs, 3, vd, vj); }
++  void vfrintrne_d(VRegister vd, VRegister vj) { frint(&E::qpfdtoifd, 0, vd, vj); }
++  void vfrintrm_d(VRegister vd, VRegister vj) { frint(&E::qpfdtoifd, 1, vd, vj); }
++  void vfrintrp_d(VRegister vd, VRegister vj) { frint(&E::qpfdtoifd, 2, vd, vj); }
++  void vfrintrz_d(VRegister vd, VRegister vj) { frint(&E::qpfdtoifd, 3, vd, vj); }
++  // Not fused (v5 has no fused multiply-add): the product is rounded.
++  // qpfmul_add a, b, c = a * b + c, qpfmul_sub = c - a * b, qpfmul_rsub = a * b - c (simd/sem2).
++  void vfmadd_s(VRegister vd, VRegister vj, VRegister vk, VRegister va) { L(qpfmul_adds(0, V(vj), V(vk), V(va), V(vd))); }
++  void vfmadd_d(VRegister vd, VRegister vj, VRegister vk, VRegister va) { L(qpfmul_addd(0, V(vj), V(vk), V(va), V(vd))); }
++  void vfmsub_s(VRegister vd, VRegister vj, VRegister vk, VRegister va) { L(qpfmul_rsubs(0, V(vj), V(vk), V(va), V(vd))); }
++  void vfmsub_d(VRegister vd, VRegister vj, VRegister vk, VRegister va) { L(qpfmul_rsubd(0, V(vj), V(vk), V(va), V(vd))); }
++  void vfnmsub_s(VRegister vd, VRegister vj, VRegister vk, VRegister va) { L(qpfmul_subs(0, V(vj), V(vk), V(va), V(vd))); }
++  void vfnmsub_d(VRegister vd, VRegister vj, VRegister vk, VRegister va) { L(qpfmul_subd(0, V(vj), V(vk), V(va), V(vd))); }
++  void vffint_s_w(VRegister vd, VRegister vj) { L(qpistofs(0, V(vj), V(vd))); }
++  void vffint_d_l(VRegister vd, VRegister vj) { L(qpidtofd(0, V(vj), V(vd))); }
++  // Unsigned: the high half converted times 2^16 (2^32), exact, plus the low half: one rounding.
++  void vffint_s_wu(VRegister vd, VRegister vj) {
++    C(qpsrlw(0, V(vj), 16, T0));
++    qsplat(T1, 4, 0xffff);
++    C(qpand(0, V(vj), T1, T1));
++    C(qpistofs(0, T0, T0); qpistofs(1, T1, T1));
++    qsplat(T2, 4, 0x47800000);                   // 65536.0f
++    L(qpfmul_adds(0, T0, T2, T1, V(vd)));
++  }
++  void vffint_d_lu(VRegister vd, VRegister vj) {
++    C(qpsrld(0, V(vj), 32, T0));
++    qsplat(T1, 8, 0xffffffff);
++    C(qpand(0, V(vj), T1, T1));
++    C(qpidtofd(0, T0, T0); qpidtofd(1, T1, T1));
++    qsplat(T2, 8, 0x41f0000000000000ull);        // 2^32
++    L(qpfmul_addd(0, T0, T2, T1, V(vd)));
++  }
++  // To integers toward zero, saturating, NaN gives 0.  The e2k conversion
++  // answers 0x80..0 to NaN and to everything out of range (simd/sem2).
++  void vftintrz_w_s(VRegister vd, VRegister vj) {
++    C(qpfstoistr(0, V(vj), T0));
++    qsplat(T1, 4, 0x4f000000);                   // 2^31
++    C(qpfcmpnlts(0, V(vj), T1, T1); qpfcmpods(1, V(vj), V(vj), T2));
++    C(qpaddw(0, T0, T1, T0));                    // 0x80..0 - 1 when too big or NaN
++    L(qpand(0, T0, T2, V(vd)));
++  }
++  void vftintrz_l_d(VRegister vd, VRegister vj) {
++    C(qpfdtoidtr(0, V(vj), T0));
++    qsplat(T1, 8, 0x43e0000000000000ull);        // 2^63
++    C(qpfcmpnltd(0, V(vj), T1, T1); qpfcmpodd(1, V(vj), V(vj), T2));
++    C(qpaddd(0, T0, T1, T0));
++    L(qpand(0, T0, T2, V(vd)));
++  }
++  // Unsigned: max(x, 0) (NaN and -0 give +0); from 2^31 (2^63) up the
++  // conversion is of x - 2^31 with the top bit put back; from 2^32 all ones.
++  void vftintrz_wu_s(VRegister vd, VRegister vj) {
++    ftintu(&E::qpfmaxs, &E::qpfcmples, &E::qpfsubs, &E::qpfstoistr, &E::qpsllw, &E::qpxor, 4, 31, 0x4f000000, 0x4f800000, vd, vj);
++  }
++  void vftintrz_lu_d(VRegister vd, VRegister vj) {
++    ftintu(&E::qpfmaxd, &E::qpfcmpled, &E::qpfsubd, &E::qpfdtoidtr, &E::qpslld, &E::qpxor, 8, 63, 0x43e0000000000000ull, 0x43f0000000000000ull, vd, vj);
++  }
++  // vd.s[0..1] = vk.d[0..1], vd.s[2..3] = vj.d[0..1]; qpfdtofs writes the low 64 bits only.
++  void vfcvt_s_d(VRegister vd, VRegister vj, VRegister vk) { C(qpfdtofs(0, V(vk), T0); qpfdtofs(1, V(vj), T1)); L(qppackdl(0, T1, T0, V(vd))); }
++  void vfcvtl_d_s(VRegister vd, VRegister vj) { L(qpfstofd(0, V(vj), V(vd))); }
++
++  // ---- whole vector to a condition flag
++  void vseteqz_v(CFRegister cd, VRegister vj) { C(qpswitchd(0, V(vj), T0)); C(ord(0, V(vj), T0, T0)); L(cmpedb(0, T0, 0, P(cd))); }
++  void vsetnez_v(CFRegister cd, VRegister vj) { C(qpswitchd(0, V(vj), T0)); C(ord(0, V(vj), T0, T0)); L(cmpbdb(0, 0, T0, P(cd))); }
++  void vsetanyeqz_b(CFRegister cd, VRegister vj) { anyeqz(&E::qpcmpeqb, true, cd, vj); }
++  void vsetanyeqz_h(CFRegister cd, VRegister vj) { anyeqz(&E::qpcmpeqh, true, cd, vj); }
++  void vsetanyeqz_w(CFRegister cd, VRegister vj) { anyeqz(&E::qpcmpeqw, true, cd, vj); }
++  void vsetanyeqz_d(CFRegister cd, VRegister vj) { anyeqz(&E::qpcmpeqd, true, cd, vj); }
++  void vsetallnez_b(CFRegister cd, VRegister vj) { anyeqz(&E::qpcmpeqb, false, cd, vj); }
++  void vsetallnez_h(CFRegister cd, VRegister vj) { anyeqz(&E::qpcmpeqh, false, cd, vj); }
++  void vsetallnez_w(CFRegister cd, VRegister vj) { anyeqz(&E::qpcmpeqw, false, cd, vj); }
++  void vsetallnez_d(CFRegister cd, VRegister vj) { anyeqz(&E::qpcmpeqd, false, cd, vj); }
++
++  // ---- not LoongArch: wasm SIMD operations that e2k has whole, for the code
++  // generator and Liftoff, where LSX needs a chain.
++  // vd = hi:lo (one operation when hi < 32).
++  void vconst(VRegister vd, uint64_t hi, uint64_t lo) {
++    if (hi < 32) { L(qppackdl(0, int(hi), int64_t(lo), V(vd))); return; }
++    C(addd(0, 0, int64_t(hi), T0));
++    if (hi == lo) L(qppackdl(0, T0, T0, V(vd))); else L(qppackdl(0, T0, int64_t(lo), V(vd)));
++  }
++  // Narrowing with saturation, signed lanes in: the low half of vd from vk,
++  // the high one from vj (wasm narrow(a, b): vk = a, vj = b).
++  void vpackss_b_h(VRegister vd, VRegister vj, VRegister vk) { L(qpacksshb(1, V(vj), V(vk), V(vd))); }
++  void vpackus_b_h(VRegister vd, VRegister vj, VRegister vk) { L(qpackushb(1, V(vj), V(vk), V(vd))); }
++  void vpackss_h_w(VRegister vd, VRegister vj, VRegister vk) { L(qpacksswh(1, V(vj), V(vk), V(vd))); }
++  void vpackus_h_w(VRegister vd, VRegister vj, VRegister vk) { L(qpackuswh(1, V(vj), V(vk), V(vd))); }
++  // rd = the sign bits of the lanes (wasm bitmask).  qpsgn2mskb puts those of
++  // the 16 bytes in bits 15..0 (above them: no defined value); narrower lanes
++  // are packed to bytes first (saturation keeps the sign).
++  void vmsk_b(Register rd, VRegister vj) { C(qpsgn2mskb(0, V(vj), T0)); L(andd(0, T0, 0xffff, D(rd))); }
++  void vmsk_h(Register rd, VRegister vj) { C(qpacksshb(1, V(vj), V(vj), T0)); C(qpsgn2mskb(0, T0, T0)); L(andd(0, T0, 0xff, D(rd))); }
++  void vmsk_w(Register rd, VRegister vj) {
++    C(qpacksswh(1, V(vj), V(vj), T0));
++    C(qpacksshb(1, T0, T0, T0));
++    C(qpsgn2mskb(0, T0, T0));
++    L(andd(0, T0, 0xf, D(rd)));
++  }
++  void vmsk_d(Register rd, VRegister vj) {
++    C(qpswitchd(0, V(vj), T0); shrd(1, V(vj), 63, T1));
++    C(shrd(0, T0, 63, T0));
++    C(shld(0, T0, 1, T0));
++    L(ord(0, T0, T1, D(rd)));
++  }
++  // i16x8.q15mulr_sat_s: qpmulhrsh, whose 0x8000 * 0x8000 (0x8000) becomes 0x7fff.
++  void vq15mulr_h(VRegister vd, VRegister vj, VRegister vk) {
++    C(qpmulhrsh(1, V(vj), V(vk), T0));
++    qsplat(T1, 2, 0x8000);
++    C(qpcmpeqh(0, T0, T1, T1));
++    L(qpxor(0, T0, T1, V(vd)));
++  }
++  void vabs_b(VRegister vd, VRegister vj) { L(qpsignb(0, V(vj), V(vj), V(vd))); }
++  void vabs_h(VRegister vd, VRegister vj) { L(qpsignh(0, V(vj), V(vj), V(vd))); }
++  void vabs_w(VRegister vd, VRegister vj) { L(qpsignw(0, V(vj), V(vj), V(vd))); }
++  void vabs_d(VRegister vd, VRegister vj) {
++    qzero(T1);
++    C(qpcmpgtd(0, T1, V(vj), T0));
++    C(qpxor(0, V(vj), T0, T1));
++    L(qpsubd(0, T1, T0, V(vd)));
++  }
++  // i32x4.dot_i16x8_s
++  void vdot_w_h(VRegister vd, VRegister vj, VRegister vk) { L(qpmaddh(1, V(vj), V(vk), V(vd))); }
++  // Shifts of every lane by a general register, modulo the lane size.
++  void vsll_br(VRegister vd, VRegister vj, Register rk) { shift_b(0, vd, vj, R(rk)); }
++  void vsrl_br(VRegister vd, VRegister vj, Register rk) { shift_b(1, vd, vj, R(rk)); }
++  void vsra_br(VRegister vd, VRegister vj, Register rk) { shift_b(2, vd, vj, R(rk)); }
++  void vsll_hr(VRegister vd, VRegister vj, Register rk) { C(andd(0, R(rk), 15, T0)); L(qpsllh(0, V(vj), T0, V(vd))); }
++  void vsll_wr(VRegister vd, VRegister vj, Register rk) { C(andd(0, R(rk), 31, T0)); L(qpsllw(0, V(vj), T0, V(vd))); }
++  void vsll_dr(VRegister vd, VRegister vj, Register rk) { C(andd(0, R(rk), 63, T0)); L(qpslld(0, V(vj), T0, V(vd))); }
++  void vsrl_hr(VRegister vd, VRegister vj, Register rk) { C(andd(0, R(rk), 15, T0)); L(qpsrlh(0, V(vj), T0, V(vd))); }
++  void vsrl_wr(VRegister vd, VRegister vj, Register rk) { C(andd(0, R(rk), 31, T0)); L(qpsrlw(0, V(vj), T0, V(vd))); }
++  void vsrl_dr(VRegister vd, VRegister vj, Register rk) { C(andd(0, R(rk), 63, T0)); L(qpsrld(0, V(vj), T0, V(vd))); }
++  void vsra_hr(VRegister vd, VRegister vj, Register rk) { C(andd(0, R(rk), 15, T0)); L(qpsrah(0, V(vj), T0, V(vd))); }
++  void vsra_wr(VRegister vd, VRegister vj, Register rk) { C(andd(0, R(rk), 31, T0)); L(qpsraw(0, V(vj), T0, V(vd))); }
++  void vsra_dr(VRegister vd, VRegister vj, Register rk) { sra_q(vd, vj, R(rk)); }
++  // wasm min/max: NaN when either operand is (the default one), -0 < +0;
++  // pmin(a, b) = b < a ? b : a = qpfmin b, a, pmax(a, b) = a < b ? b : a = qpfmax b, a.
++  void vwmin_s(VRegister vd, VRegister vj, VRegister vk) { wminmax(&E::qpfmins, &E::qpor, &E::qpfcmpuods, 0x7fc000007fc00000ull, vd, vj, vk); }
++  void vwmax_s(VRegister vd, VRegister vj, VRegister vk) { wminmax(&E::qpfmaxs, &E::qpand, &E::qpfcmpuods, 0x7fc000007fc00000ull, vd, vj, vk); }
++  void vwmin_d(VRegister vd, VRegister vj, VRegister vk) { wminmax(&E::qpfmind, &E::qpor, &E::qpfcmpuodd, 0x7ff8000000000000ull, vd, vj, vk); }
++  void vwmax_d(VRegister vd, VRegister vj, VRegister vk) { wminmax(&E::qpfmaxd, &E::qpand, &E::qpfcmpuodd, 0x7ff8000000000000ull, vd, vj, vk); }
++  void vpmin_s(VRegister vd, VRegister vj, VRegister vk) { L(qpfmins(0, V(vk), V(vj), V(vd))); }
++  void vpmax_s(VRegister vd, VRegister vj, VRegister vk) { L(qpfmaxs(0, V(vk), V(vj), V(vd))); }
++  void vpmin_d(VRegister vd, VRegister vj, VRegister vk) { L(qpfmind(0, V(vk), V(vj), V(vd))); }
++  void vpmax_d(VRegister vd, VRegister vj, VRegister vk) { L(qpfmaxd(0, V(vk), V(vj), V(vd))); }
++
++  // ---- memory: two 64-bit halves (any alignment)
++  void vld(VRegister vd, Register rj, int32_t si12) { C(ldd(0, R(rj), si12, T0); ldd(2, R(rj), si12 + 8, T1)); L(qppackdl(0, T1, T0, V(vd))); }
++  void vst(VRegister vd, Register rj, int32_t si12) { C(qpswitchd(0, V(vd), T0)); L(std_(2, R(rj), si12, V(vd)); std_(5, R(rj), si12 + 8, T0)); }
++  void vldx(VRegister vd, Register rj, Register rk) {
++    C(addd(0, R(rj), R(rk), T2));
++    C(ldd(0, T2, 0, T0); ldd(2, T2, 8, T1));
++    L(qppackdl(0, T1, T0, V(vd)));
++  }
++  void vstx(VRegister vd, Register rj, Register rk) {
++    C(addd(0, R(rj), R(rk), T2); qpswitchd(1, V(vd), T0));
++    L(std_(2, T2, 0, V(vd)); std_(5, T2, 8, T0));
++  }
++
+  private:
+   static Reg R(Register r) { return e2k::r(r.code()); }                              // source: %r0 holds 0
+   static Reg D(Register r) { return r.code() ? e2k::r(r.code()) : e2k::empty; }      // destination
+   static Reg F(FPURegister f) { return e2k::r(32 + f.code()); }
++  static Reg V(VRegister v) { return e2k::r(32 + v.code()); }
+   static Pred P(CFRegister c) { return e2k::pred(c); }
+ 
+   // ---- placing the commands -------------------------------------------------
+@@ -1085,6 +1628,207 @@ class Assembler : private e2k::Assembler {
+     if (to64) { C(addd(0, T0, T2, T0)); L(andd(0, T0, T1, F(fd))); }
+     else { C(adds(0, T0, T2, T0)); L(ands(0, T0, T1, F(fd))); }
+   }
++
++  // ---- 128 bits ---------------------------------------------------------------
++  struct Q16 { uint64_t hi, lo; };
++  // The 16 bytes f(0)..f(15), byte 0 lowest: a qppermb index.
++  template <class F> static Q16 idx16(F f) {
++    Q16 q{0, 0};
++    for (int o = 0; o < 16; o++) (o < 8 ? q.lo : q.hi) |= (uint64_t(f(o)) & 0xff) << 8 * (o % 8);
++    return q;
++  }
++  // d = hi:lo; one operation when hi < 32 (a literal of src1), else two.
++  void qconst(Reg d, uint64_t hi, uint64_t lo) {
++    if (hi < 32) { C(qppackdl(0, int(hi), int64_t(lo), d)); return; }
++    C(addd(0, 0, int64_t(hi), d));
++    if (hi == lo) C(qppackdl(0, d, d, d)); else C(qppackdl(0, d, int64_t(lo), d));
++  }
++  void qconst(Reg d, Q16 q) { qconst(d, q.hi, q.lo); }
++  // d = v in every lane of `size` bytes.
++  void qsplat(Reg d, int size, uint64_t v) {
++    uint64_t x = size == 8 ? v : (v & ((1ull << 8 * size) - 1)) * (~0ull / ((1ull << 8 * size) - 1));
++    qconst(d, x, x);
++  }
++  void vnot(Reg a, Reg d) { qplog(0, 0x0f, a, a, a, d); }
++  void qzero(Reg d) { C(qppackdl(0, 0, 0, d)); }
++  // The rounding mode in every 32-bit lane (a literal has no defined high half).
++  void frint(Alu op, int mode, VRegister vd, VRegister vj) { qsplat(T0, 4, uint64_t(mode)); L((this->*op)(0, T0, V(vj), V(vd))); }
++  // d = the bytes of vj picked by f (perm1: d = vd, the last command); perm2:
++  // index 0-15 from vb, 16-31 from va.
++  template <class F> void qperm1(Reg d, VRegister vj, F f) { qconst(T0, idx16(f)); C(qppermb(0, V(vj), V(vj), T0, d)); }
++  template <class F> void perm1(VRegister vd, VRegister vj, F f) { qconst(T0, idx16(f)); L(qppermb(0, V(vj), V(vj), T0, V(vd))); }
++  template <class F> void perm2(VRegister vd, VRegister va, VRegister vb, F f) { qconst(T0, idx16(f)); L(qppermb(0, V(va), V(vb), T0, V(vd))); }
++  // perm1 where index 16 gives a zero byte.
++  template <class F> void perm0(VRegister vd, VRegister vj, F f) { qconst(T0, idx16(f)); qzero(T1); L(qppermb(0, T1, V(vj), T0, V(vd))); }
++  // Lanes of s bytes; output byte o is byte o % s of lane o / s.
++  void ilv(VRegister vd, VRegister vj, VRegister vk, int s, bool high) {
++    int base = high ? 8 / s : 0;
++    perm2(vd, vj, vk, [=](int o) { int l = o / s; return (l & 1 ? 16 : 0) + (l / 2 + base) * s + o % s; });
++  }
++  void pickeo(VRegister vd, VRegister vj, VRegister vk, int s, int odd) {
++    int half = 8 / s;
++    perm2(vd, vj, vk, [=](int o) { int l = o / s; return (l < half ? 0 : 16) + (2 * (l % half) + odd) * s + o % s; });
++  }
++  void packeo(VRegister vd, VRegister vj, VRegister vk, int s, int odd) {
++    perm2(vd, vj, vk, [=](int o) { int l = o / s; return (l & 1 ? 16 : 0) + ((l & ~1) + odd) * s + o % s; });
++  }
++  void shuf4i(VRegister vd, VRegister vj, int s, int imm) {
++    perm1(vd, vj, [=](int o) { int l = o / s; return (l / 4 * 4 + (imm >> 2 * (l % 4) & 3)) * s + o % s; });
++  }
++  void addi(Alu op, int size, VRegister vd, VRegister vj, int32_t ui5) {
++    if ((ui5 & 31) == 0) { L(qpor(0, V(vj), V(vj), V(vd))); return; }
++    qsplat(T0, size, uint64_t(ui5 & 31));
++    L((this->*op)(0, V(vj), T0, V(vd)));
++  }
++  void adda(Alu sign, Alu add, VRegister vd, VRegister vj, VRegister vk) {
++    C((this->*sign)(0, V(vj), V(vj), T0); (this->*sign)(3, V(vk), V(vk), T1));
++    L((this->*add)(0, T0, T1, V(vd)));
++  }
++  void sat(Alu min, Alu max, int size, VRegister vd, VRegister vj, int32_t imm) {
++    if (imm >= 8 * size - 1) { L(qpor(0, V(vj), V(vj), V(vd))); return; }
++    qsplat(T1, size, (1ull << imm) - 1);
++    qsplat(T2, size, ~0ull << imm);
++    C((this->*min)(0, V(vj), T1, T0));
++    L((this->*max)(0, T0, T2, V(vd)));
++  }
++  // Lane idx of `bits` bits: insfd x, p | bits << 6, rj rotates x right by p
++  // and puts rj into the low bits, scld rotates back; the half is made in T1
++  // and packed with the other one (T0, switched to the low bits).
++  void ins(VRegister vd, Register rj, int idx, int bits) {
++    int per = 64 / bits, p = idx % per * bits;
++    bool high = idx >= per;
++    C(qpswitchd(0, V(vd), T0));
++    Reg h = high ? T0 : V(vd);
++    C(insfd(0, h, p | bits << 6, R(rj), T1));
++    if (p) C(scld(0, T1, p, T1));
++    if (high) L(qppackdl(0, T1, V(vd), V(vd))); else L(qppackdl(0, T0, T1, V(vd)));
++  }
++  void pick(Register rd, VRegister vj, int idx, int bits, bool sign) {
++    int per = 64 / bits, p = idx % per * bits;
++    Reg h = V(vj);
++    if (idx >= per) { C(qpswitchd(0, V(vj), T0)); h = T0; }
++    if (bits == 64) { L(addd(0, h, 0, D(rd))); return; }
++    L(getfd(0, h, p | bits << 6 | (sign ? 1 << 12 : 0), D(rd)));
++  }
++  void vfcmp(FPUCondition cc, VRegister vd, VRegister vj, VRegister vk, Alu eq, Alu lt, Alu le, Alu uod, Alu neq, Alu nlt, Alu nle, Alu od) {
++    Reg d = V(vd), a = V(vj), b = V(vk);
++    switch (cc & ~1) {   // the signaling variants compare like the quiet ones
++      case CAF: L(qppackdl(0, 0, 0, d)); break;
++      case CUN: L((this->*uod)(0, a, b, d)); break;
++      case CEQ: L((this->*eq)(0, a, b, d)); break;
++      case CLT: L((this->*lt)(0, a, b, d)); break;
++      case CLE: L((this->*le)(0, a, b, d)); break;
++      case CULT: L((this->*nle)(0, b, a, d)); break;
++      case CULE: L((this->*nlt)(0, b, a, d)); break;
++      case COR: L((this->*od)(0, a, b, d)); break;
++      case CUNE: L((this->*neq)(0, a, b, d)); break;
++      case CUEQ: C((this->*nlt)(0, a, b, T0); (this->*nlt)(1, b, a, T1)); L(qpand(0, T0, T1, d)); break;
++      case CNE: C((this->*neq)(0, a, b, T0); (this->*od)(1, a, b, T1)); L(qpand(0, T0, T1, d)); break;
++      default: assert(!"unknown condition");
++    }
++  }
++  // Four f32 lanes one by one on the scalar side (no qp divide or root):
++  // div: vj / vk; sqrt (div == nullptr): sqrt(vj); recip: 1 / that.
++  // insfd y, 32 | 32 << 6, x packs two results: y in bits 63..32, x below.
++  void lanes_s(Alu div, VRegister vd, VRegister vj, VRegister vk, bool recip = false) {
++    Reg a = V(vj), b = V(vk);
++    if (!recip) {
++      C(shrd(0, a, 32, T0); shrd(1, b, 32, T1));
++      if (div) { C(fdivs(5, a, b, T2)); C(fdivs(5, T0, T1, T3)); } else { C(fsqrts(5, a, T2)); C(fsqrts(5, T0, T3)); }
++      C(insfd(0, T3, 32 | 32 << 6, T2, T3));
++      C(qpswitchd(0, a, T0); qpswitchd(1, b, T1));
++      if (div) C(fdivs(5, T0, T1, T2)); else C(fsqrts(5, T0, T2));
++      C(shrd(0, T0, 32, T0); shrd(1, T1, 32, T1));
++      if (div) C(fdivs(5, T0, T1, T0)); else C(fsqrts(5, T0, T0));
++      C(insfd(0, T0, 32 | 32 << 6, T2, T0));
++      L(qppackdl(0, T0, T3, V(vd)));
++      return;
++    }
++    C(addd(0, 0, 0x3f800000, T1); shrd(1, a, 32, T0));     // 1.0f
++    if (div) { C(addd(0, a, 0, T2)); } else { C(fsqrts(5, a, T2)); C(fsqrts(5, T0, T0)); }
++    C(fdivs(5, T1, T2, T2));
++    C(fdivs(5, T1, T0, T3));
++    C(insfd(0, T3, 32 | 32 << 6, T2, T3));
++    C(qpswitchd(0, a, T0));
++    C(shrd(0, T0, 32, T2));
++    if (!div) { C(fsqrts(5, T0, T0)); C(fsqrts(5, T2, T2)); }
++    C(fdivs(5, T1, T0, T0));
++    C(fdivs(5, T1, T2, T2));
++    C(insfd(0, T2, 32 | 32 << 6, T0, T2));
++    L(qppackdl(0, T2, T3, V(vd)));
++  }
++  // qpfmax a, b = a > b ? a : b and qpfmin the same with <, NaN and ±0 as
++  // x86 (ideas/101): both orders joined (and for max, or for min: ±0), then
++  // the other operand where one is NaN, the default NaN where both are.
++  void fminmax(Alu mm, Alu join, Alu uod, uint64_t nan, VRegister vd, VRegister vj, VRegister vk) {
++    Reg a = V(vj), b = V(vk);
++    C((this->*mm)(0, b, a, T0); (this->*mm)(1, a, b, T1); (this->*uod)(3, a, a, T2); (this->*uod)(4, b, b, T3));
++    C((this->*join)(0, T0, T1, T0));
++    C(qplog(0, 0xca, T2, b, T0, T0));
++    C(qplog(0, 0xca, T3, a, T0, T0));
++    C(qpand(0, T2, T3, T2));
++    qconst(T1, nan, nan);
++    L(qplog(0, 0xca, T2, T1, T0, V(vd)));
++  }
++  void ftintu(Alu max, Alu cmple, Alu sub, Un conv, Alu sll, Alu xor_, int size, int top, uint64_t half, uint64_t full,
++              VRegister vd, VRegister vj) {
++    qzero(T1);
++    C((this->*max)(0, V(vj), T1, T0));
++    qsplat(T1, size, half);
++    C((this->*cmple)(0, T1, T0, T2));            // big: half <= x
++    C(qpand(0, T2, T1, T3));
++    C((this->*sub)(0, T0, T3, T3));
++    C((this->*conv)(0, T3, T3));
++    C((this->*sll)(0, T2, top, T2));
++    C((this->*xor_)(0, T3, T2, T3));
++    qsplat(T1, size, full);
++    C((this->*cmple)(0, T1, T0, T1));            // too big: all ones
++    L(qpor(0, T3, T1, V(vd)));
++  }
++  // Bytes shifted by the low bits of `count` (kind: 0 left, 1 logical right,
++  // 2 arithmetic right): the 16-bit shift, then the bits that crossed from
++  // the other byte are masked off ((a | b) & c = 0xa8); arithmetic: the high
++  // byte of a 16-bit lane shifted is right, the low one goes up first.
++  void shift_b(int kind, VRegister vd, VRegister vj, Reg count) {
++    C(andd(0, count, 7, T0));
++    if (kind == 2) {
++      C(qpsrah(0, V(vj), T0, T1); qpsllh(1, V(vj), 8, T2));
++      C(qpsrah(0, T2, T0, T2));
++      C(qpsrlh(0, T2, 8, T2));
++      qsplat(T3, 2, 0xff00);
++      L(qplog(0, 0xca, T3, T1, T2, V(vd)));
++      return;
++    }
++    if (kind == 0) C(qpsllh(0, V(vj), T0, T1)); else C(qpsrlh(0, V(vj), T0, T1));
++    qsplat(T2, 2, kind == 0 ? 0xff00 : 0x00ff);
++    if (kind == 0) C(qpsllh(0, T2, T0, T2)); else C(qpsrlh(0, T2, T0, T2));
++    qsplat(T3, 2, kind == 0 ? 0x00ff : 0xff00);
++    L(qplog(0, 0xa8, T2, T3, T1, V(vd)));
++  }
++  // The logical shift, ored with the sign spread over the bits that came in.
++  void sra_q(VRegister vd, VRegister vj, Reg count) {
++    C(andd(0, count, 63, T0));
++    qzero(T2);
++    C(qpsrld(0, V(vj), T0, T1); qpcmpgtd(3, T2, V(vj), T2); xord(1, T0, 63, T3));
++    C(addd(0, T3, 1, T3));                       // 64 - count; 64 gives 0
++    C(qpslld(0, T2, T3, T2));
++    L(qpor(0, T1, T2, V(vd)));
++  }
++  // qpfmax/qpfmin both ways joined (and for max, or for min: +-0), the default NaN where either is NaN.
++  void wminmax(Alu mm, Alu join, Alu uod, uint64_t nan, VRegister vd, VRegister vj, VRegister vk) {
++    Reg a = V(vj), b = V(vk);
++    C((this->*mm)(0, a, b, T0); (this->*mm)(1, b, a, T1); (this->*uod)(3, a, b, T2));
++    C((this->*join)(0, T0, T1, T0));
++    qconst(T1, nan, nan);
++    L(qplog(0, 0xca, T2, T1, T0, V(vd)));
++  }
++  void anyeqz(Alu cmpeq, bool any, CFRegister cd, VRegister vj) {
++    qzero(T0);
++    C((this->*cmpeq)(0, V(vj), T0, T0));
++    C(qpswitchd(0, T0, T1));
++    C(ord(0, T0, T1, T0));
++    if (any) L(cmpbdb(0, 0, T0, P(cd))); else L(cmpedb(0, T0, 0, P(cd)));
++  }
+ #undef C
+ #undef L
+ 
+diff --git a/chromium/v8/src/codegen/e2k/opcodes-qp.inc b/chromium/v8/src/codegen/e2k/opcodes-qp.inc
+new file mode 100644
+index 0000000000..1ca5bb62fa
+--- /dev/null
++++ b/chromium/v8/src/codegen/e2k/opcodes-qp.inc
+@@ -0,0 +1,187 @@
++// Generated by simd/gen_qp.py from GNU as (-mcpu=elbrus-v5 default): the 128-bit operations.
++// Do not edit.  Row format: see opcodes.inc.
++
++E2K_OP(ldqp,             ALOPF11, 0x61, 0x00, 0x02, 0xc0, 0, 0x00, 0x2d)  // channels 0235
++E2K_OP(qpacksshb,        ALOPF11, 0x48, 0x00, 0x02, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(qpacksswh,        ALOPF11, 0x4a, 0x00, 0x02, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(qpackushb,        ALOPF11, 0x49, 0x00, 0x02, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(qpackuswh,        ALOPF11, 0x4b, 0x00, 0x02, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(qpaddb,           ALOPF11, 0x48, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpaddd,           ALOPF11, 0x4f, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpaddh,           ALOPF11, 0x49, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpaddsb,          ALOPF11, 0x4a, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpaddsh,          ALOPF11, 0x4b, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpaddusb,         ALOPF11, 0x4c, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpaddush,         ALOPF11, 0x4d, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpaddw,           ALOPF11, 0x4e, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpand,            ALOPF11, 0x08, 0x00, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpandn,           ALOPF11, 0x09, 0x00, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpavgusb,         ALOPF11, 0x5e, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpavgush,         ALOPF11, 0x5f, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpcmpeqb,         ALOPF11, 0x58, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpcmpeqd,         ALOPF11, 0x18, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpcmpeqh,         ALOPF11, 0x59, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpcmpeqw,         ALOPF11, 0x5a, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpcmpgtb,         ALOPF11, 0x5b, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpcmpgtd,         ALOPF11, 0x1c, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpcmpgth,         ALOPF11, 0x5c, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpcmpgtw,         ALOPF11, 0x5d, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpfadd_addd,      ALOPF21, 0x01, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfadd_adds,      ALOPF21, 0x00, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfadd_addsubd,   ALOPF21, 0x61, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfadd_addsubs,   ALOPF21, 0x60, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfaddd,          ALOPF11, 0x71, 0x00, 0x02, 0xc0, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfadd_hadds,     ALOPF21, 0x40, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfadd_hsubs,     ALOPF21, 0x60, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfadd_rsubd,     ALOPF21, 0x21, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfadd_rsubs,     ALOPF21, 0x20, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfadds,          ALOPF11, 0x70, 0x00, 0x02, 0xc0, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfaddsub_addd,   ALOPF21, 0x0f, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfaddsub_adds,   ALOPF21, 0x0e, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfaddsub_addsubd, ALOPF21, 0x6f, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfaddsub_addsubs, ALOPF21, 0x6e, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfadd_subd,      ALOPF21, 0x21, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfaddsubd,       ALOPF11, 0x7f, 0x00, 0x02, 0xc0, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfaddsub_hadds,  ALOPF21, 0x4e, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfaddsub_hsubs,  ALOPF21, 0x6e, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfaddsub_rsubd,  ALOPF21, 0x2f, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfaddsub_rsubs,  ALOPF21, 0x2e, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfadd_subs,      ALOPF21, 0x20, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfaddsubs,       ALOPF11, 0x7e, 0x00, 0x02, 0xc0, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfaddsub_subd,   ALOPF21, 0x2f, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfaddsub_subs,   ALOPF21, 0x2e, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfcmpeqd,        ALOPF11, 0x7b, 0x00, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfcmpeqs,        ALOPF11, 0x7a, 0x00, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfcmpled,        ALOPF11, 0x7b, 0x00, 0x02, 0xc2, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfcmples,        ALOPF11, 0x7a, 0x00, 0x02, 0xc2, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfcmpltd,        ALOPF11, 0x7b, 0x00, 0x02, 0xc1, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfcmplts,        ALOPF11, 0x7a, 0x00, 0x02, 0xc1, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfcmpneqd,       ALOPF11, 0x7b, 0x00, 0x02, 0xc4, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfcmpneqs,       ALOPF11, 0x7a, 0x00, 0x02, 0xc4, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfcmpnled,       ALOPF11, 0x7b, 0x00, 0x02, 0xc6, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfcmpnles,       ALOPF11, 0x7a, 0x00, 0x02, 0xc6, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfcmpnltd,       ALOPF11, 0x7b, 0x00, 0x02, 0xc5, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfcmpnlts,       ALOPF11, 0x7a, 0x00, 0x02, 0xc5, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfcmpodd,        ALOPF11, 0x7b, 0x00, 0x02, 0xc7, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfcmpods,        ALOPF11, 0x7a, 0x00, 0x02, 0xc7, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfcmpuodd,       ALOPF11, 0x7b, 0x00, 0x02, 0xc3, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfcmpuods,       ALOPF11, 0x7a, 0x00, 0x02, 0xc3, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfdtofs,         ALOPF12, 0x6d, 0xee, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfdtoid,         ALOPF12, 0x6d, 0xf8, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfdtoidtr,       ALOPF12, 0x6d, 0xfa, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfdtoifd,        ALOPF11, 0x6f, 0x00, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfdtois,         ALOPF12, 0x6d, 0xe8, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfdtoistr,       ALOPF12, 0x6d, 0xea, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfhadd_adds,     ALOPF21, 0x04, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfhadd_addsubs,  ALOPF21, 0x64, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfhadd_hadds,    ALOPF21, 0x44, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfhadd_hsubs,    ALOPF21, 0x64, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfhadd_rsubs,    ALOPF21, 0x24, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfhadds,         ALOPF11, 0x7c, 0x00, 0x02, 0xc0, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfhadd_subs,     ALOPF21, 0x24, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfhsub_adds,     ALOPF21, 0x06, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfhsub_addsubs,  ALOPF21, 0x66, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfhsub_hadds,    ALOPF21, 0x46, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfhsub_hsubs,    ALOPF21, 0x66, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfhsub_rsubs,    ALOPF21, 0x26, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfhsubs,         ALOPF11, 0x7d, 0x00, 0x02, 0xc0, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfhsub_subs,     ALOPF21, 0x26, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfmaxd,          ALOPF11, 0x77, 0x00, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfmaxs,          ALOPF11, 0x76, 0x00, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfmind,          ALOPF11, 0x75, 0x00, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfmins,          ALOPF11, 0x74, 0x00, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfmul_addd,      ALOPF21, 0x09, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfmul_adds,      ALOPF21, 0x08, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfmul_addsubd,   ALOPF21, 0x69, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfmul_addsubs,   ALOPF21, 0x68, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfmuld,          ALOPF11, 0x79, 0x00, 0x02, 0xc0, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfmul_hadds,     ALOPF21, 0x48, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfmul_hsubs,     ALOPF21, 0x68, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfmul_rsubd,     ALOPF21, 0x29, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfmul_rsubs,     ALOPF21, 0x28, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfmuls,          ALOPF11, 0x78, 0x00, 0x02, 0xc0, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfmul_subd,      ALOPF21, 0x29, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfmul_subs,      ALOPF21, 0x28, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfstofd,         ALOPF12, 0x6d, 0xde, 0x02, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfstoid,         ALOPF12, 0x6d, 0xd8, 0x02, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfstoidtr,       ALOPF12, 0x6d, 0xda, 0x02, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfstoifs,        ALOPF11, 0x6e, 0x00, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfstois,         ALOPF12, 0x6d, 0xc8, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfstoistr,       ALOPF12, 0x6d, 0xca, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpfsub_addd,      ALOPF21, 0x03, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfsub_adds,      ALOPF21, 0x02, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfsub_addsubd,   ALOPF21, 0x63, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfsub_addsubs,   ALOPF21, 0x62, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfsubd,          ALOPF11, 0x73, 0x00, 0x02, 0xc0, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfsub_hadds,     ALOPF21, 0x42, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfsub_hsubs,     ALOPF21, 0x62, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfsub_rsubd,     ALOPF21, 0x23, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfsub_rsubs,     ALOPF21, 0x22, 0x00, 0x17, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfsubs,          ALOPF11, 0x72, 0x00, 0x02, 0xc0, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfsub_subd,      ALOPF21, 0x23, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qpfsub_subs,      ALOPF21, 0x22, 0x00, 0x16, 0x00, 1, 0x00, 0x3f)  // channels 012345
++E2K_OP(qphaddh,          ALOPF11, 0x19, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qphaddsh,         ALOPF11, 0x1b, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qphaddw,          ALOPF11, 0x1a, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qphminposuh,      ALOPF11, 0x6a, 0x00, 0x02, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(qphsubh,          ALOPF11, 0x1d, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qphsubsh,         ALOPF11, 0x1f, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qphsubw,          ALOPF11, 0x1e, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpidtofd,         ALOPF12, 0x6d, 0xfc, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpidtofs,         ALOPF12, 0x6d, 0xec, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpistofd,         ALOPF12, 0x6d, 0xdc, 0x02, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpistofs,         ALOPF12, 0x6d, 0xcc, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpmaddh,          ALOPF11, 0x5a, 0x00, 0x02, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(qpmaddubsh,       ALOPF11, 0x68, 0x00, 0x02, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(qpmaxsb,          ALOPF11, 0x46, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpmaxsh,          ALOPF11, 0x43, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpmaxsw,          ALOPF11, 0x0f, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpmaxub,          ALOPF11, 0x42, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpmaxuh,          ALOPF11, 0x47, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpmaxuw,          ALOPF11, 0x0e, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpmerge,          ALOPF21, 0x6d, 0x00, 0x17, 0x00, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpminsb,          ALOPF11, 0x44, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpminsh,          ALOPF11, 0x41, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpminsw,          ALOPF11, 0x0d, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpminub,          ALOPF11, 0x40, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpminuh,          ALOPF11, 0x45, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpminuw,          ALOPF11, 0x0c, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpmpsadbh,        ALOPF11, 0x6b, 0x00, 0x02, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(qpmsk2sgnb,       ALOPF11, 0x34, 0x00, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpmulhh,          ALOPF11, 0x58, 0x00, 0x02, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(qpmulhrsh,        ALOPF11, 0x69, 0x00, 0x02, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(qpmulhuh,         ALOPF11, 0x5b, 0x00, 0x02, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(qpmullh,          ALOPF11, 0x59, 0x00, 0x02, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(qpmullw,          ALOPF11, 0x5e, 0x00, 0x02, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(qpmulubhh,        ALOPF11, 0x5d, 0x00, 0x02, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(qpor,             ALOPF11, 0x0a, 0x00, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qppackdl,         ALOPF11, 0x3d, 0x00, 0x02, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(qppermb,          ALOPF21, 0x0d, 0x00, 0x17, 0x00, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpsadbw,          ALOPF11, 0x5c, 0x00, 0x02, 0xc0, 1, 0x00, 0x12)  // channels 14
++E2K_OP(qpsgn2mskb,       ALOPF12, 0x3c, 0xc0, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpshufb,          ALOPF21, 0x4d, 0x00, 0x17, 0x00, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpsignb,          ALOPF11, 0x38, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpsignh,          ALOPF11, 0x39, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpsignw,          ALOPF11, 0x3a, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpslld,           ALOPF11, 0x07, 0x00, 0x02, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpsllh,           ALOPF11, 0x05, 0x00, 0x02, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpsllw,           ALOPF11, 0x04, 0x00, 0x02, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpsrah,           ALOPF11, 0x03, 0x00, 0x02, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpsraw,           ALOPF11, 0x02, 0x00, 0x02, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpsrcd,           ALOPF11, 0x27, 0x00, 0x02, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpsrcw,           ALOPF11, 0x26, 0x00, 0x02, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpsrld,           ALOPF11, 0x06, 0x00, 0x02, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpsrlh,           ALOPF11, 0x01, 0x00, 0x02, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpsrlw,           ALOPF11, 0x00, 0x00, 0x02, 0xc0, 0, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpsubb,           ALOPF11, 0x50, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpsubd,           ALOPF11, 0x57, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpsubh,           ALOPF11, 0x51, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpsubsb,          ALOPF11, 0x52, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpsubsh,          ALOPF11, 0x53, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpsubusb,         ALOPF11, 0x54, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpsubush,         ALOPF11, 0x55, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpsubw,           ALOPF11, 0x56, 0x00, 0x02, 0xc0, 1, 0x00, 0x09)  // channels 03
++E2K_OP(qpswitchd,        ALOPF12, 0x3f, 0xc0, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpswitchw,        ALOPF12, 0x3e, 0xc0, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(qpxor,            ALOPF11, 0x0b, 0x00, 0x02, 0xc0, 1, 0x00, 0x1b)  // channels 0134
++E2K_OP(stqp,             ALOPF3,  0x21, 0x00, 0x02, 0xc0, 0, 0x00, 0x24)  // channels 25

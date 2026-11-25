@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 21:34:41 +0100
+Subject: [PATCH 69/99] v8: name the property of a failed interceptor call
+ without reading the frame marker as a Smi
+
+Isolate::NotifyExceptionPropagationCallback chose between a property name and
+an index with PropertyCallbackInfo::IsNamed(), which reads the type marker of
+the exit frame as a Smi. That gives the frame type only with 31-bit Smis; in
+a build with full pointers, as on e2k, it never says "named", and an
+exception thrown by a named interceptor called from a builtin while the
+profiler or the debugger is on was reported with a number in place of the
+name ("Failed to set a named property 68552417 on DOMStringMap").
+The kind of the callback already tells which one it is.
+---
+ chromium/v8/src/execution/isolate.cc | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/chromium/v8/src/execution/isolate.cc b/chromium/v8/src/execution/isolate.cc
+index 1aa489f988..151e131913 100644
+--- a/chromium/v8/src/execution/isolate.cc
++++ b/chromium/v8/src/execution/isolate.cc
+@@ -5597,7 +5597,19 @@ void Isolate::NotifyExceptionPropagationCallback() {
+ 
+         using PCA = PropertyCallbackArguments;
+         DirectHandle<Name> name;
+-        if (PCA::IsNamed(*callback_info)) {
++        // Whether the key slot holds a name follows from the kind of the
++        // callback. PCA::IsNamed() reads the frame type marker as a Smi, which
++        // gives the frame type only with 31-bit Smis: with full pointers (and
++        // 32-bit Smis) it is never "named", and the name was then taken for an
++        // index.
++        const bool is_named = kind == v8::ExceptionContext::kNamedQuery ||
++                              kind == v8::ExceptionContext::kNamedGetter ||
++                              kind == v8::ExceptionContext::kNamedDescriptor ||
++                              kind == v8::ExceptionContext::kNamedSetter ||
++                              kind == v8::ExceptionContext::kNamedDefiner ||
++                              kind == v8::ExceptionContext::kNamedDeleter ||
++                              kind == v8::ExceptionContext::kNamedEnumerator;
++        if (is_named) {
+           name = PCA::GetPropertyName(*callback_info);
+         } else {
+           uint32_t index = PCA::GetPropertyIndex(*callback_info);

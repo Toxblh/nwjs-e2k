@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 23:07:41 +0100
+Subject: [PATCH 70/99] v8: e2k: status of a truncation to int64 without
+ clearing %pfpfr
+
+TryTruncateFloat64ToInt64 and TryTruncateFloat32ToInt64 cleared the
+flags of %pfpfr, converted and read the flags, as the loong64 code does
+with FCSR. A process on e2k runs with all the sticky flags set, and once
+one is cleared a speculative floating-point operation of the C++ code
+that would raise it gives a diagnostic value: after i64.trunc_f64_s in
+WebAssembly d8 died of SIGILL in fast_float::from_chars on the next
+number literal. The status now comes from converting the result back and
+comparing it with the input.
+---
+ .../backend/e2k/code-generator-e2k.cc         | 63 +++++++++++++------
+ 1 file changed, 45 insertions(+), 18 deletions(-)
+
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index 6e0bdd4c20..afcac1ce96 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -250,6 +250,45 @@ CREATE_OOL_CLASS(OutOfLineFloat64Min, Float64MinOutOfLine, FPURegister);
+ 
+ #undef CREATE_OOL_CLASS
+ 
++// status = 1 if `result` is `input` truncated to int64, 0 if the input was a
++// NaN or out of range.
++// The loong64 code clears the flags of the status register, converts and
++// reads the flags. On e2k that register (%pfpfr) must be left alone: its
++// flags are sticky and all set in a running process, and once one is cleared
++// a speculative floating-point operation of the C++ code that would raise it
++// gives a diagnostic value instead of a result (SIGILL when it is used;
++// measured, v8-e2k-lab/wasm/pfpfr). So the result is converted back and
++// compared: it is right when it differs from the input by less than 1.
++void EmitTruncateToInt64Status(MacroAssembler* masm, Register status,
++                               Register result, FPURegister input,
++                               bool is_double) {
++  FPURegister back = kScratchDoubleReg;
++  FPURegister one = kScratchDoubleReg2;
++  DCHECK(input != back && input != one);
++  DCHECK(status != result);
++  // 2^63 as a double converts back from INT64_MAX to itself: count INT64_MAX
++  // as INT64_MIN.
++  masm->addi_d(status, result, 1);
++  masm->slt(status, status, result);
++  masm->add_d(status, result, status);
++  masm->movgr2fr_d(back, status);
++  if (is_double) {
++    masm->ffint_d_l(back, back);
++    masm->fsub_d(back, input, back);
++    masm->fabs_d(back, back);
++    masm->Move(one, 1.0);
++    masm->CompareF64(back, one, CLT);
++  } else {
++    masm->ffint_s_l(back, back);
++    masm->fsub_s(back, input, back);
++    masm->fabs_s(back, back);
++    masm->Move(one, 1.0f);
++    masm->CompareF32(back, one, CLT);
++  }
++  masm->li(status, 1);
++  masm->LoadZeroIfNotFPUCondition(status);
++}
++
+ #if V8_ENABLE_WEBASSEMBLY
+ class WasmOutOfLineTrap : public OutOfLineCode {
+  public:
+@@ -1969,19 +2008,13 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       FPURegister scratch_d = kScratchDoubleReg;
+ 
+       bool load_status = instr->OutputCount() > 1;
+-      // The flags of %pfpfr are sticky: clear them first.
+-      if (load_status) __ movgr2fcsr(zero_reg);
+       // Other arches use round to zero here, so we follow.
+       __ ftintrz_l_s(scratch_d, i.InputDoubleRegister(0));
+       __ movfr2gr_d(i.OutputRegister(), scratch_d);
+       if (load_status) {
+-        Register output2 = i.OutputRegister(1);
+-        __ movfcsr2gr(output2, FCSR2);
+-        // Check for overflow and NaNs.
+-        __ And(output2, output2,
+-               kFCSROverflowCauseMask | kFCSRInvalidOpCauseMask);
+-        __ Slt(output2, zero_reg, output2);
+-        __ xori(output2, output2, 1);
++        EmitTruncateToInt64Status(masm(), i.OutputRegister(1),
++                                  i.OutputRegister(0),
++                                  i.InputDoubleRegister(0), false);
+       }
+       break;
+     }
+@@ -1992,19 +2025,13 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+ 
+       bool set_overflow_to_min_i64 = MiscField::decode(instr->opcode());
+       bool load_status = instr->OutputCount() > 1;
+-      // The flags of %pfpfr are sticky: clear them first.
+-      if (load_status) __ movgr2fcsr(zero_reg);
+       // Other arches use round to zero here, so we follow.
+       __ ftintrz_l_d(scratch_d, i.InputDoubleRegister(0));
+       __ movfr2gr_d(i.OutputRegister(0), scratch_d);
+       if (load_status) {
+-        Register output2 = i.OutputRegister(1);
+-        __ movfcsr2gr(output2, FCSR2);
+-        // Check for overflow and NaNs.
+-        __ And(output2, output2,
+-               kFCSROverflowCauseMask | kFCSRInvalidOpCauseMask);
+-        __ Slt(output2, zero_reg, output2);
+-        __ xori(output2, output2, 1);
++        EmitTruncateToInt64Status(masm(), i.OutputRegister(1),
++                                  i.OutputRegister(0),
++                                  i.InputDoubleRegister(0), true);
+       }
+       if (set_overflow_to_min_i64) {
+         // Avoid INT64_MAX as an overflow indicator and use INT64_MIN instead,

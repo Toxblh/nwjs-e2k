@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Wed, 7 Oct 2026 16:53:57 +0100
+Subject: [PATCH 02/99] e2k: third_party, sandbox, crashpad, lss, link
+ libatomic
+
+---
+ chromium/build/config/linux/BUILD.gn          |  2 +-
+ chromium/build/rust/gni_impl/rustc_wrapper.py |  8 ++++++++
+ chromium/build/rust/std/BUILD.gn              | 10 ++++++----
+ 3 files changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/chromium/build/config/linux/BUILD.gn b/chromium/build/config/linux/BUILD.gn
+index e092782740..175ea38a3b 100644
+--- a/chromium/build/config/linux/BUILD.gn
++++ b/chromium/build/config/linux/BUILD.gn
+@@ -40,7 +40,7 @@ config("runtime_library") {
+   }
+ 
+   if ((!is_chromeos || default_toolchain != "//build/toolchain/cros:target") &&
+-      (!use_custom_libcxx || current_cpu == "mipsel")) {
++      (!use_custom_libcxx || current_cpu == "mipsel" || current_cpu == "e2k")) {
+     libs = [ "atomic" ]
+   }
+ }
+diff --git a/chromium/build/rust/gni_impl/rustc_wrapper.py b/chromium/build/rust/gni_impl/rustc_wrapper.py
+index ddb7c6c4f2..a3f66a6a5d 100755
+--- a/chromium/build/rust/gni_impl/rustc_wrapper.py
++++ b/chromium/build/rust/gni_impl/rustc_wrapper.py
+@@ -383,6 +383,14 @@ def main():
+         sources_separator = None
+     rustc_args = remaining_args[:ldflags_separator]
+     ldflags = remaining_args[ldflags_separator + 1 : rustenv_separator]
++    # rustc links the prebuilt std on its own. Drop the copies that
++    # //build/rust/std adds to ldflags for C++-driven links: they are redundant
++    # here and clash with rustc's when wrapped in --whole-archive (GNU ld).
++    ldflags = [
++        arg
++        for arg in ldflags
++        if not ('prebuilt_rustc_sysroot/' in arg and arg.endswith('.rlib'))
++    ]
+     rustenv = remaining_args[rustenv_separator + 1 : sources_separator]
+ 
+     abs_build_root = os.getcwd().replace('\\', '/') + '/'
+diff --git a/chromium/build/rust/std/BUILD.gn b/chromium/build/rust/std/BUILD.gn
+index eef5ab3e36..4f7cd509a4 100644
+--- a/chromium/build/rust/std/BUILD.gn
++++ b/chromium/build/rust/std/BUILD.gn
+@@ -356,17 +356,19 @@ if (toolchain_has_rust) {
+       # currently no known solution to this for the prebuilt stdlib - this
+       # problem does not apply with configurations where we build the stdlib
+       # ourselves, which is what we'll use in production.
+-      # GNU ld resolves archives in a single pass and the std rlibs depend on
+-      # each other in no particular order, so they have to be grouped.
++      # GNU ld resolves archives in a single pass, but these ldflags precede
++      # the objects and rlibs that need std on the link line (and the std rlibs
++      # depend on each other in no particular order). Link them in whole and
++      # let --gc-sections drop what is unused.
+       if (!use_lld && !is_apple && !is_win) {
+-        ldflags += [ "-Wl,--start-group" ]
++        ldflags += [ "-Wl,--whole-archive" ]
+       }
+       foreach(lib, stdlib_files) {
+         this_file = "$lib_dir/lib$lib.rlib"
+         ldflags += [ this_file ]
+       }
+       if (!use_lld && !is_apple && !is_win) {
+-        ldflags += [ "-Wl,--end-group" ]
++        ldflags += [ "-Wl,--no-whole-archive" ]
+       }
+       visibility = [ ":*" ]
+     }

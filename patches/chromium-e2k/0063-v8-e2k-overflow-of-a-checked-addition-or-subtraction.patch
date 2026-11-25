@@ -1,0 +1,362 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 19:51:35 +0100
+Subject: [PATCH 63/99] v8: e2k: overflow of a checked addition or subtraction
+ from one compare
+
+A branch on the overflow of Int64AddWithOverflow or Int64SubWithOverflow
+made a flag in a register first: add, compare, merge 0/1, compare with
+zero, branch - six wide commands on the Smi path of every arithmetic
+bytecode handler and *_Baseline builtin. s = a + b overflowed when s - a
+does (s - a is then b plus or minus 2^64), d = a - b when a - d does, and
+cmpodb tells the overflow of a subtraction: the instruction is now the
+plain operation and the branch one compare of the result with the left
+operand, which the selector keeps out of the result register. The same in
+32 bits with cmposb on the 64-bit sum of the sign-extended operands, in
+place of add, sign extension and compare. A branch taken on overflow is a
+rare one: the compare and the branch are one command.
+
+On a stand the check costs 5 cycles the old way, 2 with ct and none as a
+rare branch (lab, ideas/88-smi-ovf).
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc  |  8 ++
+ chromium/v8/src/codegen/e2k/assembler-e2k.h   | 12 +++
+ chromium/v8/src/codegen/e2k/la_asm.h          | 19 ++++
+ .../v8/src/codegen/e2k/macro-assembler-e2k.cc | 42 +++++++++
+ .../v8/src/codegen/e2k/macro-assembler-e2k.h  | 10 ++
+ .../backend/e2k/code-generator-e2k.cc         | 94 +++++++++++--------
+ .../backend/e2k/instruction-selector-e2k.cc   | 13 ++-
+ 7 files changed, 156 insertions(+), 42 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index 2c264dece3..5c97d321ae 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -1193,6 +1193,14 @@ void Assembler::bcmpi(Condition cond, Register rj, int64_t imm,
+   }
+   LA(bcmpi(cmp, negate, rj, imm, offset));
+ }
++void Assembler::bsubo(Register rj, Register rk, int32_t offset) { LA(bsubo(rj, rk, offset)); }
++void Assembler::bsubno(Register rj, Register rk, int32_t offset) { LA(bsubno(rj, rk, offset)); }
++void Assembler::bsubo_w(Register rj, Register rk, int32_t offset) { LA(bsubo_w(rj, rk, offset)); }
++void Assembler::bsubno_w(Register rj, Register rk, int32_t offset) { LA(bsubno_w(rj, rk, offset)); }
++void Assembler::bsuboi(bool w, bool negate, Register rj, int64_t imm, int32_t offset) { LA(bsuboi(w, negate, rj, imm, offset)); }
++void Assembler::subo_d(Register rd, Register rj, Register rk) { LA(subo_d(rd, rj, rk)); }
++void Assembler::subo_w(Register rd, Register rj, Register rk) { LA(subo_w(rd, rj, rk)); }
++void Assembler::suboi(bool w, Register rd, Register rj, int64_t imm) { LA(suboi(w, rd, rj, imm)); }
+ void Assembler::ffint_d_wr(FPURegister fd, Register rj) { LA(ffint_d_wr(fd, rj)); }
+ void Assembler::ffint_s_wr(FPURegister fd, Register rj) { LA(ffint_s_wr(fd, rj)); }
+ void Assembler::beqz(Register rj, int32_t offset) { LA(beqz(rj, offset)); }
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index 716b348faa..e81c5783c5 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -485,6 +485,18 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   // Not LoongArch: branch on rj <cond> imm, the constant a literal of the
+   // compare.
+   void bcmpi(Condition cond, Register rj, int64_t imm, int32_t offset);
++  // Not LoongArch: branch when rj - rk overflows as signed 64-bit numbers
++  // (bsubo), does not (bsubno); _w: as 32-bit ones. bsuboi: rj - imm, 32 bits
++  // with `w`, the branch taken on no overflow with `negate`. rd = 1 when it
++  // overflows, else 0: subo_d, subo_w, suboi.
++  void bsubo(Register rj, Register rk, int32_t offset);
++  void bsubno(Register rj, Register rk, int32_t offset);
++  void bsubo_w(Register rj, Register rk, int32_t offset);
++  void bsubno_w(Register rj, Register rk, int32_t offset);
++  void bsuboi(bool w, bool negate, Register rj, int64_t imm, int32_t offset);
++  void subo_d(Register rd, Register rj, Register rk);
++  void subo_w(Register rd, Register rj, Register rk);
++  void suboi(bool w, Register rd, Register rj, int64_t imm);
+   // Not LoongArch: int32 in a general register to double, to float.
+   void ffint_d_wr(FPURegister fd, Register rj);
+   void ffint_s_wr(FPURegister fd, Register rj);
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 6da51cf323..7692624006 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -331,6 +331,19 @@ class Assembler : private e2k::Assembler {
+     static const Cmp f[5] = {&E::cmpedb, &E::cmpldb, &E::cmpledb, &E::cmpbdb, &E::cmpbedb};
+     br(f[cmp], negate, R(rj), imm, offset);
+   }
++  // Not LoongArch: branch when rj - rk overflows as signed 64-bit numbers
++  // (bsubo) or does not (bsubno); _w: as 32-bit ones, the low halves.  One
++  // compare (cmpodb, cmposb) and no flag in a register.  It tells the
++  // overflow of an addition or a subtraction from the result: s = a + b
++  // overflowed when s - a does (s - a is then b plus or minus 2^64), d = a - b
++  // when a - d does (ideas/88-smi-ovf).  bsuboi: with a constant.
++  void bsubo(Register rj, Register rk, int32_t offset) { br(&E::cmpodb, false, R(rj), R(rk), offset); }
++  void bsubno(Register rj, Register rk, int32_t offset) { br(&E::cmpodb, true, R(rj), R(rk), offset); }
++  void bsubo_w(Register rj, Register rk, int32_t offset) { br(&E::cmposb, false, R(rj), R(rk), offset); }
++  void bsubno_w(Register rj, Register rk, int32_t offset) { br(&E::cmposb, true, R(rj), R(rk), offset); }
++  void bsuboi(bool w, bool negate, Register rj, int64_t imm, int32_t offset) {
++    if (w) br(&E::cmposb, negate, R(rj), int64_t(int32_t(imm)), offset); else br(&E::cmpodb, negate, R(rj), imm, offset);
++  }
+   void bceqz(CFRegister cj, int32_t offset) { brc(~P(cj), offset); }
+   void bcnez(CFRegister cj, int32_t offset) { brc(P(cj), offset); }
+   // pc = rj + offset instructions, rd = address of the next instruction,
+@@ -500,6 +513,12 @@ class Assembler : private e2k::Assembler {
+   // rd = (rj & rk) == 0, (rj & mask) == 0.
+   void tstz(Register rd, Register rj, Register rk) { set(&E::cmpandedb, rd, R(rj), R(rk)); }
+   void tstzi(Register rd, Register rj, int64_t mask) { set(&E::cmpandedb, rd, R(rj), mask); }
++  // Not LoongArch: rd = rj - rk overflows as signed 64-bit (_w: 32-bit) numbers.
++  void subo_d(Register rd, Register rj, Register rk) { set(&E::cmpodb, rd, R(rj), R(rk)); }
++  void subo_w(Register rd, Register rj, Register rk) { set(&E::cmposb, rd, R(rj), R(rk)); }
++  void suboi(bool w, Register rd, Register rj, int64_t imm) {
++    if (w) set(&E::cmposb, rd, R(rj), int64_t(int32_t(imm))); else set(&E::cmpodb, rd, R(rj), imm);
++  }
+   void tstnz(Register rd, Register rj, Register rk) { C(cmpandedb(0, R(rj), R(rk), PT0)); L(merged(0, 1, 0, D(rd), PT0)); }
+   void tstnzi(Register rd, Register rj, int64_t mask) { C(cmpandedb(0, R(rj), mask, PT0)); L(merged(0, 1, 0, D(rd), PT0)); }
+ 
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+index 8621420b05..db4c60aa8b 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+@@ -3656,6 +3656,48 @@ void MacroAssembler::BranchTst(Label* L, Condition cond, Register rj,
+   }
+ }
+ 
++void MacroAssembler::CompareSubOverflow(Register result, Register r1,
++                                        const Operand& r2, bool is32) {
++  if (r2.is_reg()) {
++    if (is32) {
++      subo_w(result, r1, r2.rm());
++    } else {
++      subo_d(result, r1, r2.rm());
++    }
++  } else {
++    DCHECK(RelocInfo::IsNoInfo(r2.rmode()));
++    suboi(is32, result, r1, r2.immediate());
++  }
++}
++
++void MacroAssembler::BranchSubOverflow(Label* L, Condition cond, Register r1,
++                                       const Operand& r2, bool is32) {
++  DCHECK(cond == Condition::overflow || cond == Condition::no_overflow);
++  if (L->is_bound() ? !is_near(L, OffsetSize::kOffset16)
++                    : is_trampoline_emitted()) {
++    UseScratchRegisterScope temps(this);
++    Register scratch = temps.Acquire();
++    CompareSubOverflow(scratch, r1, r2, is32);
++    Branch(L, cond == Condition::overflow ? ne : eq, scratch, Operand(zero_reg));
++    return;
++  }
++  int32_t offset = GetOffset(L, OffsetSize::kOffset16);
++  if (!r2.is_reg()) {
++    DCHECK(RelocInfo::IsNoInfo(r2.rmode()));
++    bsuboi(is32, cond == Condition::no_overflow, r1, r2.immediate(), offset);
++  } else if (is32) {
++    if (cond == Condition::overflow) {
++      bsubo_w(r1, r2.rm(), offset);
++    } else {
++      bsubno_w(r1, r2.rm(), offset);
++    }
++  } else if (cond == Condition::overflow) {
++    bsubo(r1, r2.rm(), offset);
++  } else {
++    bsubno(r1, r2.rm(), offset);
++  }
++}
++
+ void MacroAssembler::CompareTaggedAndBranch(Label* label, Condition cond,
+                                             Register r1, const Operand& r2,
+                                             bool need_link) {
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h
+index a3eafc14ad..0b32d89e64 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.h
+@@ -166,6 +166,16 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
+   // Branches when r1 & r2 is zero (eq), is not zero (ne): one compare, no
+   // scratch register.
+   void BranchTst(Label* label, Condition cond, Register r1, const Operand& r2);
++  // Branches when r1 - r2 overflows as signed 64-bit numbers (overflow) or
++  // does not (no_overflow); is32: as 32-bit ones, of the low halves. One
++  // compare, no flag in a register. This is how the overflow of a checked
++  // addition or subtraction is told from its result: s = a + b overflowed
++  // when s - a does, d = a - b when a - d does.
++  void BranchSubOverflow(Label* label, Condition cond, Register r1,
++                         const Operand& r2, bool is32 = false);
++  // result = 1 when r1 - r2 overflows, else 0.
++  void CompareSubOverflow(Register result, Register r1, const Operand& r2,
++                          bool is32 = false);
+   void Branch(Label* L, Condition cond, Register rj, RootIndex index,
+               bool need_sign_extend = true);
+ 
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index 735ef8404c..c8d4a7ddfc 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -434,6 +434,23 @@ Condition FlagsConditionToConditionTst(FlagsCondition condition) {
+   UNREACHABLE();
+ }
+ 
++// Whether the overflow of kE2kAddOvf_d, kE2kSubOvf_d and their _w forms is
++// found by the branch that follows, with one compare of the result and the
++// left operand (MacroAssembler::BranchSubOverflow): s = a + b overflowed
++// when s - a does, d = a - b when a - d does. The instruction is then the
++// plain 64-bit operation, and the selector keeps the left operand out of
++// the result register. A flag in a register was four more commands.
++bool OvfInBranch(Instruction* instr) {
++  switch (instr->flags_mode()) {
++    case kFlags_branch:
++    case kFlags_deoptimize:
++    case kFlags_trap:
++      return true;
++    default:
++      return false;
++  }
++}
++
+ Condition FlagsConditionToConditionOvf(FlagsCondition condition) {
+   switch (condition) {
+     case kOverflow:
+@@ -1418,7 +1435,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       __ Add_d(i.OutputRegister(), i.InputRegister(0), i.InputOperand(1));
+       break;
+     case kE2kAddOvf_w: {
+-      if (instr->InputAt(1)->IsImmediate()) {
++      if (instr->InputAt(1)->IsImmediate() && !OvfInBranch(instr)) {
+         __ Add_w(i.OutputRegister(), i.InputRegister(0), i.InputOperand(1));
+       } else {
+         __ Add_d(i.OutputRegister(), i.InputRegister(0), i.InputOperand(1));
+@@ -1426,6 +1443,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       break;
+     }
+     case kE2kAddOvf_d: {
++      if (OvfInBranch(instr)) {
++        __ Add_d(i.OutputRegister(), i.InputRegister(0), i.InputOperand(1));
++        break;
++      }
+       UseScratchRegisterScope temps(masm());
+       DCHECK(temps.hasAvailable());
+       temps.Exclude(t8);
+@@ -1455,7 +1476,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       __ Sub_d(i.OutputRegister(), i.InputRegister(0), i.InputOperand(1));
+       break;
+     case kE2kSubOvf_w: {
+-      if (instr->InputAt(1)->IsImmediate()) {
++      if (instr->InputAt(1)->IsImmediate() && !OvfInBranch(instr)) {
+         __ Sub_w(i.OutputRegister(), i.InputRegister(0), i.InputOperand(1));
+       } else {
+         __ Sub_d(i.OutputRegister(), i.InputRegister(0), i.InputOperand(1));
+@@ -1463,6 +1484,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       break;
+     }
+     case kE2kSubOvf_d: {
++      if (OvfInBranch(instr)) {
++        __ Sub_d(i.OutputRegister(), i.InputRegister(0), i.InputOperand(1));
++        break;
++      }
+       UseScratchRegisterScope temps(masm());
+       DCHECK(temps.hasAvailable());
+       temps.Exclude(t8);
+@@ -4566,53 +4591,31 @@ void AssembleBranchToLabels(CodeGenerator* gen, MacroAssembler* masm,
+     Condition cc = FlagsConditionToConditionTst(condition);
+     __ BranchTst(tlabel, cc, i.InputRegister(0), i.InputOperand(1));
+   } else if (instr->arch_opcode() == kE2kAddOvf_w ||
+-             instr->arch_opcode() == kE2kSubOvf_w) {
+-    if (!instr->InputAt(1)->IsImmediate()) {
+-      UseScratchRegisterScope temps(masm);
+-      Register scratch = temps.Acquire();
+-      Condition cc = FlagsConditionToConditionOvf(condition);
+-      __ slli_w(scratch, i.OutputRegister(), 0);
+-      __ Branch(tlabel, cc, i.OutputRegister(), Operand(scratch));
+-    } else {
+-      DCHECK(!AreAliased(i.OutputRegister(), i.InputRegister(0)));
+-      bool is_add = (instr->arch_opcode() == kE2kAddOvf_w);
+-      int64_t imm = i.ToConstant(instr->InputAt(1)).ToInt64();
+-      // Define mapping from {is_add, imm < 0, is_overflow} to branch condition.
+-      static const Condition cond_map[2][2][2] = {
+-          {
+-              /* Add_w */
+-              {lt, ge},  // imm>=0: [kOverflow, !kOverflow]
+-              {gt, le}   // imm<0:  [kOverflow, !kOverflow]
+-          },
+-          {
+-              /* Sub_w */
+-              {gt, le},  // imm>=0: [kOverflow, !kOverflow]
+-              {lt, ge}   // imm<0:  [kOverflow, !kOverflow]
+-          }};
+-      bool is_overflow = (condition == kOverflow);
+-      if (imm != 0) {
+-        Condition cc = cond_map[is_add][imm < 0][is_overflow];
+-        __ Branch(tlabel, cc, i.OutputRegister(), Operand(i.InputRegister(0)));
+-      } else if (!is_overflow) {
+-        __ Branch(tlabel);
+-      }
+-    }
+-  } else if (instr->arch_opcode() == kE2kAddOvf_d ||
++             instr->arch_opcode() == kE2kSubOvf_w ||
++             instr->arch_opcode() == kE2kAddOvf_d ||
+              instr->arch_opcode() == kE2kSubOvf_d) {
+-    DCHECK_LE(instr->OutputCount(), 1);
++    // See OvfInBranch. In 32 bits the operands are sign-extended and the
++    // operation was done in 64: the low halves are compared.
++    DCHECK(OvfInBranch(instr));
++    DCHECK_EQ(instr->OutputCount(), 1);
++    Register result = i.OutputRegister();
++    Register left = i.InputRegister(0);
++    CHECK(result != left);
++    bool is_add = instr->arch_opcode() == kE2kAddOvf_w ||
++                  instr->arch_opcode() == kE2kAddOvf_d;
++    bool is32 = instr->arch_opcode() == kE2kAddOvf_w ||
++                instr->arch_opcode() == kE2kSubOvf_w;
+     switch (condition) {
+-      // Overflow occurs if overflow register is 1.
+       case kOverflow:
+-        __ Branch(tlabel, ne, t8, Operand(zero_reg));
+-        break;
+       case kNotOverflow:
+-        __ Branch(tlabel, eq, t8, Operand(zero_reg));
++        __ BranchSubOverflow(tlabel,
++                             condition == kOverflow ? overflow : no_overflow,
++                             is_add ? result : left,
++                             Operand(is_add ? left : result), is32);
+         break;
+       default:
+         UNSUPPORTED_COND(instr->arch_opcode(), condition);
+     }
+-    UseScratchRegisterScope temps(masm);
+-    temps.Include(t8);
+   } else if (instr->arch_opcode() == kE2kMulOvf_w ||
+              instr->arch_opcode() == kE2kMulOvf_d) {
+     DCHECK_LE(instr->OutputCount(), 1);
+@@ -4683,6 +4686,15 @@ void CodeGenerator::AssembleArchBranch(Instruction* instr, BranchInfo* branch) {
+              !instructions()->InstructionBlockAt(current_block_)->IsDeferred();
+     }
+   }
++  // So is a branch taken when an addition or a subtraction overflows, even
++  // where CSA code does not defer its target.
++  if (branch->condition == kOverflow &&
++      (instr->arch_opcode() == kE2kAddOvf_d ||
++       instr->arch_opcode() == kE2kSubOvf_d ||
++       instr->arch_opcode() == kE2kAddOvf_w ||
++       instr->arch_opcode() == kE2kSubOvf_w)) {
++    rare = true;
++  }
+   MacroAssembler::RareBranchScope rare_scope(masm(), rare);
+   AssembleBranchToLabels(this, masm(), instr, branch->condition, tlabel, flabel,
+                          branch->fallthru);
+diff --git a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+index 00db181511..0054d0286e 100644
+--- a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+@@ -365,7 +365,18 @@ static void VisitBinop(InstructionSelector* selector, turboshaft::OpIndex node,
+     opcode = reverse_opcode;
+     input_count++;
+   } else {
+-    inputs[input_count++] = g.UseRegister(left_node);
++    // The branch on the overflow of an addition or a subtraction compares
++    // the result with the left operand, which then has to outlive it.
++    ArchOpcode arch_opcode = ArchOpcodeField::decode(opcode);
++    if (!cont->IsNone() &&
++        (cont->condition() == FlagsCondition::kOverflow ||
++         cont->condition() == FlagsCondition::kNotOverflow) &&
++        (arch_opcode == kE2kAddOvf_d || arch_opcode == kE2kSubOvf_d ||
++         arch_opcode == kE2kAddOvf_w || arch_opcode == kE2kSubOvf_w)) {
++      inputs[input_count++] = g.UseUniqueRegister(left_node);
++    } else {
++      inputs[input_count++] = g.UseRegister(left_node);
++    }
+     inputs[input_count++] = g.UseOperand(right_node, opcode);
+   }
+ 

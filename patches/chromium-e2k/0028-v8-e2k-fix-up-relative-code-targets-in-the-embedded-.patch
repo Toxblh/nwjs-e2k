@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Mon, 12 Oct 2026 20:30:54 +0100
+Subject: [PATCH 28/99] v8: e2k: fix up relative code targets in the embedded
+ blob
+
+---
+ chromium/v8/src/snapshot/embedded/embedded-data.cc | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/chromium/v8/src/snapshot/embedded/embedded-data.cc b/chromium/v8/src/snapshot/embedded/embedded-data.cc
+index 6323ee4982..d78787d71c 100644
+--- a/chromium/v8/src/snapshot/embedded/embedded-data.cc
++++ b/chromium/v8/src/snapshot/embedded/embedded-data.cc
+@@ -189,7 +189,8 @@ void FinalizeEmbeddedCodeTargets(Isolate* isolate, EmbeddedData* blob) {
+ #if defined(V8_TARGET_ARCH_X64) || defined(V8_TARGET_ARCH_ARM64) ||     \
+     defined(V8_TARGET_ARCH_ARM) || defined(V8_TARGET_ARCH_IA32) ||      \
+     defined(V8_TARGET_ARCH_S390X) || defined(V8_TARGET_ARCH_RISCV64) || \
+-    defined(V8_TARGET_ARCH_LOONG64) || defined(V8_TARGET_ARCH_RISCV32)
++    defined(V8_TARGET_ARCH_LOONG64) || defined(V8_TARGET_ARCH_RISCV32) || \
++    defined(V8_TARGET_ARCH_E2K)
+     // On these platforms we emit relative builtin-to-builtin
+     // jumps for isolate independent builtins in the snapshot. This fixes up the
+     // relative jumps to the right offsets in the snapshot.

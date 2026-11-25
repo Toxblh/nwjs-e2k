@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 06:57:49 +0100
+Subject: [PATCH 43/99] v8: e2k: stack checks of the interpreter and baseline
+ entries are rare branches
+
+---
+ chromium/v8/src/builtins/e2k/builtins-e2k.cc | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/chromium/v8/src/builtins/e2k/builtins-e2k.cc b/chromium/v8/src/builtins/e2k/builtins-e2k.cc
+index f6d8b21627..b535044a17 100644
+--- a/chromium/v8/src/builtins/e2k/builtins-e2k.cc
++++ b/chromium/v8/src/builtins/e2k/builtins-e2k.cc
+@@ -1057,8 +1057,11 @@ void Builtins::Generate_BaselineOutOfLinePrologue(MacroAssembler* masm) {
+     __ Sub_d(sp_minus_frame_size, sp, frame_size);
+     Register interrupt_limit = temps.Acquire();
+     __ LoadStackLimit(interrupt_limit, StackLimitKind::kInterruptStackLimit);
+-    __ Branch(&call_stack_guard, Uless, sp_minus_frame_size,
+-              Operand(interrupt_limit));
++    {
++      MacroAssembler::RareBranchScope rare(masm, true);
++      __ Branch(&call_stack_guard, Uless, sp_minus_frame_size,
++                Operand(interrupt_limit));
++    }
+   }
+ 
+   // Do "fast" return to the caller pc in ra.
+@@ -1215,7 +1218,10 @@ void Builtins::Generate_InterpreterEntryTrampoline(
+     // Do a stack check to ensure we don't go over the limit.
+     __ Sub_d(a6, sp, Operand(a5));
+     __ LoadStackLimit(a2, StackLimitKind::kRealStackLimit);
+-    __ Branch(&stack_overflow, lo, a6, Operand(a2));
++    {
++      MacroAssembler::RareBranchScope rare(masm, true);
++      __ Branch(&stack_overflow, lo, a6, Operand(a2));
++    }
+ 
+     // If ok, push undefined as the initial value for all register file entries.
+     Label loop_header;
+@@ -1265,7 +1271,10 @@ void Builtins::Generate_InterpreterEntryTrampoline(
+   // TODO(solanes): Merge with the real stack limit check above.
+   Label stack_check_interrupt, after_stack_check_interrupt;
+   __ LoadStackLimit(a5, StackLimitKind::kInterruptStackLimit);
+-  __ Branch(&stack_check_interrupt, lo, sp, Operand(a5));
++  {
++    MacroAssembler::RareBranchScope rare(masm, true);
++    __ Branch(&stack_check_interrupt, lo, sp, Operand(a5));
++  }
+   __ bind(&after_stack_check_interrupt);
+ 
+   // The accumulator is already loaded with undefined.

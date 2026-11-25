@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Thu, 15 Oct 2026 15:47:14 +0100
+Subject: [PATCH 83/99] v8: e2k: emit the table of MacroAssembler::Switch as
+ jumps in instruction slots
+
+The loong64 code put an inline table of 8-byte label addresses after the jump,
+which leaves the code after it off the 32-byte grid of instruction slots
+("(target_pos - pos) % kInstrSize == 0" on the next branch). Switch is used
+by Maglev only; it now emits one jump per slot, like GenerateSwitchTable of
+TurboFan, and keeps the bounds check and the case base.
+
+Fixes maglev/regress/regress-crbug-1403399, turbolev/switch and
+turboshaft/branch-elim-switch-4 in the Maglev variants.
+---
+ .../v8/src/codegen/e2k/macro-assembler-e2k.cc | 29 ++++++-------------
+ 1 file changed, 9 insertions(+), 20 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+index e439b8130f..a9884de310 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+@@ -4236,31 +4236,20 @@ void MacroAssembler::Call(Label* target) {
+ void MacroAssembler::Switch(Register scratch, Register value,
+                             int case_value_base, Label** labels,
+                             int num_labels) {
+-  Register table = scratch;
+-  Label fallthrough, jump_table;
++  // A table of jumps, one per instruction slot, as in GenerateSwitchTable.
++  // An inline table of 8-byte label addresses (the loong64 code) would leave
++  // the code after it off the kInstrSize grid of the instruction slots.
++  Label fallthrough;
+   if (case_value_base != 0) {
+     Sub_d(value, value, Operand(case_value_base));
+   }
+   Branch(&fallthrough, uge, value, Operand(num_labels));
+-  LoadLabelRelative(table, &jump_table);
+-  Alsl_d(table, value, table, kSystemPointerSizeLog2);
+-  Ld_d(table, MemOperand(table, 0));
+-  Jump(table);
+-  // Calculate label area size and let MASM know that it will be impossible to
+-  // create the trampoline within the range. That forces MASM to create the
+-  // trampoline right here if necessary, i.e. if label area is too large and
+-  // all unbound forward branches cannot be bound over it.
+-
+-  static constexpr int mask = kInstrSize - 1;
+-  int aligned_label_area_size = num_labels * kUIntptrSize + kSystemPointerSize;
+-  int instructions_per_label_area =
+-      ((aligned_label_area_size + mask) & ~mask) >> kInstrSizeLog2;
+-  BlockTrampolinePoolFor(instructions_per_label_area);
+-  // Emit the jump table inline, under the assumption that it's not too big.
+-  Align(kSystemPointerSize);
+-  bind(&jump_table);
++  BlockTrampolinePoolFor(3 + num_labels);
++  pcaddi(scratch, 3);
++  alsl_d(scratch, value, scratch, kInstrSizeLog2);
++  jirl(zero_reg, scratch, 0);
+   for (int i = 0; i < num_labels; ++i) {
+-    dd(labels[i]);
++    b(labels[i]);
+   }
+   bind(&fallthrough);
+ }

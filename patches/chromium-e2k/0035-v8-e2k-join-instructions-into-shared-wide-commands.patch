@@ -1,0 +1,1070 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 03:24:24 +0100
+Subject: [PATCH 35/99] v8: e2k: join instructions into shared wide commands
+
+An instruction no longer owns a 32-byte slot. The layer keeps the last
+wide command of the code and puts the operations of the next instruction
+into it when that keeps the meaning: they must not read a register or a
+predicate the command writes, must not write one it writes, must not
+touch memory after its store, and nothing joins a command that loads
+(measured slower). Otherwise the command goes right after the last one.
+The end of the code is rewritten in place, so it always ends on a slot
+boundary and every position anyone can know is still a slot boundary.
+
+Joining stops when the position has been asked for (pc_offset() marks
+the slot closed: labels, return addresses, relocations), inside
+BlockTrampolinePool scopes, where instructions are counted, and around
+instructions that use their own address or are patched: branches,
+pcaddi, li64, nop.
+
+Memory accesses of one command go in channel order: a load placed above
+a store sees the new value, so joined loads are kept below the store.
+
+Assembler::li is a constant that is not patchable and can join.
+
+E2K_NO_FUSE=1 gives a slot per instruction as before, E2K_FUSE_STATS=1
+prints the totals at exit, =2 also who emitted instructions that found
+the slot closed. The embedded blob shrinks from 18.4 to 12.4 MB.
+---
+ chromium/v8/src/codegen/assembler.h          |  21 +-
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc | 160 ++++++++++++--
+ chromium/v8/src/codegen/e2k/assembler-e2k.h  |  18 +-
+ chromium/v8/src/codegen/e2k/e2k_asm.h        | 221 +++++++++++++++----
+ chromium/v8/src/codegen/e2k/la_asm.h         | 197 ++++++++++++-----
+ 5 files changed, 492 insertions(+), 125 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/assembler.h b/chromium/v8/src/codegen/assembler.h
+index cfbdd6b0ca..fb119a261f 100644
+--- a/chromium/v8/src/codegen/assembler.h
++++ b/chromium/v8/src/codegen/assembler.h
+@@ -392,9 +392,19 @@ class V8_EXPORT_PRIVATE AssemblerBase : public Malloced {
+   // cross-snapshotting.
+   static void QuietNaN(Tagged<HeapObject> nan) {}
+ 
+-  int pc_offset() const { return static_cast<int>(pc_ - buffer_start_); }
++  int pc_offset() const {
++#if V8_TARGET_ARCH_E2K
++    slot_open_ = false;
++#endif
++    return static_cast<int>(pc_ - buffer_start_);
++  }
+ 
+-  Address current_pc() const { return reinterpret_cast<Address>(pc_); }
++  Address current_pc() const {
++#if V8_TARGET_ARCH_E2K
++    slot_open_ = false;
++#endif
++    return reinterpret_cast<Address>(pc_);
++  }
+ 
+   void skip_bytes(int num_bytes) { pc_ += num_bytes; }
+ 
+@@ -521,6 +531,13 @@ class V8_EXPORT_PRIVATE AssemblerBase : public Malloced {
+   // The program counter, which points into the buffer above and moves forward.
+   // TODO(jkummerow): This should probably have type {Address}.
+   uint8_t* pc_;
++#if V8_TARGET_ARCH_E2K
++  // The e2k assembler packs an instruction into the wide commands of the
++  // instructions before it, rewriting the end of the code, for as long as
++  // nobody has asked where the code ends: that position may then be a branch
++  // target, a return address or the start of code that is patched later.
++  mutable bool slot_open_ = false;
++#endif
+ 
+   void set_constant_pool_available(bool available) {
+     if (V8_EMBEDDED_CONSTANT_POOL_BOOL) {
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index 739a07dbcf..be7a148d67 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -7,9 +7,20 @@
+ #define LA_ASM_V8
+ #include "src/codegen/e2k/la_asm.h"
+ 
++#include <execinfo.h>
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <map>
++#include <vector>
++
+ #if V8_TARGET_ARCH_E2K
+ 
+ #include "src/base/cpu/cpu.h"
++#include "src/base/platform/mutex.h"
+ #include "src/codegen/flush-instruction-cache.h"
+ #include "src/common/code-memory-access-inl.h"
+ #include "src/codegen/e2k/assembler-e2k-inl.h"
+@@ -966,34 +977,146 @@ void Assembler::label_at_put(Label* L, int at_offset) {
+ //------- Branch and jump instructions --------
+ 
+ // Every LoongArch instruction is assembled as e2k code by la::Assembler
+-// (la_asm.h) into a scratch buffer and appended to the code: one 32-byte slot
+-// per instruction, two for a few of them.
++// (la_asm.h). The code is a sequence of 32-byte slots, and every position
++// anyone can know (pc_offset()) is a slot boundary, but an instruction does
++// not own a slot: the layer puts it into the wide commands of the
++// instructions before it where that keeps the meaning, rewriting the end of
++// the code. That stops as soon as the position has been asked for
++// (slot_open_), inside BlockTrampolinePool scopes, which mark sequences
++// whose instructions are counted, and after anything not emitted here.
+ namespace {
+-la::Assembler& Scratch() {
++struct Layer {
++  la::Assembler la;
++  const Assembler* owner = nullptr;
++  int base = 0;     // pc offset of the layer's offset 0
++  int settled = 0;  // layer offset the current instruction may rewrite from
++  int start = 0;    // how the current instruction found the code: a kStart*
++  la::Assembler::Counts counted = {0, 0, 0, 0, 0};
++};
++
++// E2K_NO_FUSE=1: a slot per instruction. E2K_FUSE_STATS=1: totals at exit;
++// =2: also who emitted the instructions that could not use an open slot
++// because the position had been asked for (return addresses, see nm).
++enum {
++  kInstructions, kOwn, kCommands, kJoined, kBytes,
++  kStartOpen, kStartAsked, kStartBlocked, kStartMoved,  // of all instructions
++  kLostAsked, kLostBlocked, kLostMoved,  // of those that could have joined
++  kNumStats
++};
++std::atomic<long> stats[kNumStats];
++int stats_level = 0;
++base::Mutex* lost_mutex = nullptr;
++std::map<std::array<void*, 3>, long>* lost = nullptr;
++
++void PrintStats() {
++  long n[kNumStats];
++  for (int i = 0; i < kNumStats; i++) n[i] = stats[i].load();
++  if (!n[kCommands]) return;
++  fprintf(stderr,
++          "e2k fuse: %ld instructions (%ld with slots of their own), %ld "
++          "commands (%ld joins), %ld slots: %.2f per command, %.2f per slot\n"
++          "e2k fuse: code found open %ld, position asked %ld, blocked %ld, "
++          "other code %ld; of the instructions that can join: asked %ld, "
++          "blocked %ld, other code %ld\n",
++          n[kInstructions], n[kOwn], n[kCommands], n[kJoined],
++          n[kBytes] / kInstrSize, double(n[kInstructions]) / n[kCommands],
++          double(n[kInstructions]) * kInstrSize / n[kBytes], n[kStartOpen],
++          n[kStartAsked], n[kStartBlocked], n[kStartMoved], n[kLostAsked],
++          n[kLostBlocked], n[kLostMoved]);
++  if (!lost) return;
++  std::vector<std::pair<long, std::array<void*, 3>>> top;
++  for (auto& e : *lost) top.push_back({e.second, e.first});
++  std::sort(top.begin(), top.end(), std::greater<>());
++  fprintf(stderr, "e2k fuse: PrintStats is at %p\n",
++          reinterpret_cast<void*>(&PrintStats));
++  for (size_t i = 0; i < top.size() && i < 60; i++) {
++    fprintf(stderr, "e2k fuse: %8ld %p %p %p\n", top[i].first,
++            top[i].second[0], top[i].second[1], top[i].second[2]);
++  }
++}
++
++Layer& TheLayer() {
+   // One per thread, never destroyed.
+-  static thread_local la::Assembler* assembler = new la::Assembler;
+-  assembler->clear();
+-  return *assembler;
++  static thread_local Layer* layer = [] {
++    static const bool fuse = [] {
++      const char* level = getenv("E2K_FUSE_STATS");
++      stats_level = level ? atoi(level) : 0;
++      if (stats_level >= 2) {
++        lost_mutex = new base::Mutex;
++        lost = new std::map<std::array<void*, 3>, long>;
++      }
++      if (stats_level) atexit(PrintStats);
++      return getenv("E2K_NO_FUSE") == nullptr;
++    }();
++    Layer* l = new Layer;
++    l->la.set_fuse(fuse);
++    return l;
++  }();
++  return *layer;
+ }
+ }  // namespace
+ 
+-#define LA(call)                                                      \
+-  do {                                                                \
+-    la::Assembler& la_scratch = Scratch();                            \
+-    la_scratch.call;                                                  \
+-    EmitSlots(la_scratch.code().data(),                               \
+-              static_cast<int>(la_scratch.code().size()));            \
++#define LA(call)                       \
++  do {                                 \
++    la::Assembler& la_ = OpenSlots();  \
++    la_.call;                          \
++    EmitSlots(la_);                    \
+   } while (false)
+ 
+-void Assembler::EmitSlots(const uint8_t* code, int size) {
+-  // Instructions and labels sit on slot boundaries: branch offsets count
+-  // slots. Data emitted before (jump tables) is padded.
+-  while (pc_offset() & (kInstrSize - 1)) db(0);
++la::Assembler& Assembler::OpenSlots() {
++  // Data emitted before (jump tables) is padded up to a slot.
++  while ((pc_ - buffer_start_) & (kInstrSize - 1)) db(0);
++  Layer& l = TheLayer();
++  int pos = static_cast<int>(pc_ - buffer_start_);
++  bool blocked =
++      is_trampoline_pool_blocked() || pos < no_trampoline_pool_before_;
++  bool moved =
++      l.owner != this || l.base + static_cast<int>(l.la.pc_offset()) != pos;
++  if (!slot_open_ || blocked || moved) {
++    l.la.clear();
++    l.owner = this;
++    l.base = pos;
++  }
++  l.start = blocked      ? kStartBlocked
++            : moved      ? kStartMoved
++            : slot_open_ ? kStartOpen
++                         : kStartAsked;
++  l.settled = static_cast<int>(l.la.settled());
++  return l.la;
++}
++
++void Assembler::EmitSlots(const la::Assembler& la) {
++  Layer& l = TheLayer();
++  int size = static_cast<int>(la.pc_offset()) - l.settled;
+   if (!is_buffer_growth_blocked()) {
+     while (buffer_space() <= kGap + size) GrowBuffer();
+   }
+-  memcpy(pc_, code, size);
++  pc_ = buffer_start_ + l.base + l.settled;
++  memcpy(pc_, la.code().data() + l.settled, size);
+   pc_ += size;
++  slot_open_ = !is_trampoline_pool_blocked() &&
++               pc_ - buffer_start_ >= no_trampoline_pool_before_;
++  if (stats_level) {
++    const la::Assembler::Counts& c = la.counts();
++    bool own = c.own != l.counted.own;
++    stats[kInstructions] += c.instructions - l.counted.instructions;
++    stats[kOwn] += own;
++    stats[kCommands] += c.commands - l.counted.commands;
++    stats[kJoined] += c.joined - l.counted.joined;
++    stats[kBytes] += c.bytes - l.counted.bytes;
++    l.counted = c;
++    stats[l.start]++;
++    if (!own && l.start != kStartOpen) {
++      stats[l.start - kStartAsked + kLostAsked]++;
++      if (lost && l.start == kStartAsked) {
++        // Frames 0 and 1 are this function and the instruction.
++        void* frames[5] = {};
++        backtrace(frames, 5);
++        base::MutexGuard guard(lost_mutex);
++        (*lost)[{frames[2], frames[3], frames[4]}]++;
++      }
++    }
++  }
+ }
+ 
+ void Assembler::EnterFromC(int num_args) { LA(enter(num_args)); }
+@@ -1005,6 +1128,7 @@ void Assembler::TailCallC(int arg, int32_t offset) {
+   LA(tail_c(arg, offset));
+ }
+ void Assembler::li64(Register rd, int64_t imm) { LA(li64(rd, imm)); }
++void Assembler::li(Register rd, int64_t imm) { LA(li(rd, imm)); }
+ 
+ void Assembler::b(int32_t offset) { LA(b(offset)); }
+ void Assembler::bl(int32_t offset) { LA(bl(offset)); }
+@@ -4774,6 +4898,8 @@ void Assembler::dd(Label* label) {
+ }
+ 
+ void Assembler::RecordRelocInfo(RelocInfo::Mode rmode, intptr_t data) {
++  // The instruction that follows is found by this position.
++  slot_open_ = false;
+   if (!ShouldRecordRelocInfo(rmode)) return;
+   // We do not try to reuse pool constants.
+   RelocInfo rinfo(reinterpret_cast<Address>(pc_), rmode, data);
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index 867733096d..c90d2093c5 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -19,6 +19,10 @@
+ #include "src/objects/contexts.h"
+ #include "src/objects/smi.h"
+ 
++namespace la {
++class Assembler;
++}  // namespace la
++
+ namespace v8 {
+ namespace internal {
+ 
+@@ -393,6 +397,8 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   // rd = imm in one instruction whose value can be read and replaced
+   // (target_address_at, set_target_value_at).
+   void li64(Register rd, int64_t imm);
++  // rd = imm, not patchable.
++  void li(Register rd, int64_t imm);
+ 
+   // --------Branch-and-jump-instructions----------
+   // We don't use likely variant of instructions.
+@@ -1645,7 +1651,10 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+     }
+   }
+ 
+-  void set_pc_for_safepoint() { pc_for_safepoint_ = pc_; }
++  void set_pc_for_safepoint() {
++    slot_open_ = false;
++    pc_for_safepoint_ = pc_;
++  }
+ 
+  private:
+   // Buffer size and constant pool distance are checked together at regular
+@@ -1695,8 +1704,11 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   template <typename T>
+   inline void EmitHelper(T x);
+   inline void EmitHelper(Instr x);
+-  // Appends instructions assembled by the la_asm.h layer.
+-  void EmitSlots(const uint8_t* code, int size);
++  // Instructions are assembled by the la_asm.h layer: OpenSlots() gives it
++  // positioned at the end of the code, EmitSlots() copies back what the
++  // instruction added and what it rewrote of the last slots.
++  la::Assembler& OpenSlots();
++  void EmitSlots(const la::Assembler& la);
+ 
+   void GenB(Opcode opcode, Register rj, int32_t si21);  // opcode:6
+   void GenB(Opcode opcode, CFRegister cj, int32_t si21, bool isEq);
+diff --git a/chromium/v8/src/codegen/e2k/e2k_asm.h b/chromium/v8/src/codegen/e2k/e2k_asm.h
+index 52bc5dc565..5a3a1cecaa 100644
+--- a/chromium/v8/src/codegen/e2k/e2k_asm.h
++++ b/chromium/v8/src/codegen/e2k/e2k_asm.h
+@@ -64,7 +64,31 @@ struct Src2 {
+   static Src2 lit64(int64_t v) { Src2 s(v); s.cls = 2; return s; }
+ };
+ 
+-class Assembler {
++struct Op { uint8_t cop, opce, opc2, opce2; bool w32; uint8_t plain, ales; };
++struct Lit { int64_t v; Label* label; uint8_t cls; int8_t ch; };   // cls: 0/1/2 = 16/32/64 bits; ch < 0: setwd
++
++// One wide command while it is built.  It is a plain copyable value: end()
++// leaves it as it is, so the command just written can be taken back
++// (Assembler::join) and extended, or saved and written again.
++struct Command {
++  uint32_t als_[6]; uint16_t ales_[6]; int als_mask_, ales_mask_;
++  int order_[6], norder_;                      // channels in the order the operations were given
++  Pred rlp_[6], mrgc_[6]; int rlp_mask_, mrgc_mask_;
++  uint8_t elp_[4]; uint16_t clp_[3]; int pls_used_;
++  uint32_t ss_, cs0_, cs1_; bool has_ss_, has_cs0_, has_cs1_, setwd_, setbr_, mas_;
++  Lit lits_[7]; int nlits_, nop_;
++  Label* cs0_label_;
++  // For join(): the operation of each channel, and what the command writes.
++  // def_ is a bit set over operand codes (registers), pdef_ over predicate
++  // numbers; g* are those of the operations given since the last join(),
++  // which see one another's old values.
++  Op op_[6]; int16_t src3_[6]; uint8_t mem_[6];        // mem_: 1 load, 2 store
++  uint64_t def_[4], gdef_[4]; uint32_t pdef_, gpdef_;
++  bool store_, gstore_, alone_, join_, bad_;
++  int8_t map_[6];                                      // channel named by the caller -> channel taken
++};
++
++class Assembler : public Command {
+  public:
+   // `base` is the address the first byte will have at run time.
+   explicit Assembler(uint64_t base = 0) : base_(base) { reset(); }
+@@ -94,6 +118,32 @@ class Assembler {
+   // do not pack into four LTS, too many conditions, or more than 64 bytes.
+   bool fits() const { Plan p; return plan(p); }
+ 
++  // ---- joining operations to the command written last ----------------------
++  // join(at) takes back the command that end() wrote at offset `at` (nothing
++  // else was built since).  Operations given after it become part of that
++  // command if that keeps the meaning "the old command, then these": they
++  // must not read a register or a predicate the command writes (all
++  // operations of a command read the state before it), must not write one it
++  // writes, must not touch memory after its store; a write to what the
++  // command only reads is fine.  The channel an operation names is a wish:
++  // it gets any free channel it can run in, an operation placed earlier
++  // moving aside if that helps; sm(), when() and MERGE follow.  When it does
++  // not work out joined() is false and the state is garbage: put a saved
++  // Command back with reopen() and end().
++  void join(size_t at) {
++    reopen(at);
++    for (int i = 0; i < 4; i++) { def_[i] |= gdef_[i]; gdef_[i] = 0; }
++    pdef_ |= gpdef_; gpdef_ = 0; store_ |= gstore_; gstore_ = false;
++    memset(map_, -1, sizeof map_); join_ = true; bad_ = false;
++  }
++  bool joined() const { return !bad_ && fits(); }
++  // A command with a control transfer (the code after it may be entered from
++  // elsewhere), a CS1 syllable (window, call, mas, wait) or a write to a
++  // state register takes nothing more.
++  bool joinable() const { return !alone_ && !has_ss_ && !has_cs1_; }
++  // The code is cut at `at` and the current state is the command to write there.
++  void reopen(size_t at) { assert(at <= buf_.size()); buf_.resize(at); open_ = true; }
++
+   // ---- arithmetic-logic operations, generated from opcodes.inc -----------
+   //   ALOPF1/11   name(ch, src1, src2, dst)
+   //   ALOPF2/12   name(ch, src2, dst)
+@@ -103,27 +153,27 @@ class Assembler {
+   //   MERGE       name(ch, src1, src2, dst, pred)         dst = pred ? src2 : src1
+   //   ALOPF15     name(ch, src2, state_register)          rws/rwd
+   //   ALOPF16     name(ch, state_register, dst)           rrs/rrd
+-  struct Op { uint8_t cop, opce, opc2, opce2; bool w32; uint8_t plain, ales; };
+ #define E2K_SREG(...)
+ #define E2K_OP(name, fmt, cop, opce, opc2, opce2, w32, plain, ales) \
+   E2K_##fmt(name, (Op{cop, opce, opc2, opce2, bool(w32), plain, ales}))
+ #define E2K_ALOPF1(name, op) \
+-  void name(int ch, Src1 s1, Src2 s2, Reg d) { alop(op, ch, s1.code, s2, d.code); }
++  void name(int ch, Src1 s1, Src2 s2, Reg d) { use(s1.code); def(d.code); alop(op, ch, s1.code, s2, d.code); }
+ #define E2K_ALOPF11 E2K_ALOPF1
+-#define E2K_ALOPF3 E2K_ALOPF1
++#define E2K_ALOPF3(name, op) \
++  void name(int ch, Src1 s1, Src2 s2, Reg d) { use(s1.code); use(d.code); alop(op, ch, s1.code, s2, d.code, -1, 2); }
+ #define E2K_ALOPF2(name, op) \
+-  void name(int ch, Src2 s2, Reg d) { Op o = op; alop(o, ch, o.opce, s2, d.code); }
++  void name(int ch, Src2 s2, Reg d) { Op o = op; def(d.code); alop(o, ch, o.opce, s2, d.code); }
+ #define E2K_ALOPF12 E2K_ALOPF2
+ #define E2K_ALOPF7(name, op) \
+-  void name(int ch, Src1 s1, Src2 s2, Pred p) { Op o = op; assert(!p.negated); alop(o, ch, s1.code, s2, uint8_t(o.opce << 5 | p.n)); }
++  void name(int ch, Src1 s1, Src2 s2, Pred p) { Op o = op; assert(!p.negated); use(s1.code); defp(p); alop(o, ch, s1.code, s2, uint8_t(o.opce << 5 | p.n)); }
+ #define E2K_ALOPF21(name, op) \
+-  void name(int ch, Src1 s1, Src2 s2, Reg s3, Reg d) { alop(op, ch, s1.code, s2, d.code, s3.code); }
++  void name(int ch, Src1 s1, Src2 s2, Reg s3, Reg d) { use(s1.code); use(s3.code); def(d.code); alop(op, ch, s1.code, s2, d.code, s3.code); }
+ #define E2K_MERGE(name, op) \
+-  void name(int ch, Src1 s1, Src2 s2, Reg d, Pred p) { alop(op, ch, s1.code, s2, d.code); mrgc_[ch] = p; mrgc_mask_ |= 1 << ch; }
++  void name(int ch, Src1 s1, Src2 s2, Reg d, Pred p) { use(s1.code); def(d.code); usep(p); ch = alop(op, ch, s1.code, s2, d.code); if (ch >= 0) { mrgc_[ch] = p; mrgc_mask_ |= 1 << ch; } }
+ #define E2K_ALOPF15(name, op) \
+-  void name(int ch, Src2 s2, Sreg d) { Op o = op; alop(o, ch, o.opce, s2, uint8_t(d)); }
++  void name(int ch, Src2 s2, Sreg d) { Op o = op; alone(); alop(o, ch, o.opce, s2, uint8_t(d)); }
+ #define E2K_ALOPF16(name, op) \
+-  void name(int ch, Sreg s, Reg d) { alop(op, ch, uint8_t(s), 0, d.code); }
++  void name(int ch, Sreg s, Reg d) { first(); def(d.code); alop(op, ch, uint8_t(s), 0, d.code); }
+ #include "opcodes.inc"
+ #undef E2K_ALOPF1
+ #undef E2K_ALOPF11
+@@ -141,16 +191,18 @@ class Assembler {
+   // dst = address of label
+   void lea(int ch, Label* l, Reg d) { addd(ch, 0, l, d); }
+   // Modifiers of the operation already placed in channel `ch`.
+-  void sm(int ch) { assert(als_mask_ >> ch & 1); als_[ch] |= 0x80000000u; }             // `op,ch,sm`
+-  void when(int ch, Pred p) { assert(als_mask_ >> ch & 1); rlp_[ch] = p; rlp_mask_ |= 1 << ch; }  // `op ? %pred`
++  void sm(int ch) { if ((ch = taken(ch)) >= 0) als_[ch] |= 0x80000000u; }             // `op,ch,sm`
++  void when(int ch, Pred p) { usep(p); if ((ch = taken(ch)) >= 0) { rlp_[ch] = p; rlp_mask_ |= 1 << ch; } }  // `op ? %pred`
+ 
+   // ---- predicate logic (PLS) ---------------------------------------------
+   void pass(Pred src, Lp dst) {            // pass %predN, @p0..@p3
+     assert(open_ && !src.negated && !dst.negated && dst.n < 4);
++    first(); usep(src);
+     elp_[dst.n] = uint8_t(0x60 | src.n); pls_used_ |= 1 << dst.n / 2;
+   }
+   void pass(Lp src, Pred dst) {            // pass @p4..@p6, %predN
+     assert(open_ && !src.negated && !dst.negated && src.n >= 4 && src.n <= 6);
++    first(); defp(dst);
+     clp_[src.n - 4] |= uint16_t(0x20 | dst.n); pls_used_ |= 1 << (src.n - 4);
+   }
+   void andp(Lp a, Lp b, Lp dst) { clp(0, a, b, dst); }
+@@ -164,17 +216,19 @@ class Assembler {
+   void return_(Ctpr c) { assert(c == ctpr3); cs0(0xf0000000u, nullptr); }
+   void movtd(Src2 src, Ctpr c) { alop(Op{0x61, 0xc0, 0, 0, false, 0x01, 0}, 0, 0xc0, src, uint8_t(0xd0 | c)); }
+   void ct(Ctpr c) { ss(0xc0000000u | uint32_t(c) << 10 | 0x20); }
+-  void ct(Ctpr c, Pred p) { ss(0xc0000000u | uint32_t(c) << 10 | cond(p)); }
++  void ct(Ctpr c, Pred p) { usep(p); ss(0xc0000000u | uint32_t(c) << 10 | cond(p)); }
+   void call(Ctpr c, int wbs) { ct(c); cs1(0x50000000u | uint32_t(wbs)); }
+   void call(Ctpr c, int wbs, Pred p) { ct(c, p); cs1(0x50000000u | uint32_t(wbs)); }
+   void ibranch(Label* l) { ss(0xc0000020u); cs0(0, l); }
+-  void ibranch(Label* l, Pred p) { ss(0xc0000000u | cond(p)); cs0(0, l); }
++  void ibranch(Label* l, Pred p) { usep(p); ss(0xc0000000u | cond(p)); cs0(0, l); }
+   // `ibranch l ? %MLOCK` (as also spells it `rbranch l`): taken when the store
+   // with mas = 2 of this command lost the lock taken by a load with mas = 7.
+-  void ibranch_mlock(Label* l) { ss(0xc0000100u); cs0(0, l); }
++  void ibranch_mlock(Label* l) { alone(); ss(0xc0000100u); cs0(0, l); }
+   // `mas = v` of the load or store in channel 0, 2, 3 or 5.
+   void mas(int ch, int v) {
+     static const int8_t shift[6] = {21, -1, 14, 7, -1, 0};
++    alone();
++    if (bad_) return;
+     assert(open_ && shift[ch] >= 0 && v > 0 && v < 128 && (!has_cs1_ || mas_));
+     if (!mas_) cs1_ = 0x60000000u;
+     mas_ = has_cs1_ = true; cs1_ |= uint32_t(v) << shift[ch];
+@@ -185,6 +239,7 @@ class Assembler {
+   // ---- procedure window --------------------------------------------------
+   void setwd(int wsz, bool nfx = true, bool dbl = false) {
+     assert(!setwd_ && wsz >= 0 && wsz <= 0x70);
++    alone();
+     setwd_ = true; lit(-1, int64_t(wsz) << 5 | int64_t(nfx) << 4 | int64_t(dbl) << 3, nullptr, 1); setbr(0);
+   }
+   void setbn(int rsz, int rbs, int rcur) {
+@@ -194,7 +249,6 @@ class Assembler {
+   void setbp(int psz) { assert(psz >= 0 && psz < 32); setbr(1u << 27 | uint32_t(psz) << 18); }
+ 
+  private:
+-  struct Lit { int64_t v; Label* label; uint8_t cls; int8_t ch; };   // cls: 0/1/2 = 16/32/64 bits; ch < 0: setwd
+   struct Half { int8_t owner; uint8_t sub; };                        // literal and which 16-bit piece of it
+   struct Plan {
+     Half half_lts[8]; uint8_t choice[7]; unsigned best;
+@@ -207,14 +261,94 @@ class Assembler {
+     has_ss_ = has_cs0_ = has_cs1_ = setwd_ = setbr_ = mas_ = false;
+     nop_ = norder_ = nlits_ = 0; cs0_label_ = nullptr;
+     memset(elp_, 0, sizeof elp_); memset(clp_, 0, sizeof clp_);
++    memset(def_, 0, sizeof def_); memset(gdef_, 0, sizeof gdef_); memset(mem_, 0, sizeof mem_);
++    pdef_ = gpdef_ = 0; store_ = gstore_ = alone_ = join_ = bad_ = false;
+   }
+-  void word(uint32_t w) { for (int i = 0; i < 4; i++) buf_.push_back(uint8_t(w >> (8 * i))); }
+-  void als(int ch, uint32_t w) {
+-    assert(open_ && ch >= 0 && ch < 6 && !(als_mask_ & (1 << ch)));
+-    als_mask_ |= 1 << ch; als_[ch] = w; order_[norder_++] = ch;
++
++  // What an operation reads and writes; a clash with the joined command sets bad_.
++  // Operand codes 0xc0..0xdf are literals and %empty.
++  static bool has(const uint64_t* set, int k) { return set[(k & 0xff) >> 6] >> (k & 63) & 1; }
++  static bool is_reg(int code) { return code < 0xc0 || code >= 0xe0; }
++  void use(int code) { if (is_reg(code) && has(def_, code)) bad_ = true; }
++  void use(const Src2& s) { if (s.kind == Src2::kReg) use(s.code); }
++  void def(int code) {
++    if (!is_reg(code)) return;
++    if (has(def_, code)) bad_ = true;
++    gdef_[(code & 0xff) >> 6] |= uint64_t(1) << (code & 63);
++  }
++  void usep(Pred p) { if (pdef_ >> p.n & 1) bad_ = true; }
++  void defp(Pred p) { if (pdef_ >> p.n & 1) bad_ = true; gpdef_ |= 1u << p.n; }
++  void first() { if (join_) bad_ = true; }           // only in the operations a command starts with
++  void alone() { first(); alone_ = true; }           // and nothing joins them either
++  int taken(int ch) {
++    if (join_) ch = bad_ ? -1 : map_[ch];
++    assert(bad_ || (ch >= 0 && als_mask_ >> ch & 1));
++    return ch;
++  }
++  // Memory is accessed in channel order: a load in a channel above the
++  // store's sees the new value, below it the old one (measured,
++  // ideas/72-load-store-one-command).  Every load of a command with a store
++  // was given before the store or together with it and wants the old value.
++  // GNU as refuses a store in channel 5 with a load in 0 and a store in 2
++  // with a load in 3.
++  bool mem_ok(int mem, int ch) const {
++    for (int c = 0; c < 6; c++)
++      if (mem && mem_[c] && mem_[c] != mem && (mem == 2) != (c < ch)) return false;
++    if (mem == 2) return !(ch == 5 && mem_[0] == 1) && !(ch == 2 && mem_[3] == 1);
++    if (mem == 1) return !(ch == 0 && mem_[5] == 2) && !(ch == 3 && mem_[2] == 2);
++    return true;
++  }
++  void put(const Op& op, int ch, uint32_t w, int src3, int mem) {
++    als_mask_ |= 1 << ch; als_[ch] = w; op_[ch] = op; src3_[ch] = int16_t(src3); mem_[ch] = uint8_t(mem);
++    if (op.ales >> ch & 1) { ales_mask_ |= 1 << ch; ales_[ch] = uint16_t(op.opc2 << 8 | (src3 < 0 ? op.opce2 : src3)); }
++  }
++  void move(int from, int to) {
++    put(op_[from], to, als_[from], src3_[from], mem_[from]);
++    als_mask_ &= ~(1 << from); ales_mask_ &= ~(1 << from); mem_[from] = 0;
++    for (int i = 0; i < norder_; i++) if (order_[i] == from) order_[i] = to;
++    for (int i = 0; i < nlits_; i++) if (lits_[i].ch == from) lits_[i].ch = int8_t(to);
++    for (int i = 0; i < 6; i++) if (map_[i] == from) map_[i] = int8_t(to);
++    if (rlp_mask_ >> from & 1) { rlp_[to] = rlp_[from]; rlp_mask_ ^= 1 << from | 1 << to; }
++    if (mrgc_mask_ >> from & 1) { mrgc_[to] = mrgc_[from]; mrgc_mask_ ^= 1 << from | 1 << to; }
+   }
++  // The channel for a joining operation: a free one it can run in, the least
++  // capable first (5 and 2 take anything simple, 1 and 4 everything but
++  // memory; loads keep below the store channels), else the channel of an
++  // operation that can step aside.
++  int place(const Op& op, int wish, int mem) {
++    static const int8_t simple[6] = {5, 2, 4, 1, 3, 0}, loads[6] = {3, 2, 0, 5, 1, 4};
++    const int8_t* pref = mem == 1 ? loads : simple;
++    unsigned can = op.plain | op.ales;
++    for (int i = 0; i < 6; i++)
++      if (int ch = pref[i]; can >> ch & 1 && !(als_mask_ >> ch & 1) && mem_ok(mem, ch)) return map_[wish] = int8_t(ch);
++    for (int i = 0; i < 6; i++) {
++      int ch = pref[i];
++      if (!(can >> ch & 1) || !(als_mask_ >> ch & 1)) continue;
++      for (int to = 5; to >= 0; to--) {
++        if (als_mask_ >> to & 1 || !((op_[ch].plain | op_[ch].ales) >> to & 1)) continue;
++        int m = mem_[ch]; mem_[ch] = 0;
++        bool ok = mem_ok(m, to);
++        if (ok) { mem_[to] = uint8_t(m); ok = mem_ok(mem, ch); mem_[to] = 0; }
++        mem_[ch] = uint8_t(m);
++        if (!ok) continue;
++        move(ch, to);
++        return map_[wish] = int8_t(ch);
++      }
++    }
++    bad_ = true;
++    return -1;
++  }
++  void word(uint32_t w) { for (int i = 0; i < 4; i++) buf_.push_back(uint8_t(w >> (8 * i))); }
+   // ALS = cop:b2:src2:b0, plus ALES = opc2:ales_lo where the channel needs it.
+-  void alop(Op op, int ch, uint8_t b2, Src2 s2, uint8_t b0, int ales_lo = -1) {
++  // Returns the channel taken, -1 when the operation does not join.
++  int alop(Op op, int ch, uint8_t b2, Src2 s2, uint8_t b0, int src3 = -1, int mem = 0) {
++    if (op.plain == 0x2d) mem = 1;                     // channels 0, 2, 3, 5: the loads
++    use(s2);
++    if (mem && store_) bad_ = true;                    // a load would see the old memory; two stores: not proven
++    if (mem == 2) gstore_ = true;
++    if (join_ && !bad_) ch = place(op, ch, mem);
++    if (bad_) return -1;
++    assert(open_ && ch >= 0 && ch < 6 && !(als_mask_ & (1 << ch)));
+     assert((op.plain | op.ales) >> ch & 1 && "operation is not available in this channel");
+     uint8_t b1 = s2.code;
+     if (s2.kind == Src2::kLabel) { b1 = 0; lit(ch, 0, s2.label, 2); }
+@@ -230,18 +364,25 @@ class Assembler {
+         lit(ch, v, nullptr, v >= -32768 && v <= 32767 ? 0 : op.w32 || (v >= INT32_MIN && v <= INT32_MAX) ? 1 : 2);
+       }
+     }
+-    als(ch, uint32_t(op.cop) << 24 | uint32_t(b2) << 16 | uint32_t(b1) << 8 | b0);
+-    if (op.ales >> ch & 1) { ales_mask_ |= 1 << ch; ales_[ch] = uint16_t(op.opc2 << 8 | (ales_lo < 0 ? op.opce2 : ales_lo)); }
++    if (bad_) return -1;
++    put(op, ch, uint32_t(op.cop) << 24 | uint32_t(b2) << 16 | uint32_t(b1) << 8 | b0, src3, mem);
++    order_[norder_++] = ch;
++    return ch;
++  }
++  void ss(uint32_t w) { first(); if (bad_) return; assert(open_ && !has_ss_); has_ss_ = true; ss_ = w; }
++  void cs0(uint32_t w, Label* l) {
++    if (has_cs0_ && join_) bad_ = true;
++    if (bad_) return;
++    assert(open_ && !has_cs0_); has_cs0_ = true; cs0_ = w; cs0_label_ = l;
+   }
+-  void ss(uint32_t w) { assert(open_ && !has_ss_); has_ss_ = true; ss_ = w; }
+-  void cs0(uint32_t w, Label* l) { assert(open_ && !has_cs0_); has_cs0_ = true; cs0_ = w; cs0_label_ = l; }
+-  void cs1(uint32_t w) { assert(open_ && !has_cs1_); has_cs1_ = true; cs1_ = w; }
++  void cs1(uint32_t w) { alone(); if (bad_) return; assert(open_ && !has_cs1_); has_cs1_ = true; cs1_ = w; }
+   // setwd, setbn and setbp share one CS1; without setwd its opcode is 4.
+-  void setbr(uint32_t w) { assert(open_ && (!has_cs1_ || setbr_)); if (!setbr_) cs1_ = 0; setbr_ = has_cs1_ = true; cs1_ |= w; }
++  void setbr(uint32_t w) { alone(); if (bad_) return; assert(open_ && (!has_cs1_ || setbr_)); if (!setbr_) cs1_ = 0; setbr_ = has_cs1_ = true; cs1_ |= w; }
+   uint32_t cs1_word() const { return setbr_ && !setwd_ ? cs1_ | 0x40000000u : cs1_; }
+   static uint32_t cond(Pred p) { return (p.negated ? 0x60u : 0x40u) | p.n; }
+   void clp(int opc, Lp a, Lp b, Lp dst) {
+     assert(open_ && !dst.negated && dst.n >= 4 && dst.n <= 6 && a.n < dst.n && b.n < dst.n);
++    first();
+     clp_[dst.n - 4] |= uint16_t(opc << 14 | a.negated << 13 | a.n << 10 | b.negated << 9 | b.n << 6);
+     pls_used_ |= 1 << (dst.n - 4);
+   }
+@@ -255,7 +396,12 @@ class Assembler {
+   // are tried, literals with fewer choices first (setwd, 64, 32, 16 bits; in
+   // the order given within a size), and the first one with the smallest mask
+   // of used halves wins (the high half of an LTS being the lower bit).
+-  void lit(int ch, int64_t v, Label* l, int cls) { assert(nlits_ < 7); lits_[nlits_++] = Lit{v, l, uint8_t(cls), int8_t(ch)}; }
++  void lit(int ch, int64_t v, Label* l, int cls) {
++    // ponytail: at most four literals in a joined command, the placement search is exhaustive
++    if (join_ && nlits_ >= 4) bad_ = true;
++    if (bad_) return;
++    assert(nlits_ < 7); lits_[nlits_++] = Lit{v, l, uint8_t(cls), int8_t(ch)};
++  }
+   static int choices(const Lit& l, uint8_t pos[11], uint8_t size[11]) {
+     if (l.ch < 0) { pos[0] = 0; size[0] = 2; return 1; }       // setwd owns LTS0
+     static const uint8_t p16[4] = {1, 0, 3, 2};
+@@ -309,13 +455,6 @@ class Assembler {
+   std::vector<uint8_t> buf_;
+   uint64_t base_;
+   bool open_ = false;
+-  uint32_t als_[6]; uint16_t ales_[6]; int als_mask_, ales_mask_;
+-  int order_[6], norder_;                      // channels in the order the operations were given
+-  Pred rlp_[6], mrgc_[6]; int rlp_mask_, mrgc_mask_;
+-  uint8_t elp_[4]; uint16_t clp_[3]; int pls_used_;
+-  uint32_t ss_, cs0_, cs1_; bool has_ss_, has_cs0_, has_cs1_, setwd_, setbr_, mas_;
+-  Lit lits_[7]; int nlits_, nop_;
+-  Label* cs0_label_;
+ };
+ 
+ inline bool Assembler::plan(Plan& p) const {
+@@ -383,17 +522,15 @@ inline bool Assembler::plan(Plan& p) const {
+ inline void Assembler::end(int min_words) {
+   assert(open_);
+   // as refuses these two pairs
+-  auto cop = [&](int ch) { return als_mask_ >> ch & 1 ? als_[ch] >> 24 & 0x7f : 0u; };
+-  auto is_load = [&](int ch) { return cop(ch) >= 0x64 && cop(ch) <= 0x67; };
+-  auto is_store = [&](int ch) { return cop(ch) >= 0x24 && cop(ch) <= 0x27; };
+-  assert(!(is_store(5) && is_load(0)) && !(is_store(2) && is_load(3)));
+-  (void)is_load; (void)is_store;
++  assert(!(mem_[5] == 2 && mem_[0] == 1) && !(mem_[2] == 2 && mem_[3] == 1));
+ 
+   Plan p;
+   bool ok = plan(p);
+   assert(ok && "literals or syllables cannot be packed into a wide command"); (void)ok;
++  uint32_t als[6];                         // the state stays as it is: see join()
++  memcpy(als, als_, sizeof als);
+   for (int i = 0; i < nlits_; i++)
+-    if (lits_[i].ch >= 0) als_[lits_[i].ch] |= uint32_t(p.ref[i]) << 8;
++    if (lits_[i].ch >= 0) als[lits_[i].ch] |= uint32_t(p.ref[i]) << 8;
+ 
+   size_t start = buf_.size();
+   int ncdsw = (p.ncds + 1) / 2, padded = (p.total + 1) & ~1;
+@@ -404,7 +541,7 @@ inline void Assembler::end(int min_words) {
+        uint32_t(ncdsw) << 16 | uint32_t(p.npls) << 18 | uint32_t(ales_mask_) << 20 | uint32_t(als_mask_) << 26);
+   if (has_ss_) word(ss_);
+   for (int i = 0; i < 6; i++)
+-    if (als_mask_ & (1 << i)) word(als_[i]);
++    if (als_mask_ & (1 << i)) word(als[i]);
+   size_t cs0_word = buf_.size();
+   if (has_cs0_) word(cs0_);
+   if (p.ales25) word(uint32_t(ales_mask_ & 4 ? ales_[2] : 0x01c0) << 16 | (ales_mask_ & 32 ? ales_[5] : 0x01c0));
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index f323a1445d..2179ceeb69 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -6,6 +6,15 @@
+ // one slot of kSlot bytes (a few take two, see NOTES.md): one or more wide
+ // commands, the last one stretched with zero words up to the slot boundary.
+ //
++// With set_fuse(true) an instruction no longer owns its slots.  Its commands
++// go into the last command of the code where that keeps the meaning (see
++// e2k::Assembler::join) and right after it otherwise; the buffer still ends
++// on a slot boundary after every instruction, the tail being rewritten by
++// the next one.  seal() makes the next instruction start at that boundary:
++// it is needed wherever the position is used as an address (a label, a
++// return address, code that is patched or read back, a count of slots).
++// Instructions that take their own address or jump seal by themselves.
++//
+ //   LA r0..r31    %r0..%r31    (%r0 must hold 0: the entry code sets it, the
+ //                               layer never writes it)
+ //   LA f0..f31    %r32..%r63
+@@ -20,6 +29,8 @@
+ #ifndef LA_ASM_H_
+ #define LA_ASM_H_
+ 
++#include <algorithm>
++
+ #ifdef LA_ASM_V8
+ #include "src/codegen/e2k/e2k_asm.h"
+ #else
+@@ -87,12 +98,11 @@ constexpr uint32_t kFCSRInvalidOpCauseBit = 0, kFCSRDivideByZeroCauseBit = 2, kF
+                    kFCSRUnderflowCauseBit = 4, kFCSRInexactCauseBit = 5;
+ #endif  // LA_ASM_V8
+ 
+-// One wide command of the current instruction; L is the last one of a
+-// one-slot instruction, L2 of a two-slot one.
+-#define C(...) do { cmd(); __VA_ARGS__; end(); } while (0)
+-#define L(...) do { cmd(); __VA_ARGS__; last(1); } while (0)
+-#define L2(...) do { cmd(); __VA_ARGS__; last(2); } while (0)
+-#define LF(...) do { cmd(); __VA_ARGS__; finish(); } while (0)
++// One wide command of the current instruction, as it would be alone: its
++// operations read the state before it.  They are given twice when they do
++// not join the command before them.  L is the last one of an instruction.
++#define C(...) do { for (bool joining = group();; joining = false) { __VA_ARGS__; if (close(joining)) break; } } while (0)
++#define L(...) do { C(__VA_ARGS__); done(); } while (0)
+ class Assembler : private e2k::Assembler {
+   typedef e2k::Assembler E;
+   typedef e2k::Reg Reg;
+@@ -109,11 +119,21 @@ class Assembler : private e2k::Assembler {
+   using E::code;
+   using E::pc_offset;
+   using E::data;
+-  using E::clear;
++  void clear() { E::clear(); seal(); }
+   // One byte of an instruction assembled elsewhere.
+-  void raw_byte(uint8_t b) { assert(!in_slot_); append(b); }
++  void raw_byte(uint8_t b) { seal(); append(b); }
+   // Entry and exit code is not LoongArch: it is written with the e2k encoder.
+-  E& raw() { assert(!in_slot_); return *this; }
++  E& raw() { seal(); return *this; }
++
++  void set_fuse(bool on) { fuse_ = on; seal(); }
++  // The next instruction starts on the slot boundary the code ends at.
++  void seal() { sealed_ = true; }
++  // Everything before this offset stays as it is whatever comes next.
++  size_t settled() const { return sealed_ ? pc_offset() : size_t(cmd_); }
++  // Instructions (those that keep their slots apart), wide commands, commands
++  // joined to and bytes so far; clear() does not reset them.
++  struct Counts { long instructions, own, commands, joined, bytes; };
++  const Counts& counts() const { return counts_; }
+ 
+   // The branch offset (in instructions) held by the b/bl/beq.../bceqz/bcnez
+   // instruction at `slot`, for linking and binding labels.
+@@ -164,6 +184,7 @@ class Assembler : private e2k::Assembler {
+   // non-speculative use of one, a move or a store included, is SIGILL.
+   void enter(int nargs) {
+     assert(nargs >= 0 && nargs <= 8);
++    Own own(this);
+     C(setwd(kWindow); setbn(5, 32, 0));
+     C(for (int i = 4; i < 8; i++) addd(i - 4, i < nargs ? Src1(e2k::r(i)) : Src1(0), 0, e2k::r(4 + i)));
+     C(for (int i = 0; i < 4; i++) addd(i, i < nargs ? Src1(e2k::r(i)) : Src1(0), 0, e2k::r(4 + i)));
+@@ -176,10 +197,10 @@ class Assembler : private e2k::Assembler {
+     // getsp, so the room is claimed here and given back at once.
+     C(getsp(0, -kStackReserve, T0));
+     C(getsp(0, kStackReserve, T0));
+-    LF(getsp(0, 0, R(sp)));
++    L(getsp(0, 0, R(sp)));
+   }
+   // Return to the C caller of enter() with the value of a0.
+-  void leave() { C(addd(0, R(a0), 0, e2k::r(0)); return_(e2k::ctpr3)); LF(ct(e2k::ctpr3)); }
++  void leave() { Own own(this); C(addd(0, R(a0), 0, e2k::r(0)); return_(e2k::ctpr3)); L(ct(e2k::ctpr3)); }
+   // Call of the C function at `target`.  C parameters are the first eight
+   // registers of the callee whatever their type (the ninth and further ones
+   // are on the stack at sp): parameter i is taken from f<i> if bit i of
+@@ -200,6 +221,7 @@ class Assembler : private e2k::Assembler {
+   // register of the layer survives the call.
+   void ccall(Register target, int fp_mask, int results) {
+     assert(fp_mask >= 0 && fp_mask < 256 && results >= 0 && results <= 2);
++    Own own(this);
+     C(rrd(0, Sreg::usd_lo, T0));
+     C(andd(0, T0, 0xffffffffffffll, T0));        // usd.base
+     C(subd(0, R(sp), T0, T0));
+@@ -211,10 +233,8 @@ class Assembler : private e2k::Assembler {
+     C(movtd(R(target), e2k::ctpr1); addd(1, arg(6), 0, e2k::b(10)); addd(2, arg(7), 0, e2k::b(11)));
+     C(call(e2k::ctpr1, kWindow - 4));
+     if (results >= 1) C(std_(2, R(sp), -8, e2k::b(4)); sm(2); if (results == 2) { std_(5, R(sp), -16, e2k::b(5)); sm(5); });
+-    cmd();
+-    if (results >= 1) { ldd(0, R(sp), -8, R(a0)); ldd(2, R(sp), -8, e2k::r(32)); }
+-    if (results == 2) ldd(3, R(sp), -16, R(a1));
+-    finish();
++    L(if (results >= 1) { ldd(0, R(sp), -8, R(a0)); ldd(2, R(sp), -8, e2k::r(32)); }
++      if (results == 2) ldd(3, R(sp), -16, R(a1)));
+   }
+   // The whole body of a function called by C that does nothing but jump to
+   // the C function whose address is at [parameter `arg` + offset]: the
+@@ -223,18 +243,21 @@ class Assembler : private e2k::Assembler {
+   // %g16.. in leaf functions).
+   void tail_c(int arg, int32_t offset) {
+     assert(arg >= 0 && arg < 8);
++    Own own(this);
+     C(ldd(0, e2k::r(arg), offset, e2k::g(16)));
+     C(movtd(e2k::g(16), e2k::ctpr1));
+-    LF(ct(e2k::ctpr1));
++    L(ct(e2k::ctpr1));
+   }
+   // rd = a 64-bit value that can be read back and replaced (li64_at).
+-  void li64(Register rd, int64_t value) { L(addd(0, 0, e2k::Src2::lit64(value), D(rd))); }
++  void li64(Register rd, int64_t value) { Own own(this); L(addd(0, 0, e2k::Src2::lit64(value), D(rd))); }
++  // rd = value, nothing more.
++  void li(Register rd, int64_t value) { alu(&E::addd, rd, 0, value); }
+ 
+   // ---- branches ------------------------------------------------------------
+   // The target is prepared in %ctpr1 by the first command and taken by the
+   // second: measured faster than a single `ibranch` (see NOTES.md).
+-  void b(int32_t offset) { C(disp(e2k::ctpr1, to(offset))); L(ct(e2k::ctpr1)); }
+-  void bl(int32_t offset) { C(disp(e2k::ctpr1, to(offset))); L(rrd(0, Sreg::nip, D(ra)); ct(e2k::ctpr1)); }
++  void b(int32_t offset) { Own own(this); C(disp(e2k::ctpr1, to(offset))); L(ct(e2k::ctpr1)); }
++  void bl(int32_t offset) { Own own(this); C(disp(e2k::ctpr1, to(offset))); L(rrd(0, Sreg::nip, D(ra)); ct(e2k::ctpr1)); }
+   void beq(Register rj, Register rd, int32_t offset) { br(&E::cmpedb, false, R(rj), R(rd), offset); }
+   void bne(Register rj, Register rd, int32_t offset) { br(&E::cmpedb, true, R(rj), R(rd), offset); }
+   void blt(Register rj, Register rd, int32_t offset) { br(&E::cmpldb, false, R(rj), R(rd), offset); }
+@@ -243,18 +266,16 @@ class Assembler : private e2k::Assembler {
+   void bgeu(Register rj, Register rd, int32_t offset) { br(&E::cmpbdb, true, R(rj), R(rd), offset); }
+   void beqz(Register rj, int32_t offset) { br(&E::cmpedb, false, R(rj), 0, offset); }
+   void bnez(Register rj, int32_t offset) { br(&E::cmpedb, true, R(rj), 0, offset); }
+-  void bceqz(CFRegister cj, int32_t offset) { L(ibranch(to(offset), ~P(cj))); }
+-  void bcnez(CFRegister cj, int32_t offset) { L(ibranch(to(offset), P(cj))); }
+-  // pc = rj + offset instructions, rd = address of the next instruction.
+-  // Two slots when offset != 0.
++  void bceqz(CFRegister cj, int32_t offset) { Own own(this); L(ibranch(to(offset), ~P(cj))); }
++  void bcnez(CFRegister cj, int32_t offset) { Own own(this); L(ibranch(to(offset), P(cj))); }
++  // pc = rj + offset instructions, rd = address of the next instruction,
++  // which starts a slot.  Two slots when offset != 0 (and not fused).
+   void jirl(Register rd, Register rj, int32_t offset) {
+     e2k::Ctpr c = rd == zero_reg && rj == ra ? e2k::ctpr2 : e2k::ctpr1;
+-    if (offset == 0) C(movtd(R(rj), c));
+-    else { C(addd(0, R(rj), int64_t(offset) * kSlot, T0)); C(movtd(T0, c)); }
+-    cmd();
+-    if (rd != zero_reg) rrd(0, Sreg::nip, D(rd));
+-    ct(c);
+-    last(offset ? 2 : 1);
++    if (offset == 0) { C(movtd(R(rj), c)); L(if (rd != zero_reg) rrd(0, Sreg::nip, D(rd)); ct(c)); return; }
++    Own own(this, 2);
++    C(addd(0, R(rj), int64_t(offset) * kSlot, T0)); C(movtd(T0, c));
++    L(if (rd != zero_reg) rrd(0, Sreg::nip, D(rd)); ct(c));
+   }
+ 
+   // ---- integer arithmetic --------------------------------------------------
+@@ -282,7 +303,7 @@ class Assembler : private e2k::Assembler {
+   void pcaddi(Register rd, int32_t si20) { pcadd(rd, e2k::Src2::lit32(int64_t(si20) * kSlot)); }
+   void pcaddu12i(Register rd, int32_t si20) { pcadd(rd, int64_t(si20) * 4096); }
+   void pcaddu18i(Register rd, int32_t si20) { pcadd(rd, int64_t(si20) * 65536 * kSlot); }
+-  void pcalau12i(Register rd, int32_t si20) { C(rrd(0, Sreg::ip, T0)); C(addd(0, T0, int64_t(si20) * 4096, T0)); L2(andd(0, T0, -4096, D(rd))); }
++  void pcalau12i(Register rd, int32_t si20) { Own own(this, 2); C(rrd(0, Sreg::ip, T0)); C(addd(0, T0, int64_t(si20) * 4096, T0)); L(andd(0, T0, -4096, D(rd))); }
+ 
+   void and_(Register rd, Register rj, Register rk) { alu(&E::andd, rd, R(rj), R(rk)); }
+   void or_(Register rd, Register rj, Register rk) { alu(&E::ord, rd, R(rj), R(rk)); }
+@@ -310,8 +331,8 @@ class Assembler : private e2k::Assembler {
+   void div_d(Register rd, Register rj, Register rk) { C(cmpedb(0, R(rk), 0, PT0)); L(sdivd(5, R(rj), R(rk), D(rd)); when(5, ~PT0)); }
+   void div_du(Register rd, Register rj, Register rk) { C(cmpedb(0, R(rk), 0, PT0)); L(udivd(5, R(rj), R(rk), D(rd)); when(5, ~PT0)); }
+   // Two slots each.
+-  void mod_w(Register rd, Register rj, Register rk) { C(cmpesb(0, R(rk), 0, PT0); sxt(1, 2, R(rj), T0)); C(smodx(5, T0, R(rk), T0); sm(5)); L2(sxt(0, 2, T0, D(rd)); when(0, ~PT0)); }
+-  void mod_wu(Register rd, Register rj, Register rk) { C(cmpesb(0, R(rk), 0, PT0); sxt(1, 6, R(rj), T0)); C(umodx(5, T0, R(rk), T0); sm(5)); L2(sxt(0, 2, T0, D(rd)); when(0, ~PT0)); }
++  void mod_w(Register rd, Register rj, Register rk) { C(cmpesb(0, R(rk), 0, PT0); sxt(1, 2, R(rj), T0)); C(smodx(5, T0, R(rk), T0); sm(5)); L(sxt(0, 2, T0, D(rd)); when(0, ~PT0)); }
++  void mod_wu(Register rd, Register rj, Register rk) { C(cmpesb(0, R(rk), 0, PT0); sxt(1, 6, R(rj), T0)); C(umodx(5, T0, R(rk), T0); sm(5)); L(sxt(0, 2, T0, D(rd)); when(0, ~PT0)); }
+   void mod_d(Register rd, Register rj, Register rk) { mod(&E::sdivd, rd, rj, rk); }
+   void mod_du(Register rd, Register rj, Register rk) { mod(&E::udivd, rd, rj, rk); }
+ 
+@@ -355,15 +376,15 @@ class Assembler : private e2k::Assembler {
+   }
+ 
+   // Byte i of the constant is the number of the source byte that goes to byte i.
+-  void revb_2h(Register rd, Register rj) { C(addd(0, 0, 0x8080808002030001ll, T0)); C(pshufb(0, R(rj), R(rj), T0, T0)); L2(sxt(0, 2, T0, D(rd))); }   // two slots
++  void revb_2h(Register rd, Register rj) { C(addd(0, 0, 0x8080808002030001ll, T0)); C(pshufb(0, R(rj), R(rj), T0, T0)); L(sxt(0, 2, T0, D(rd))); }   // two slots
+   void revb_4h(Register rd, Register rj) { shuffle(rd, rj, 0x0607040502030001ll); }
+   void revb_2w(Register rd, Register rj) { shuffle(rd, rj, 0x0405060700010203ll); }
+   void revb_d(Register rd, Register rj) { shuffle(rd, rj, 0x0001020304050607ll); }
+   void revh_2w(Register rd, Register rj) { shuffle(rd, rj, 0x0504070601000302ll); }
+   void revh_d(Register rd, Register rj) { shuffle(rd, rj, 0x0100030205040706ll); }
+   // Two slots each.
+-  void bitrev_4b(Register rd, Register rj) { C(bitrevd(0, R(rj), T1); addd(1, 0, 0x8080808004050607ll, T0)); C(pshufb(0, T1, T1, T0, T0)); L2(sxt(0, 2, T0, D(rd))); }
+-  void bitrev_8b(Register rd, Register rj) { C(bitrevd(0, R(rj), T1); addd(1, 0, 0x0001020304050607ll, T0)); L2(pshufb(0, T1, T1, T0, D(rd))); }
++  void bitrev_4b(Register rd, Register rj) { C(bitrevd(0, R(rj), T1); addd(1, 0, 0x8080808004050607ll, T0)); C(pshufb(0, T1, T1, T0, T0)); L(sxt(0, 2, T0, D(rd))); }
++  void bitrev_8b(Register rd, Register rj) { C(bitrevd(0, R(rj), T1); addd(1, 0, 0x0001020304050607ll, T0)); L(pshufb(0, T1, T1, T0, D(rd))); }
+   void bitrev_w(Register rd, Register rj) { C(bitrevs(0, R(rj), T0)); L(sxt(0, 2, T0, D(rd))); }
+   void bitrev_d(Register rd, Register rj) { L(bitrevd(0, R(rj), D(rd))); }
+ 
+@@ -427,8 +448,8 @@ class Assembler : private e2k::Assembler {
+   void ll_w(Register rd, Register rj, int32_t si14) { C(ldw(0, R(rj), si14, T0); mas(0, 7)); L(sxt(0, 2, T0, D(rd))); }
+   void ll_d(Register rd, Register rj, int32_t si14) { L(ldd(0, R(rj), si14, D(rd)); mas(0, 7)); }
+   // rd = 1 when the store went through, 0 when the lock was lost.  Two slots.
+-  void sc_w(Register rd, Register rj, int32_t si14) { C(stw(2, R(rj), si14, R(rd)); mas(2, 2); addd(0, 0, 0, D(rd)); ibranch_mlock(to(2))); L2(addd(0, 0, 1, D(rd))); }
+-  void sc_d(Register rd, Register rj, int32_t si14) { C(std_(2, R(rj), si14, R(rd)); mas(2, 2); addd(0, 0, 0, D(rd)); ibranch_mlock(to(2))); L2(addd(0, 0, 1, D(rd))); }
++  void sc_w(Register rd, Register rj, int32_t si14) { Own own(this, 2); C(stw(2, R(rj), si14, R(rd)); mas(2, 2); addd(0, 0, 0, D(rd)); ibranch_mlock(to(2))); L(addd(0, 0, 1, D(rd))); }
++  void sc_d(Register rd, Register rj, int32_t si14) { Own own(this, 2); C(std_(2, R(rj), si14, R(rd)); mas(2, 2); addd(0, 0, 0, D(rd)); ibranch_mlock(to(2))); L(addd(0, 0, 1, D(rd))); }
+   // rd = [rj]; [rj] = rd op rk, atomically.  rd must differ from rj and rk.  Two slots each.
+ #define LA_AM(name, w, op)                                                        \
+   void name##_db_##w(Register rd, Register rk, Register rj) { am_##w(op, rd, rk, rj); } \
+@@ -443,7 +464,7 @@ class Assembler : private e2k::Assembler {
+   // A store to the address `code`: SIGSEGV with si_addr == code.
+   void break_(uint32_t code, bool = false) { assert(code < 65536); L(stw(2, 0, code, R(zero_reg))); }
+   void stop(uint32_t code = 127) { break_(code); }
+-  void nop(unsigned = 0) { cmd(); last(1); }
++  void nop(unsigned = 0) { Own own(this); L(); }      // a slot of its own: nops are counted
+ 
+   // ---- floating point ------------------------------------------------------
+   void fadd_s(FPURegister fd, FPURegister fj, FPURegister fk) { fop(&E::fadds, fd, fj, fk); }
+@@ -533,22 +554,73 @@ class Assembler : private e2k::Assembler {
+   static Reg F(FPURegister f) { return e2k::r(32 + f.code()); }
+   static Pred P(CFRegister c) { return e2k::pred(c); }
+ 
+-  void cmd() {
+-    if (!in_slot_) { slot_ = int64_t(pc_offset()); in_slot_ = true; }
+-    cmd_ = int64_t(pc_offset());
++  // ---- placing the commands -------------------------------------------------
++  // The command written last starts at cmd_, takes psize_ bytes and is
++  // followed by zero words up to a slot boundary; while the code is not
++  // sealed it is kept in saved_ and can be written again, longer or shorter.
++  bool group() {
++    end_ = int64_t(pc_offset());
++    if (fuse_ && !sealed_) {
++      static_cast<e2k::Command&>(*this) = saved_;
++      if (takes()) { join(size_t(cmd_)); return true; }
++    }
+     begin();
++    return false;
+   }
+-  void last(int slots) {
+-    int64_t rest = slot_ + slots * kSlot - cmd_;
+-    assert(rest >= 8 && rest <= 64 && "the instruction does not fit its slots");
+-    end(int(rest / 4));
+-    assert(int64_t(pc_offset()) == slot_ + slots * kSlot && "the instruction does not fit its slots");
+-    in_slot_ = false;
++  bool close(bool joining) {
++    if (joining) {
++      if (joined() && size() <= kMaxCommand) { counts_.joined++; finish(); return true; }
++      static_cast<e2k::Command&>(*this) = saved_;       // it does not join: the old command back
++      reopen(size_t(cmd_)); pad();
++      begin();
++      return false;
++    }
++    // A command of its own: right after the last one, which gives its padding
++    // back, or at the slot boundary when the code is sealed.
++    int64_t at = cmd_ + psize_;
++    if (!sealed_ && up(at + size()) - at <= 64) {
++      e2k::Command c = *this;
++      static_cast<e2k::Command&>(*this) = saved_;
++      reopen(size_t(cmd_)); end();
++      static_cast<e2k::Command&>(*this) = c;
++      reopen(pc_offset());
++    }
++    cmd_ = int64_t(pc_offset());
++    counts_.commands++;
++    finish();
++    return true;
++  }
++  // Nothing joins a command that loads: measured on fib under TurboFan,
++  // 237 ms with such joins, 225 without, 224 with no joins at all.
++  bool takes() const {
++    for (int ch = 0; ch < 6; ch++) if ((als_mask_ >> ch & 1) && mem_[ch] == 1) return false;
++    return joinable();
++  }
++  void finish() {
++    psize_ = size(); pad();
++    saved_ = *this; sealed_ = false;
++    counts_.bytes += long(int64_t(pc_offset()) - end_);
++  }
++  void pad() { end(int(std::max(up(cmd_ + size()), floor_) - cmd_) / 4); }
++  static int64_t up(int64_t at) { return (at + kSlot - 1) & -int64_t(kSlot); }
++  // The end of an instruction.  A control transfer ends the slot: the code
++  // after it is entered from elsewhere.
++  void done() {
++    counts_.instructions++;
+     if (fix_) { set_branch_offset_at(data() + slot_, fix_); fix_ = 0; }
++    if (!fuse_ || has_ss_) seal();
+   }
+-  // Ends an instruction of as many slots as it takes.
+-  void finish() { last(int(cmd_ - slot_ + size() + kSlot - 1) / kSlot); }
+-  // Branch target `offset` instructions from the current one.
++  // An instruction that keeps its slots to itself, as all do without fusing:
++  // it uses its own address, or its code is found and patched later.
++  struct Own {
++    Assembler* a; bool fuse;
++    explicit Own(Assembler* as, int slots = 1) : a(as), fuse(as->fuse_) {
++      a->fuse_ = false; a->seal(); a->slot_ = int64_t(a->pc_offset()); a->floor_ = a->slot_ + slots * kSlot;
++      a->counts_.own++;
++    }
++    ~Own() { a->fuse_ = fuse; a->seal(); a->floor_ = 0; }
++  };
++  // Branch target `offset` instructions from the current one (an Own one).
+   // A target before the start of the buffer (V8 gives the layer one
+   // instruction at a time) is written when the instruction is complete.
+   e2k::Label* to(int32_t offset) {
+@@ -574,12 +646,12 @@ class Assembler : private e2k::Assembler {
+   // LoongArch wants the sign extension.
+   void alu_w(Alu f, Register rd, e2k::Src1 a, e2k::Src2 b) { C((this->*f)(0, a, b, T0)); L(sxt(0, 2, T0, D(rd))); }
+   void set(Cmp f, Register rd, e2k::Src1 a, e2k::Src2 b) { C((this->*f)(0, a, b, PT0)); L(merged(0, 0, 1, D(rd), PT0)); }
+-  void br(Cmp f, bool negate, e2k::Src1 a, e2k::Src2 b, int32_t offset) { C((this->*f)(0, a, b, PT0); disp(e2k::ctpr1, to(offset))); L(ct(e2k::ctpr1, negate ? ~PT0 : PT0)); }
+-  void pcadd(Register rd, e2k::Src2 bytes) { C(rrd(0, Sreg::ip, T0)); L(addd(0, T0, bytes, D(rd))); }
++  void br(Cmp f, bool negate, e2k::Src1 a, e2k::Src2 b, int32_t offset) { Own own(this); C((this->*f)(0, a, b, PT0); disp(e2k::ctpr1, to(offset))); L(ct(e2k::ctpr1, negate ? ~PT0 : PT0)); }
++  void pcadd(Register rd, e2k::Src2 bytes) { Own own(this); C(rrd(0, Sreg::ip, T0)); L(addd(0, T0, bytes, D(rd))); }
+   void mod(Alu div, Register rd, Register rj, Register rk) {
+     C(cmpedb(0, R(rk), 0, PT0); (this->*div)(5, R(rj), R(rk), T0); sm(5));
+     C(muld(0, T0, R(rk), T0); sm(0));
+-    L2(subd(0, R(rj), T0, D(rd)); when(0, ~PT0));
++    L(subd(0, R(rj), T0, D(rd)); when(0, ~PT0));
+   }
+   void shuffle(Register rd, Register rj, int64_t bytes) { C(addd(0, 0, bytes, T0)); L(pshufb(0, R(rj), R(rj), T0, D(rd))); }
+   void load(Alu f, Reg d, Register rj, e2k::Src2 offset, int ext = -1) {
+@@ -589,10 +661,11 @@ class Assembler : private e2k::Assembler {
+   void am_w(Alu op, Register rd, Register rk, Register rj) { am(&E::ldw, &E::stw, op, rd, rk, rj, true); }
+   void am_d(Alu op, Register rd, Register rk, Register rj) { am(&E::ldd, &E::std_, op, rd, rk, rj, false); }
+   void am(Alu ld, Alu st, Alu op, Register rd, Register rk, Register rj, bool w) {
++    Own own(this, 2);
+     C((this->*ld)(0, R(rj), 0, T0); mas(0, 7));
+     if (op) C((this->*op)(0, T0, R(rk), T1)); else C(addd(0, R(rk), 0, T1));
+     C((this->*st)(2, R(rj), 0, T1); mas(2, 2); ibranch_mlock(to(0)));
+-    if (w) L2(sxt(0, 2, T0, D(rd))); else L2(addd(0, T0, 0, D(rd)));
++    if (w) L(sxt(0, 2, T0, D(rd))); else L(addd(0, T0, 0, D(rd)));
+   }
+   void fop(Alu f, FPURegister fd, FPURegister fj, FPURegister fk, int ch = 0) { L((this->*f)(ch, F(fj), F(fk), F(fd))); }
+   // The e2k operation gives its second operand when the operands are
+@@ -602,7 +675,7 @@ class Assembler : private e2k::Assembler {
+     C((this->*op)(0, F(fk), F(fj), T0); (this->*op)(1, F(fj), F(fk), T1); (this->*uod)(3, F(fk), F(fk), PT0); (this->*uod)(4, F(fj), F(fj), PT1));
+     C((this->*join)(0, T0, T1, T0));
+     C((this->*merge)(0, T0, F(fj), T0, PT0));
+-    L2((this->*merge)(0, T0, F(fk), F(fd), PT1));
++    L((this->*merge)(0, T0, F(fk), F(fd), PT1));
+   }
+   void fcmp(FPUCondition cc, Reg a, Reg b, Pred cd, Cmp eq, Cmp lt, Cmp le, Cmp uod, Cmp neq, Cmp nlt, Cmp nle, Cmp od) {
+     switch (cc & ~1) {   // the signaling variants compare like the quiet ones
+@@ -638,21 +711,23 @@ class Assembler : private e2k::Assembler {
+       C(fdtoifd(0, mode, x, T3); fcmpodd(1, x, x, T1));
+       C((this->*conv)(0, T3, T0); fcmpnltd(1, T3, limit, T2));
+     }
+-    if (to64) { C(addd(0, T0, T2, T0)); L2(andd(0, T0, T1, F(fd))); }
+-    else { C(adds(0, T0, T2, T0)); L2(ands(0, T0, T1, F(fd))); }
++    if (to64) { C(addd(0, T0, T2, T0)); L(andd(0, T0, T1, F(fd))); }
++    else { C(adds(0, T0, T2, T0)); L(ands(0, T0, T1, F(fd))); }
+   }
+ #undef C
+ #undef L
+-#undef L2
+-#undef LF
+ 
+   static constexpr Reg T0 = e2k::b(0), T1 = e2k::b(1), T2 = e2k::b(2), T3 = e2k::b(3);
+   static constexpr Pred PT0 = e2k::pred(8), PT1 = e2k::pred(9);
+   static constexpr int kWindow = 38;   // setwd wsz: %r0..%r75
+   static constexpr int kStackReserve = 1536 * 1024;   // more than V8's --stack-size (984 KB) plus its slack
+-  int64_t slot_ = 0, cmd_ = 0;
++  static constexpr int kMaxCommand = 32;   // bytes of a command that others joined
++  int64_t slot_ = 0, cmd_ = 0, end_ = 0, floor_ = 0;   // floor_: an Own instruction ends there at the earliest
++  int psize_ = 0;
+   int32_t fix_ = 0;
+-  bool in_slot_ = false;
++  bool fuse_ = false, sealed_ = true;
++  e2k::Command saved_;
++  Counts counts_ = {0, 0, 0, 0, 0};
+   e2k::Label target_;
+ };
+ 

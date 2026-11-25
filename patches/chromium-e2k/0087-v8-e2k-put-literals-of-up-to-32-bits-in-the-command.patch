@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Fri, 16 Oct 2026 13:53:44 +0100
+Subject: [PATCH 87/99] v8: e2k: put literals of up to 32 bits in the command
+
+LoongArch has 12-bit immediates, and the selector and the macro assembler
+loaded a wider constant into a scratch register first. An e2k command
+carries 32- and 64-bit literals: add, sub, and, or, xor and the bit test
+take a literal of up to 32 bits from the selector (sign-extended, as the
+Word32 values are), and the macro assembler puts any non-relocatable
+literal in the operation (addli_d, andli, orli, xorli in the layer).
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc   |  4 ++++
+ chromium/v8/src/codegen/e2k/assembler-e2k.h    |  5 +++++
+ chromium/v8/src/codegen/e2k/la_asm.h           |  6 ++++++
+ .../v8/src/codegen/e2k/macro-assembler-e2k.cc  | 18 +++++++++++++++---
+ .../backend/e2k/instruction-selector-e2k.cc    |  8 +++++++-
+ 5 files changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index c148a055ea..f29ad297c7 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -1256,6 +1256,10 @@ void Assembler::ffint_s_wr(FPURegister fd, Register rj) { LA(ffint_s_wr(fd, rj))
+ void Assembler::beqz(Register rj, int32_t offset) { LA(beqz(rj, offset)); }
+ void Assembler::bnez(Register rj, int32_t offset) { LA(bnez(rj, offset)); }
+ void Assembler::jirl(Register rd, Register rj, int32_t offset) { LA(jirl(rd, rj, offset)); }
++void Assembler::addli_d(Register rd, Register rj, int64_t imm) { LA(addli_d(rd, rj, imm)); }
++void Assembler::andli(Register rd, Register rj, int64_t imm) { LA(andli(rd, rj, imm)); }
++void Assembler::orli(Register rd, Register rj, int64_t imm) { LA(orli(rd, rj, imm)); }
++void Assembler::xorli(Register rd, Register rj, int64_t imm) { LA(xorli(rd, rj, imm)); }
+ void Assembler::bceqz(CFRegister cj, int32_t si21) { LA(bceqz(cj, si21)); }
+ void Assembler::bcnez(CFRegister cj, int32_t si21) { LA(bcnez(cj, si21)); }
+ void Assembler::add_w(Register rd, Register rj, Register rk) { LA(add_w(rd, rj, rk)); }
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index b27a3dd0f3..1628653543 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -537,6 +537,11 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   }
+ 
+   void jirl(Register rd, Register rj, int32_t offset);
++  // Not LoongArch: add, and, or, xor with a literal of any size.
++  void addli_d(Register rd, Register rj, int64_t imm);
++  void andli(Register rd, Register rj, int64_t imm);
++  void orli(Register rd, Register rj, int64_t imm);
++  void xorli(Register rd, Register rj, int64_t imm);
+ 
+   void bceqz(CFRegister cj, int32_t si21);
+   inline void bceqz(CFRegister cj, Label* L) {
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 1c44117d76..4bbadda06b 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -405,6 +405,12 @@ class Assembler : private e2k::Assembler {
+   void andn(Register rd, Register rj, Register rk) { alu(&E::andnd, rd, R(rj), R(rk)); }
+   void orn(Register rd, Register rj, Register rk) { alu(&E::ornd, rd, R(rj), R(rk)); }
+   void andi(Register rd, Register rj, int32_t ui12) { alu(&E::andd, rd, R(rj), ui12 & 0xfff); }
++  // Not LoongArch: the operation with a literal of any size (the command
++  // carries 32- and 64-bit literals), where LoongArch loads it first.
++  void addli_d(Register rd, Register rj, int64_t imm) { alu(&E::addd, rd, R(rj), imm); }
++  void andli(Register rd, Register rj, int64_t imm) { alu(&E::andd, rd, R(rj), imm); }
++  void orli(Register rd, Register rj, int64_t imm) { alu(&E::ord, rd, R(rj), imm); }
++  void xorli(Register rd, Register rj, int64_t imm) { alu(&E::xord, rd, R(rj), imm); }
+   void ori(Register rd, Register rj, int32_t ui12) { alu(&E::ord, rd, R(rj), ui12 & 0xfff); }
+   void xori(Register rd, Register rj, int32_t ui12) { alu(&E::xord, rd, R(rj), ui12 & 0xfff); }
+ 
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+index 3335e9499d..9b5704bb77 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+@@ -881,7 +881,8 @@ void MacroAssembler::Add_w(Register rd, Register rj, const Operand& rk) {
+   if (rk.is_reg()) {
+     add_w(rd, rj, rk.rm());
+   } else {
+-    if (is_int12(rk.immediate()) && !MustUseReg(rk.rmode())) {
++    if (is_int32(rk.immediate()) && !MustUseReg(rk.rmode())) {
++      // The literal goes in the command, whatever its size.
+       addi_w(rd, rj, static_cast<int32_t>(rk.immediate()));
+     } else {
+       // li handles the relocation.
+@@ -900,6 +901,8 @@ void MacroAssembler::Add_d(Register rd, Register rj, const Operand& rk) {
+   } else {
+     if (is_int12(rk.immediate()) && !MustUseReg(rk.rmode())) {
+       addi_d(rd, rj, static_cast<int32_t>(rk.immediate()));
++    } else if (!MustUseReg(rk.rmode())) {
++      addli_d(rd, rj, rk.immediate());
+     } else {
+       // li handles the relocation.
+       UseScratchRegisterScope temps(this);
+@@ -916,8 +919,8 @@ void MacroAssembler::Sub_w(Register rd, Register rj, const Operand& rk) {
+     sub_w(rd, rj, rk.rm());
+   } else {
+     DCHECK(is_int32(rk.immediate()));
+-    if (is_int12(-rk.immediate()) && !MustUseReg(rk.rmode())) {
+-      // No subi_w instr, use addi_w(x, y, -imm).
++    if (is_int32(-rk.immediate()) && !MustUseReg(rk.rmode())) {
++      // No subi_w instr, use addi_w(x, y, -imm), the literal in the command.
+       addi_w(rd, rj, static_cast<int32_t>(-rk.immediate()));
+     } else {
+       UseScratchRegisterScope temps(this);
+@@ -942,6 +945,9 @@ void MacroAssembler::Sub_d(Register rd, Register rj, const Operand& rk) {
+   } else if (is_int12(-rk.immediate()) && !MustUseReg(rk.rmode())) {
+     // No subi_d instr, use addi_d(x, y, -imm).
+     addi_d(rd, rj, static_cast<int32_t>(-rk.immediate()));
++  } else if (!MustUseReg(rk.rmode()) &&
++             rk.immediate() != std::numeric_limits<int64_t>::min()) {
++    addli_d(rd, rj, -rk.immediate());
+   } else {
+     int li_count = InstrCountForLi64Bit(rk.immediate());
+     int li_neg_count = InstrCountForLi64Bit(-rk.immediate());
+@@ -1150,6 +1156,8 @@ void MacroAssembler::And(Register rd, Register rj, const Operand& rk) {
+   } else {
+     if (is_uint12(rk.immediate()) && !MustUseReg(rk.rmode())) {
+       andi(rd, rj, static_cast<int32_t>(rk.immediate()));
++    } else if (!MustUseReg(rk.rmode())) {
++      andli(rd, rj, rk.immediate());
+     } else {
+       // li handles the relocation.
+       UseScratchRegisterScope temps(this);
+@@ -1167,6 +1175,8 @@ void MacroAssembler::Or(Register rd, Register rj, const Operand& rk) {
+   } else {
+     if (is_uint12(rk.immediate()) && !MustUseReg(rk.rmode())) {
+       ori(rd, rj, static_cast<int32_t>(rk.immediate()));
++    } else if (!MustUseReg(rk.rmode())) {
++      orli(rd, rj, rk.immediate());
+     } else {
+       // li handles the relocation.
+       UseScratchRegisterScope temps(this);
+@@ -1184,6 +1194,8 @@ void MacroAssembler::Xor(Register rd, Register rj, const Operand& rk) {
+   } else {
+     if (is_uint12(rk.immediate()) && !MustUseReg(rk.rmode())) {
+       xori(rd, rj, static_cast<int32_t>(rk.immediate()));
++    } else if (!MustUseReg(rk.rmode())) {
++      xorli(rd, rj, rk.immediate());
+     } else {
+       // li handles the relocation.
+       UseScratchRegisterScope temps(this);
+diff --git a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+index 938a89e838..26cb767988 100644
+--- a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+@@ -141,7 +141,13 @@ class E2kOperandGenerator final : public OperandGenerator {
+       case kE2kXor:
+       case kE2kXor32:
+       case kE2kTst:
+-        return is_uint12(value);
++        // A literal of up to 32 bits goes in the command (sign-extended).
++        return is_int32(value);
++      case kE2kAdd_d:
++      case kE2kAdd_w:
++      case kE2kSub_d:
++      case kE2kSub_w:
++        return is_int32(value) && value != std::numeric_limits<int32_t>::min();
+       case kE2kLd_w:
+       case kE2kSt_w:
+       case kE2kLd_d:

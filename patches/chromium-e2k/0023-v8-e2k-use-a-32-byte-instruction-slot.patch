@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Mon, 12 Oct 2026 15:20:51 +0100
+Subject: [PATCH 23/99] v8: e2k: use a 32-byte instruction slot
+
+Every emulated loong64 instruction will occupy one fixed 32-byte slot
+holding one to three wide e2k instructions, so set kInstrSize to 32. The
+encoder still writes 4-byte loong64 words; places that assume 4 bytes
+are to be fixed together with the real assembler.
+---
+ chromium/v8/src/codegen/e2k/constants-e2k.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/constants-e2k.h b/chromium/v8/src/codegen/e2k/constants-e2k.h
+index 8688b3dd50..e84eef771a 100644
+--- a/chromium/v8/src/codegen/e2k/constants-e2k.h
++++ b/chromium/v8/src/codegen/e2k/constants-e2k.h
+@@ -1533,8 +1533,8 @@ const Instr rtCallRedirInstr =
+ // A nop instruction. (Encoding of addi_w 0 0 0).
+ const Instr nopInstr = ADDI_W;
+ 
+-constexpr uint8_t kInstrSize = 4;
+-constexpr uint8_t kInstrSizeLog2 = 2;
++constexpr uint8_t kInstrSize = 32;  // One fixed-size slot per emulated instruction, see DESIGN.md.
++constexpr uint8_t kInstrSizeLog2 = 5;
+ 
+ class InstructionBase {
+  public:

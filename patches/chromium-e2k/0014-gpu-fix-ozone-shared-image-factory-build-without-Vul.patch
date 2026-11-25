@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Sat, 10 Oct 2026 00:26:28 +0100
+Subject: [PATCH 14/99] gpu: fix ozone shared image factory build without
+ Vulkan
+
+---
+ .../service/shared_image/ozone_image_backing_factory.cc       | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/chromium/gpu/command_buffer/service/shared_image/ozone_image_backing_factory.cc b/chromium/gpu/command_buffer/service/shared_image/ozone_image_backing_factory.cc
+index 9388305854..dfa8e1acfb 100644
+--- a/chromium/gpu/command_buffer/service/shared_image/ozone_image_backing_factory.cc
++++ b/chromium/gpu/command_buffer/service/shared_image/ozone_image_backing_factory.cc
+@@ -95,9 +95,13 @@ OzoneImageBackingFactory::CreateGpuMemoryBufferHandle(
+       ui::OzonePlatform::GetInstance()
+           ->GetSurfaceFactoryOzone()
+           ->CreateNativePixmap(gpu::kNullSurfaceHandle,
++#if BUILDFLAG(ENABLE_VULKAN)
+                                vulkan_context_provider
+                                    ? vulkan_context_provider->GetDeviceQueue()
+                                    : nullptr,
++#else
++                               nullptr,
++#endif  // BUILDFLAG(ENABLE_VULKAN)
+                                size, format, usage, size);
+ 
+   if (!pixmap.get()) {

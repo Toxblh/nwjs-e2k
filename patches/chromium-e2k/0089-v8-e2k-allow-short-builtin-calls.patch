@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Fri, 16 Oct 2026 22:04:32 +0100
+Subject: [PATCH 89/99] v8: e2k: allow short builtin calls
+
+Default v8_enable_short_builtin_calls on for e2k and keep it without
+pointer compression, as on x64: the builtins are re-embedded into the
+code range. The args files still say false; with true (d8, mg2 args)
+Octane +4 %, JetStream 2 +4.7 %, some Sparkplug microtests slower.
+---
+ chromium/v8/BUILD.gn | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/chromium/v8/BUILD.gn b/chromium/v8/BUILD.gn
+index 5cf4c83457..2bd6d9d4e4 100644
+--- a/chromium/v8/BUILD.gn
++++ b/chromium/v8/BUILD.gn
+@@ -653,7 +653,8 @@ if (v8_enable_concurrent_mksnapshot == "") {
+ if (v8_enable_short_builtin_calls == "") {
+   v8_enable_short_builtin_calls =
+       v8_current_cpu == "x64" || v8_current_cpu == "arm64" ||
+-      v8_current_cpu == "loong64" || v8_current_cpu == "riscv64"
++      v8_current_cpu == "loong64" || v8_current_cpu == "riscv64" ||
++      v8_current_cpu == "e2k"
+ }
+ if (v8_enable_external_code_space == "") {
+   v8_enable_external_code_space =
+@@ -725,10 +726,12 @@ assert(
+     "v8_enable_slow_dchecks requires v8_enable_verification_features or dcheck_always_on.")
+ 
+ if (v8_enable_short_builtin_calls &&
+-    (!v8_enable_pointer_compression && v8_current_cpu != "x64")) {
+-  # Disable short calls when pointer compression is not enabled, except x64,
+-  # where short builtin calls can still be enabled if the code range is
+-  # guaranteed to be close enough to embedded builtins.
++    (!v8_enable_pointer_compression && v8_current_cpu != "x64" &&
++     v8_current_cpu != "e2k")) {
++  # Disable short calls when pointer compression is not enabled, except x64
++  # and e2k, where short builtin calls can still be enabled if the code range
++  # is guaranteed to be close enough to embedded builtins (e2k: the builtins
++  # are re-embedded into the code range, within kMaxPCRelativeCodeRangeInMB).
+   v8_enable_short_builtin_calls = false
+ }
+ 

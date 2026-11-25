@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 21:25:48 +0100
+Subject: [PATCH 66/99] v8: e2k: baseline code counts the interrupt budget in
+ 64 bits
+
+The budget was loaded, added to and tested as a 32-bit value: load and
+sign extension, 32-bit sum and sign extension, compare. The result of a
+32-bit operation reaches a 64-bit one four cycles later than that of a
+64-bit one, and this runs on every back edge and every return of baseline
+code. The budget and the weights are far from the ends of int32: the sum
+is made in 64 bits, its low half is stored as before.
+---
+ chromium/v8/src/baseline/e2k/baseline-assembler-e2k-inl.h | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/chromium/v8/src/baseline/e2k/baseline-assembler-e2k-inl.h b/chromium/v8/src/baseline/e2k/baseline-assembler-e2k-inl.h
+index 81a0cc8e5d..1bb7dbdce9 100644
+--- a/chromium/v8/src/baseline/e2k/baseline-assembler-e2k-inl.h
++++ b/chromium/v8/src/baseline/e2k/baseline-assembler-e2k-inl.h
+@@ -755,7 +755,9 @@ void BaselineAssembler::AddToInterruptBudgetAndJumpIfNotExceeded(
+   __ Ld_w(interrupt_budget,
+           FieldMemOperand(feedback_cell,
+                           offsetof(FeedbackCell, interrupt_budget_)));
+-  __ Add_w(interrupt_budget, interrupt_budget, weight);
++  // In 64 bits: the budget and the weights are far from the ends of int32,
++  // and a 32-bit sum waits four cycles for its sign extension.
++  __ Add_d(interrupt_budget, interrupt_budget, Operand(weight));
+   __ St_w(interrupt_budget,
+           FieldMemOperand(feedback_cell,
+                           offsetof(FeedbackCell, interrupt_budget_)));
+@@ -775,7 +777,7 @@ void BaselineAssembler::AddToInterruptBudgetAndJumpIfNotExceeded(
+   __ Ld_w(interrupt_budget,
+           FieldMemOperand(feedback_cell,
+                           offsetof(FeedbackCell, interrupt_budget_)));
+-  __ Add_w(interrupt_budget, interrupt_budget, weight);
++  __ add_d(interrupt_budget, interrupt_budget, weight);
+   __ St_w(interrupt_budget,
+           FieldMemOperand(feedback_cell,
+                           offsetof(FeedbackCell, interrupt_budget_)));

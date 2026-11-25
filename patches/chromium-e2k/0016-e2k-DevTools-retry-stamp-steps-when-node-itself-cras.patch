@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Sat, 10 Oct 2026 04:37:38 +0100
+Subject: [PATCH 16/99] e2k: DevTools: retry stamp steps when node itself
+ crashes
+
+---
+ .../src/scripts/build/run_with_stamp.py       | 25 ++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/chromium/third_party/devtools-frontend/src/scripts/build/run_with_stamp.py b/chromium/third_party/devtools-frontend/src/scripts/build/run_with_stamp.py
+index 2b3e307ec5..d017476a64 100644
+--- a/chromium/third_party/devtools-frontend/src/scripts/build/run_with_stamp.py
++++ b/chromium/third_party/devtools-frontend/src/scripts/build/run_with_stamp.py
+@@ -23,6 +23,29 @@ if _SCRIPTS_BUILD_DIR not in sys.path:
+ from response_file import expand_response_files
+ 
+ 
++def _run(command_args):
++    """Runs the command; on e2k reruns it when node itself crashed.
++
++    The node available for e2k occasionally dies with an internal error
++    (uncaught exception out of correct JS, or a signal). Such a failure ends
++    with the 'Node.js vX' trailer on stderr, a regular tool error does not.
++    """
++    import platform
++    if platform.machine() != 'e2k':
++        return subprocess.call(command_args)
++    ret = 1
++    for _ in range(3):
++        process = subprocess.run(command_args,
++                                 stderr=subprocess.PIPE,
++                                 text=True,
++                                 errors='replace')
++        sys.stderr.write(process.stderr)
++        ret = process.returncode
++        if ret == 0 or (ret > 0 and '\nNode.js v' not in process.stderr):
++            break
++    return ret
++
++
+ def main():
+     args = expand_response_files(sys.argv[1:])
+ 
+@@ -58,7 +81,7 @@ def main():
+         print("Error: No command specified to run", file=sys.stderr)
+         sys.exit(1)
+ 
+-    ret = subprocess.call(command_args)
++    ret = _run(command_args)
+     if ret != 0:
+         if ret < 0:
+             sys.exit(128 - ret)

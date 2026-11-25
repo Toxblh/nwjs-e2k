@@ -1,0 +1,59 @@
+diff --git a/common.gypi b/common.gypi
+index f7faecf7..a5790148 100644
+--- a/common.gypi
++++ b/common.gypi
+@@ -781,7 +781,7 @@
+       }],
+       [ 'OS in "linux freebsd openbsd solaris aix os400 openharmony"', {
+         'cflags': [ '-pthread' ],
+-        'ldflags': [ '-pthread', '-fuse-ld=lld' ],
++        'ldflags': [ '-pthread' ],  # e2k: GNU ld (no lld for e2k)
+       }],
+       [ 'OS in "linux freebsd openbsd solaris android aix os400 cloudabi openharmony"', {
+         'cflags': [ '-Wall', '-Wextra', '-Wno-unused-parameter', ],
+diff --git a/deps/openssl/openssl_common.gypi b/deps/openssl/openssl_common.gypi
+index 368f3474..d0d76885 100644
+--- a/deps/openssl/openssl_common.gypi
++++ b/deps/openssl/openssl_common.gypi
+@@ -16,6 +16,10 @@
+   'cflags!': ['-fvisibility=hidden'],
+   'cflags_cc!': ['-fvisibility-inlines-hidden'],
+   'conditions': [
++    # e2k: glibc has no makecontext/swapcontext for e2k -> no async jobs (as in node26 for e2k)
++    [ 'target_arch=="e2k"', {
++      'defines': [ 'OPENSSL_NO_ASYNC' ],
++    }],
+     [ 'OS in ("aix", "os400")', {
+       # AIX is missing /usr/include/endian.h
+       'defines': [
+diff --git a/deps/zstd/zstd.gyp b/deps/zstd/zstd.gyp
+index 6018f128..2cdca342 100644
+--- a/deps/zstd/zstd.gyp
++++ b/deps/zstd/zstd.gyp
+@@ -86,6 +86,10 @@
+         ],
+       },
+       'conditions': [
++        # e2k: the MCST compiler predefines __BMI2__; use zstd's portable bit code (as in node26 for e2k)
++        [ 'target_arch=="e2k"', {
++          'defines': [ 'STATIC_BMI2=0', 'DYNAMIC_BMI2=0' ],
++        }],
+         [ 'OS=="solaris"', {
+           'cflags': [ '-pthreads' ],
+           'ldflags': [ '-pthreads' ],
+diff --git a/node.gyp b/node.gyp
+index 3284323a..b83e1022 100644
+--- a/node.gyp
++++ b/node.gyp
+@@ -2154,6 +2154,11 @@
+           'defines': ['NODE_JS2C_USE_STRING_LITERALS'],
+ 	  'ldflags': [ '-lstdc++' ], #'-Wl,--whole-archive <(LIBSIMDUTF)', '-Wl,--no-whole-archive' ],
+         }],
++        # e2k: js2c is compiled against Chromium's libc++ headers (std::__Cr); host == target here, so link
++        # the libc++ of the NW.js build
++        [ 'OS=="linux" and target_arch=="e2k"', {
++          'libraries': [ '<(PRODUCT_DIR)/../nw/obj/buildtools/third_party/libc++/libcpp.a', '/usr/lib/lccrt/lib/e2k64/liblccrt_s.a' ],
++        }],
+         [ 'debug_node=="true"', {
+           'cflags!': [ '-O3' ],
+           'cflags': [ '-g', '-O0' ],

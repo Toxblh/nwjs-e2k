@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Wed, 14 Oct 2026 23:44:08 +0100
+Subject: [PATCH 79/99] v8: e2k: call C from a secondary stack, install JSPI
+
+WebAssembly stack switching (JSPI, WasmFX) runs wasm code and the
+switching builtins on secondary stacks, mmap'd apart from the main
+stack. A C function called from there faulted: ccall lends the hardware
+stack pointer %usd to C by moving it to sp - 64 with getsp, and from
+another mapping that move goes off the data stack. %usd and the hardware
+stacks cannot be switched from user mode (rwd to them is SIGILL), and
+they need not be: the code of V8 keeps its frames in memory and runs in
+one register window, only C makes hardware frames, and JS and runtime
+functions called from wasm switch to the central stack anyway.
+
+So ccall leaves %usd where enter() parked it when sp is not within
+kStackReserve above it: the C frames then go under the parked pointer on
+the main stack, where nothing is live. A C function takes its ninth and
+further parameters at %usd + 64; CallC now gets the number of stack
+words, and ccall copies them there (in place when %usd is at sp - 64).
+switch_wasmfx_stack, with 9 parameters, needs that from a secondary
+stack.
+
+This reverts the guard of "v8: e2k: do not install JSPI": WebAssembly.
+Suspending and WebAssembly.promising are installed again.
+
+mjsunit/wasm stack-switching*, jspi*, wasmfx*, resume* pass in TurboFan
+and Liftoff (18 of 18; before, 17 of them failed); all of mjsunit/wasm with
+--stress-wasm-stack-switching fails only the known denormals and
+speculative-inlining and the two wasm-to-JS wrapper profiler tests that
+the upstream status file skips in that variant.
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc    |  5 +++--
+ chromium/v8/src/codegen/e2k/assembler-e2k.h     |  3 ++-
+ chromium/v8/src/codegen/e2k/la_asm.h            | 14 ++++++++++++--
+ .../v8/src/codegen/e2k/macro-assembler-e2k.cc   |  4 +++-
+ chromium/v8/src/wasm/wasm-js.cc                 | 17 ++---------------
+ 5 files changed, 22 insertions(+), 21 deletions(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index f5e5a3d393..eb84399469 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -1137,8 +1137,9 @@ void Assembler::EmitSlots(const la::Assembler& la) {
+ 
+ void Assembler::EnterFromC(int num_args) { LA(enter(num_args)); }
+ void Assembler::ReturnToC() { LA(leave()); }
+-void Assembler::CallC(Register target, int fp_mask, int num_results) {
+-  LA(ccall(target, fp_mask, num_results));
++void Assembler::CallC(Register target, int fp_mask, int num_results,
++                      int stack_args) {
++  LA(ccall(target, fp_mask, num_results, stack_args));
+ }
+ void Assembler::TailCallC(int arg, int32_t offset) {
+   LA(tail_c(arg, offset));
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index 5c34b4272d..26d37a9112 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -405,7 +405,8 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   // included, raises SIGILL. A C function that returns nothing may leave one
+   // in its result register, so the results are passed through memory by a
+   // speculative store, which turns such a value into a plain number.
+-  void CallC(Register target, int fp_mask, int num_results);
++  void CallC(Register target, int fp_mask, int num_results,
++             int stack_args = 0);
+   // The whole body of a function called by C++ that jumps to the C++ function
+   // whose address is at [C parameter `arg` + offset], parameters untouched.
+   void TailCallC(int arg, int32_t offset);
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 7692624006..61c7755cf9 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -255,15 +255,25 @@ class Assembler : private e2k::Assembler {
+   // enter() left it (the hardware gives back the value it had at the call, T0
+   // keeps the distance): a signal that comes while this code runs must not
+   // find it above live frames.  Every register of the layer survives the call.
+-  void ccall(Register target, int fp_mask, int results) {
++  // When sp is not within kStackReserve above the parked pointer it is on a
++  // secondary stack of WebAssembly stack switching (another mapping): then
++  // the pointer stays where it is and the C frames go under it, on the main
++  // stack, where nothing is live.  Only C runs there; the hardware stacks are
++  // not switched (the code of V8 keeps its frames in memory, see
++  // e2k-kb/research/13-wasm-jspi-simd.md).  The C function takes its ninth and
++  // further parameters at the hardware pointer + 64: the `stack_args` words at
++  // sp are copied there (in place when the pointer is at sp - 64).
++  void ccall(Register target, int fp_mask, int results, int stack_args = 0) {
+     assert(fp_mask >= 0 && fp_mask < 256 && results >= 0 && results <= 2);
+     Own own(this);
+     C(rrd(0, Sreg::usd_lo, T0));
+     C(andd(0, T0, 0xffffffffffffll, T0));        // usd.base
+     C(subd(0, R(sp), T0, T0));
+-    C(subd(0, T0, 64, T0));
++    C(subd(0, T0, 64, T0); cmpbedb(1, T0, kStackReserve, PT0));
+     C(andd(0, T0, -16, T0));                     // up to sp - 64
++    C(merged(0, 0, T0, T0, PT0));                // or nowhere, off the stack
+     C(getsp(0, T0, T1));
++    for (int i = 0; i < stack_args; i++) { C(ldd(0, R(sp), 8 * i, T2)); C(std_(2, T1, 64 + 8 * i, T2)); }
+     auto arg = [&](int i) { return fp_mask >> i & 1 ? e2k::r(32 + i) : e2k::r(4 + i); };
+     C(for (int i = 0; i < 6; i++) addd(i, arg(i), 0, e2k::b(4 + i)));
+     C(movtd(R(target), e2k::ctpr1); addd(1, arg(6), 0, e2k::b(10)); addd(2, arg(7), 0, e2k::b(11)); subd(3, 0, T0, T0));
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+index f8e7a7c6cf..e439b8130f 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+@@ -5755,7 +5755,9 @@ int MacroAssembler::CallCFunctionHelper(
+     int call_pc_offset;
+     {
+       BlockTrampolinePoolScope block_trampoline_pool(this);
+-      CallC(function, fp_mask, num_results);
++      CallC(function, fp_mask, num_results,
++            CalculateStackPassedWords(num_reg_arguments,
++                                      num_double_arguments));
+       call_pc_offset = pc_offset();
+       bind(&get_pc);
+       if (return_location) bind(return_location);
+diff --git a/chromium/v8/src/wasm/wasm-js.cc b/chromium/v8/src/wasm/wasm-js.cc
+index 049cccee0a..9770961239 100644
+--- a/chromium/v8/src/wasm/wasm-js.cc
++++ b/chromium/v8/src/wasm/wasm-js.cc
+@@ -3398,19 +3398,6 @@ void WasmJs::InstallModule(Isolate* isolate,
+               SideEffectType::kHasNoSideEffect);
+ }
+ 
+-namespace {
+-#if V8_TARGET_ARCH_E2K
+-// Stack switching does not work on e2k yet: the code runs on the secondary
+-// stack, but C++ is called with the hardware stack pointer (%usd), which
+-// stays in the main stack, and the first such call faults just under it.
+-// Until that is done WebAssembly.Suspending and WebAssembly.promising are
+-// not installed, so that pages which test for them take their other path.
+-constexpr bool kJSPIAvailable = false;
+-#else
+-constexpr bool kJSPIAvailable = true;
+-#endif
+-}  // namespace
+-
+ // static
+ void WasmJs::Install(Isolate* isolate) {
+   DirectHandle<JSGlobalObject> global = isolate->global_object();
+@@ -3485,7 +3472,7 @@ void WasmJs::Install(Isolate* isolate) {
+ 
+   // Initialize and install JSPI feature.
+   // JSPI is not supported by Wasm interpreter.
+-  if (!v8_flags.wasm_jitless && kJSPIAvailable) {
++  if (!v8_flags.wasm_jitless) {
+     CHECK(native_context->is_wasm_jspi_installed() == Smi::zero());
+     isolate->WasmInitJSPIFeature();
+     InstallJSPromiseIntegration(isolate, native_context, webassembly);
+@@ -3512,7 +3499,7 @@ void WasmJs::InstallConditionalFeatures(Isolate* isolate,
+   // }
+ 
+   // Install JSPI-related features.
+-  if (!v8_flags.wasm_jitless && kJSPIAvailable) {
++  if (!v8_flags.wasm_jitless) {
+     if (context->is_wasm_jspi_installed() == Smi::zero()) {
+       isolate->WasmInitJSPIFeature();
+       if (InstallJSPromiseIntegration(isolate, context, webassembly)) {

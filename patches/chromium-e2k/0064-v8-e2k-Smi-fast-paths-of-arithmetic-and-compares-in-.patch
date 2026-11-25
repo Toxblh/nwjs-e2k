@@ -1,0 +1,685 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 20:57:27 +0100
+Subject: [PATCH 64/99] v8: e2k: Smi fast paths of arithmetic and compares in
+ baseline code
+
+Baseline code called a *_Generic_Baseline builtin for every arithmetic
+bytecode: a call through a table and a register, the Smi path, the update
+of the feedback embedded in the bytecode (two table loads one after the
+other) and a return through a register, 50-58 cycles for an operation of
+one or two. In a loop of a function called once, which is what a page in
+efficiency mode runs, that was two thirds of the time.
+
+Sparkplug+ is now built for e2k (it was x64, arm64 and loong64), and where
+the embedded feedback covers Smi operands with a Smi result the baseline
+compiler emits the operation on the tagged values itself: + - * | & ^ << >>
+>>> with a register or a constant, ++ and --, and the six compares. The
+checks are rare branches (the tag of both operands in one test, overflow by
+cmpodb of the result, a product by smulx and its sign extension, -0 from
+the signs), the builtin stays as the slow path, the feedback is left as it
+is. A compare followed by JumpIfTrue or JumpIfFalse jumps on the compare
+and passes that bytecode by; the boolean is chosen by a merge, without a
+branch. The upstream paths for ++, -- and compares (sparkplug_inline_smi,
+off by default) are used in this e2k form too.
+
+Unlike upstream the path is taken for any numeric feedback that includes
+Smis, not only for kSignedSmall: the slow path is the generic builtin, and
+a sum that overflows once in a thousand iterations has made the feedback
+kNumber before the loop is compiled. --no-sparkplug-smi-fast-paths turns it
+off. Patching of calls to typed builtins (--sparkplug-plus proper) needs
+short builtin calls and stays off.
+
+bench.js intLoop under --no-opt: 4608 -> about 1100 ms.
+---
+ chromium/v8/BUILD.gn                          |   7 +-
+ chromium/v8/src/baseline/baseline-assembler.h |  22 ++
+ chromium/v8/src/baseline/baseline-compiler.cc | 158 ++++++++-
+ chromium/v8/src/baseline/baseline-compiler.h  |  14 +
+ .../baseline/e2k/baseline-assembler-e2k-inl.h | 299 +++++++++++++++++-
+ chromium/v8/src/flags/flag-definitions.h      |   8 +
+ 6 files changed, 495 insertions(+), 13 deletions(-)
+
+diff --git a/chromium/v8/BUILD.gn b/chromium/v8/BUILD.gn
+index 61267757a7..b9edad1504 100644
+--- a/chromium/v8/BUILD.gn
++++ b/chromium/v8/BUILD.gn
+@@ -665,9 +665,10 @@ if (v8_enable_external_code_space == "") {
+ if (v8_enable_sparkplug == "") {
+   v8_enable_sparkplug = !v8_jitless
+ }
+-v8_enable_sparkplug_plus = v8_enable_sparkplug && (v8_current_cpu == "x64" ||
+-                                                   v8_current_cpu == "arm64" ||
+-                                                   v8_current_cpu == "loong64")
++v8_enable_sparkplug_plus =
++    v8_enable_sparkplug &&
++    (v8_current_cpu == "x64" || v8_current_cpu == "arm64" ||
++     v8_current_cpu == "loong64" || v8_current_cpu == "e2k")
+ if (v8_enable_maglev == "") {
+   v8_enable_maglev =
+       v8_enable_turbofan &&
+diff --git a/chromium/v8/src/baseline/baseline-assembler.h b/chromium/v8/src/baseline/baseline-assembler.h
+index d5aebea695..7299aa5c68 100644
+--- a/chromium/v8/src/baseline/baseline-assembler.h
++++ b/chromium/v8/src/baseline/baseline-assembler.h
+@@ -252,6 +252,28 @@ class BaselineAssembler {
+   inline void SmiAddConstantAndJumpIfOverflow(
+       Register value, int constant, Label* overflow,
+       Label::Distance distance = Label::kFar);
++
++#if V8_TARGET_ARCH_E2K
++  // Whether SmiBinaryOp (SmiBinaryOpConstant with this constant) has a fast
++  // path for |op|.
++  static inline bool HasSmiBinaryOp(Operation op);
++  static inline bool HasSmiBinaryOpConstant(Operation op, int constant);
++  // value := lhs <op> value (value := value <op> Smi(constant)) when the
++  // operands are Smis and so is the result. Otherwise jumps to |slow| with
++  // |value| and |lhs| as they were.
++  inline void SmiBinaryOp(Operation op, Register value, Register lhs,
++                          Label* slow);
++  inline void SmiBinaryOpConstant(Operation op, Register value, int constant,
++                                  Label* slow);
++  // value := the boolean of lhs <op> value when both are Smis, without a
++  // branch. Otherwise jumps to |slow| with |value| as it was.
++  inline void SmiCompare(Operation op, Register value, Register lhs,
++                         Label* slow);
++  // The same, then jumps to |if_true| or to |if_false| on the compare
++  // itself: for a compare whose boolean the next bytecode jumps on.
++  inline void SmiCompareAndJump(Operation op, Register value, Register lhs,
++                                Label* slow, Label* if_true, Label* if_false);
++#endif  // V8_TARGET_ARCH_E2K
+ #endif  // V8_ENABLE_SPARKPLUG_PLUS
+ 
+   inline void Switch(Register reg, int case_value_base, Label** labels,
+diff --git a/chromium/v8/src/baseline/baseline-compiler.cc b/chromium/v8/src/baseline/baseline-compiler.cc
+index 52d26d78bf..dccb250ca1 100644
+--- a/chromium/v8/src/baseline/baseline-compiler.cc
++++ b/chromium/v8/src/baseline/baseline-compiler.cc
+@@ -1253,6 +1253,100 @@ void BaselineCompiler::VisitDefineKeyedOwnPropertyInLiteral() {
+               FeedbackSlotAsTagged(3));         // slot
+ }
+ 
++#if defined(V8_ENABLE_SPARKPLUG_PLUS) && V8_TARGET_ARCH_E2K
++namespace {
++// The fast path leaves the feedback alone, so the feedback has to cover Smi
++// operands with a Smi result already. With the generic builtin as the slow
++// path it may cover more: a sum that left the range of Smis once in a
++// thousand iterations makes the feedback kSignedSmallInputs or kNumber long
++// before the loop gets its baseline code.
++bool InlineSmiPathFor(BinaryOperationFeedback::Type type) {
++  using Feedback = BinaryOperationFeedback;
++  switch (type) {
++    case Feedback::kSignedSmall:
++    case Feedback::kSignedSmallInputs:
++    case Feedback::kAdditiveSafeInteger:
++    case Feedback::kNumber:
++    case Feedback::kNumberOrOddball:
++      return v8_flags.sparkplug_smi_fast_paths;
++    default:
++      return false;
++  }
++}
++bool InlineSmiPathFor(CompareOperationFeedback::Type type) {
++  using Feedback = CompareOperationFeedback;
++  switch (type) {
++    case Feedback::kSignedSmall:
++    case Feedback::kNumber:
++    case Feedback::kNumberOrBoolean:
++    case Feedback::kNumberOrOddball:
++      return v8_flags.sparkplug_smi_fast_paths;
++    default:
++      return false;
++  }
++}
++bool InlineSmiPathFor(uint8_t feedback) {
++  using Feedback = BinaryOperationFeedback;
++  return InlineSmiPathFor(
++      Feedback::DecodeTypeIndex(static_cast<Feedback::TypeIndex>(feedback)));
++}
++}  // namespace
++
++bool BaselineCompiler::EmitInlineSmiBinaryFastPath(Operation operation,
++                                                   interpreter::Register lhs,
++                                                   Register rhs,
++                                                   uint8_t feedback,
++                                                   Label* done) {
++  DCHECK_EQ(rhs, kInterpreterAccumulatorRegister);
++  if (allow_sparkplug_plus_ || !InlineSmiPathFor(feedback) ||
++      !BaselineAssembler::HasSmiBinaryOp(operation)) {
++    return false;
++  }
++  ASM_CODE_COMMENT_STRING(&masm_, "inlined Smi binary fast path");
++  Label slow;
++  {
++    BaselineAssembler::ScratchRegisterScope scratch_scope(&basm_);
++    Register lhs_reg = scratch_scope.AcquireScratch();
++    __ Move(lhs_reg, lhs);
++    __ SmiBinaryOp(operation, rhs, lhs_reg, &slow);
++  }
++  __ Jump(done);
++  __ Bind(&slow);
++  return true;
++}
++
++bool BaselineCompiler::EmitInlineSmiBinaryFastPath(Operation operation,
++                                                   Register lhs,
++                                                   Tagged<Smi> rhs,
++                                                   uint8_t feedback,
++                                                   Label* done) {
++  DCHECK_EQ(lhs, kInterpreterAccumulatorRegister);
++  if (allow_sparkplug_plus_ || !InlineSmiPathFor(feedback) ||
++      !BaselineAssembler::HasSmiBinaryOpConstant(operation, rhs.value())) {
++    return false;
++  }
++  ASM_CODE_COMMENT_STRING(&masm_, "inlined Smi binary fast path");
++  Label slow;
++  __ SmiBinaryOpConstant(operation, lhs, rhs.value(), &slow);
++  __ Jump(done);
++  __ Bind(&slow);
++  return true;
++}
++
++// The fast path first; the call that the rest of the visitor emits is then
++// its slow path.
++#define INLINE_SMI_BINARY_FAST_PATH(Name, Lhs, Rhs)                       \
++  Label inline_smi_done;                                                  \
++  bool inline_smi = EmitInlineSmiBinaryFastPath(                          \
++      Operation::k##Name, Lhs, Rhs,                                       \
++      EmbeddedFeedback(kEmbeddedFeedbackOperandIndex), &inline_smi_done);
++#define INLINE_SMI_BINARY_DONE() \
++  if (inline_smi) __ Bind(&inline_smi_done);
++#else
++#define INLINE_SMI_BINARY_FAST_PATH(Name, Lhs, Rhs)
++#define INLINE_SMI_BINARY_DONE()
++#endif  // V8_ENABLE_SPARKPLUG_PLUS && V8_TARGET_ARCH_E2K
++
+ #ifdef V8_ENABLE_SPARKPLUG_PLUS
+ #define TYPED_BINOP_CASE(type, name, lhs_expr, rhs_expr)                      \
+   case BinaryOperationFeedback::Type::k##type:                                \
+@@ -1265,6 +1359,7 @@ void BaselineCompiler::VisitDefineKeyedOwnPropertyInLiteral() {
+   using Feedback = BinaryOperationFeedback;                                 \
+   auto feedback_index_offset =                                              \
+       iterator().GetEmbeddedFeedbackOffset(kEmbeddedFeedbackOperandIndex);  \
++  INLINE_SMI_BINARY_FAST_PATH(Name, Lhs, Rhs)                               \
+   if (allow_sparkplug_plus_) {                                              \
+     switch (Feedback::DecodeTypeIndex(static_cast<Feedback::TypeIndex>(     \
+         EmbeddedFeedback(kEmbeddedFeedbackOperandIndex)))) {                \
+@@ -1276,7 +1371,8 @@ void BaselineCompiler::VisitDefineKeyedOwnPropertyInLiteral() {
+   } else {                                                                  \
+     CallBuiltin<Builtin::k##GenericName##_Generic_Baseline>(                \
+         Lhs, Rhs, feedback_index_offset);                                   \
+-  }
++  }                                                                         \
++  INLINE_SMI_BINARY_DONE()
+ #else
+ #define VISIT_TYPED_BINARY_OPERATION(TypedStubList, Name, GenericName, Lhs, \
+                                      Rhs)                                   \
+@@ -1472,6 +1568,8 @@ void BaselineCompiler::VisitShiftRightLogicalSmi() {
+ #undef TYPED_BINOP_CASE
+ #endif  // V8_ENABLE_SPARKPLUG_PLUS
+ #undef VISIT_TYPED_BINARY_OPERATION
++#undef INLINE_SMI_BINARY_FAST_PATH
++#undef INLINE_SMI_BINARY_DONE
+ 
+ #ifdef V8_ENABLE_SPARKPLUG_PLUS
+ template <Operation kOperation, Builtin kSmiBuiltin, Builtin kGenericBuiltin>
+@@ -1479,20 +1577,35 @@ bool BaselineCompiler::TryEmitInlineSmiUnary(
+     BinaryOperationFeedback::Type feedback_type, int feedback_index_offset) {
+   static_assert(kOperation == Operation::kIncrement ||
+                 kOperation == Operation::kDecrement);
++#if V8_TARGET_ARCH_E2K
++  if (allow_sparkplug_plus_ || !InlineSmiPathFor(feedback_type)) {
++    if (!v8_flags.sparkplug_inline_smi) return false;
++    if (feedback_type != BinaryOperationFeedback::Type::kSignedSmall) {
++      return false;
++    }
++  }
++#else
+   if (!v8_flags.sparkplug_inline_smi) {
+     return false;
+   }
+   if (feedback_type != BinaryOperationFeedback::Type::kSignedSmall) {
+     return false;
+   }
++#endif
+ 
+   ASM_CODE_COMMENT_STRING(&masm_, "inlined Smi unary fast path");
+   constexpr int kDelta = kOperation == Operation::kIncrement ? 1 : -1;
+   Label slow, done;
++#if V8_TARGET_ARCH_E2K
++  // The two checks as branches that are almost never taken.
++  __ SmiBinaryOpConstant(Operation::kAdd, kInterpreterAccumulatorRegister,
++                         kDelta, &slow);
++#else
+   __ JumpIfNotSmi(kInterpreterAccumulatorRegister, &slow, Label::kNear);
+   // Smi overflow bails out so that the stub records kNumber for the patcher.
+   __ SmiAddConstantAndJumpIfOverflow(kInterpreterAccumulatorRegister, kDelta,
+                                      &slow, Label::kNear);
++#endif
+   __ Jump(&done);
+ 
+   __ Bind(&slow);
+@@ -1981,15 +2094,57 @@ template <Operation kOperation, Builtin kSmiBuiltin, Builtin kGenericBuiltin>
+ bool BaselineCompiler::TryEmitInlineSmiCompare(
+     CompareOperationFeedback::Type feedback_type, int feedback_index_offset) {
+   static_assert(IsComparisonOperation(kOperation));
++#if V8_TARGET_ARCH_E2K
++  if (allow_sparkplug_plus_ || !InlineSmiPathFor(feedback_type)) {
++    if (!v8_flags.sparkplug_inline_smi) return false;
++    if (feedback_type != CompareOperationFeedback::Type::kSignedSmall) {
++      return false;
++    }
++  }
++#else
+   if (!v8_flags.sparkplug_inline_smi) {
+     return false;
+   }
+   if (feedback_type != CompareOperationFeedback::Type::kSignedSmall) {
+     return false;
+   }
++#endif
+ 
+   ASM_CODE_COMMENT_STRING(&masm_, "inlined Smi compare fast path");
+   Label slow, done;
++#if V8_TARGET_ARCH_E2K
++  {
++    // A compare and a choice of the boolean on its predicate: no branch.
++    BaselineAssembler::ScratchRegisterScope scratch_scope(&basm_);
++    Register lhs = scratch_scope.AcquireScratch();
++    __ Move(lhs, RegisterOperand(0));
++    // When the next bytecode jumps on the boolean, the fast path jumps on
++    // the compare and passes that bytecode by: it would compare the boolean
++    // with a root and jump over a jump.
++    interpreter::BytecodeArrayIterator next(bytecode_,
++                                            iterator().next_offset());
++    bool jump_if_true = false;
++    bool jump_if_false = false;
++    if (!next.done()) {
++      interpreter::Bytecode next_bytecode = next.current_bytecode();
++      jump_if_true = next_bytecode == interpreter::Bytecode::kJumpIfTrue ||
++                     next_bytecode == interpreter::Bytecode::kJumpIfTrueConstant;
++      jump_if_false =
++          next_bytecode == interpreter::Bytecode::kJumpIfFalse ||
++          next_bytecode == interpreter::Bytecode::kJumpIfFalseConstant;
++    }
++    if (jump_if_true || jump_if_false) {
++      Label* target = EnsureLabel(next.GetJumpTargetOffset());
++      Label* after = EnsureLabel(next.next_offset());
++      __ SmiCompareAndJump(kOperation, kInterpreterAccumulatorRegister, lhs,
++                           &slow, jump_if_true ? target : after,
++                           jump_if_true ? after : target);
++    } else {
++      __ SmiCompare(kOperation, kInterpreterAccumulatorRegister, lhs, &slow);
++      __ Jump(&done);
++    }
++  }
++#else
+   {
+     BaselineAssembler::ScratchRegisterScope scratch_scope(&basm_);
+     Register lhs = scratch_scope.AcquireScratch();
+@@ -2034,6 +2189,7 @@ bool BaselineCompiler::TryEmitInlineSmiCompare(
+         });
+   }
+   __ Jump(&done);
++#endif  // V8_TARGET_ARCH_E2K
+ 
+   __ Bind(&slow);
+   if (allow_sparkplug_plus_) {
+diff --git a/chromium/v8/src/baseline/baseline-compiler.h b/chromium/v8/src/baseline/baseline-compiler.h
+index 724996805a..5fa76e8047 100644
+--- a/chromium/v8/src/baseline/baseline-compiler.h
++++ b/chromium/v8/src/baseline/baseline-compiler.h
+@@ -155,6 +155,20 @@ class BaselineCompiler {
+   template <Operation kOperation, Builtin kSmiBuiltin, Builtin kGenericBuiltin>
+   bool TryEmitInlineSmiUnary(BinaryOperationFeedback::Type feedback_type,
+                              int feedback_index_offset);
++
++#if V8_TARGET_ARCH_E2K
++  // Emits the Smi fast path of a binary operation that ends with a jump to
++  // |done| and leaves the assembler at its slow path, where the caller emits
++  // the call of the builtin and then binds |done|. Returns false without
++  // emitting anything when the embedded feedback is not exactly kSignedSmall
++  // or there is no fast path for the operation.
++  bool EmitInlineSmiBinaryFastPath(Operation operation,
++                                   interpreter::Register lhs, Register rhs,
++                                   uint8_t feedback, Label* done);
++  bool EmitInlineSmiBinaryFastPath(Operation operation, Register lhs,
++                                   Tagged<Smi> rhs, uint8_t feedback,
++                                   Label* done);
++#endif  // V8_TARGET_ARCH_E2K
+ #endif  // V8_ENABLE_SPARKPLUG_PLUS
+ 
+   // Jumps based on calling ToBoolean on kInterpreterAccumulatorRegister.
+diff --git a/chromium/v8/src/baseline/e2k/baseline-assembler-e2k-inl.h b/chromium/v8/src/baseline/e2k/baseline-assembler-e2k-inl.h
+index 800e8b1430..81a0cc8e5d 100644
+--- a/chromium/v8/src/baseline/e2k/baseline-assembler-e2k-inl.h
++++ b/chromium/v8/src/baseline/e2k/baseline-assembler-e2k-inl.h
+@@ -198,19 +198,300 @@ void BaselineAssembler::SmiAddConstantAndJumpIfOverflow(Register value,
+                                                         Label* overflow,
+                                                         Label::Distance) {
+   DCHECK(Smi::IsValid(constant));
++  static_assert(!SmiValuesAre31Bits());
+   ScratchRegisterScope temps(this);
+   Register scratch1 = temps.AcquireScratch();
+   Register scratch2 = temps.AcquireScratch();
+-  if (SmiValuesAre31Bits()) {
+-    __ slli_w(scratch1, value, 0);
+-    __ Add_w(scratch2, scratch1, Operand(Smi::FromInt(constant)));
+-    __ Branch(overflow, constant > 0 ? lt : gt, scratch2, Operand(scratch1));
+-    __ Move(value, scratch2);
+-  } else {
+-    __ Add_d(scratch1, value, Operand(Smi::FromInt(constant)));
+-    __ Branch(overflow, constant > 0 ? lt : gt, scratch1, Operand(value));
+-    __ Move(value, scratch1);
++  __ li(scratch2, Operand(Smi::FromInt(constant)));
++  __ add_d(scratch1, value, scratch2);
++  __ BranchSubOverflow(overflow, Condition::overflow, scratch1,
++                       Operand(value));
++  __ Move(value, scratch1);
++}
++
++namespace detail {
++// For MacroAssembler::RareBranchScope: every register but these is read by
++// the code at the target.
++inline uint64_t LiveExcept(std::initializer_list<Register> scratch) {
++  uint64_t live = Assembler::kAllLive;
++  for (Register reg : scratch) live &= ~(uint64_t{1} << reg.code());
++  return live;
++}
++}  // namespace detail
++
++// The fast paths below work on tagged values: a Smi is the number in the
++// upper 32 bits over 32 zero bits, so sums, differences and bitwise results
++// of Smis are tagged as they come, and an addition or a subtraction leaves
++// the range of Smis exactly when it overflows 64 bits. The checks are
++// branches that are almost never taken; the result goes into |value| after
++// the last of them, since the slow path wants |value| as it was.
++
++bool BaselineAssembler::HasSmiBinaryOp(Operation op) {
++  switch (op) {
++    case Operation::kAdd:
++    case Operation::kSubtract:
++    case Operation::kMultiply:
++    case Operation::kBitwiseOr:
++    case Operation::kBitwiseAnd:
++    case Operation::kBitwiseXor:
++    case Operation::kShiftLeft:
++    case Operation::kShiftRight:
++    case Operation::kShiftRightLogical:
++      return true;
++    default:
++      return false;
++  }
++}
++
++bool BaselineAssembler::HasSmiBinaryOpConstant(Operation op, int constant) {
++  // The sign of a zero product needs the sign of the other operand, and the
++  // constant is seldom anything but a small positive number.
++  if (op == Operation::kMultiply) return constant > 0;
++  return HasSmiBinaryOp(op);
++}
++
++void BaselineAssembler::SmiBinaryOp(Operation op, Register value, Register lhs,
++                                    Label* slow) {
++  static_assert(!SmiValuesAre31Bits());
++  static_assert(kSmiTag == 0 && kSmiShift == 32);
++  ScratchRegisterScope temps(this);
++  Register both = temps.AcquireScratch();
++  Register scratch = temps.AcquireScratch();
++  // The slow path takes the left operand from the frame again.
++  MacroAssembler::RareBranchScope rare(
++      masm_, true, detail::LiveExcept({lhs, both, scratch}));
++  __ or_(both, lhs, value);
++  __ BranchTst(slow, ne, both, Operand(kSmiTagMask));
++  switch (op) {
++    case Operation::kAdd:
++      // The sum overflowed when sum - lhs does.
++      __ add_d(scratch, lhs, value);
++      __ BranchSubOverflow(slow, Condition::overflow, scratch, Operand(lhs));
++      __ mov(value, scratch);
++      break;
++    case Operation::kSubtract:
++      __ sub_d(scratch, lhs, value);
++      __ BranchSubOverflow(slow, Condition::overflow, lhs, Operand(scratch));
++      __ mov(value, scratch);
++      break;
++    case Operation::kMultiply:
++      // The product of the numbers in 64 bits is a Smi when it is its own
++      // lower half sign-extended. A zero product with a negative operand is
++      // -0: with the sign of lhs | value spread over a word, product | ~sign
++      // is zero just then.
++      __ srai_d(scratch, lhs, kSmiShift);
++      __ srai_d(both, both, 63);
++      {
++        ScratchRegisterScope more_temps(this);
++        Register scratch2 = more_temps.AcquireScratch();
++        MacroAssembler::RareBranchScope rare_mul(
++            masm_, true, detail::LiveExcept({lhs, both, scratch, scratch2}));
++        __ srai_d(scratch2, value, kSmiShift);
++        __ mulw_d_w(scratch, scratch, scratch2);
++        __ slli_w(scratch2, scratch, 0);
++        __ Branch(slow, ne, scratch, Operand(scratch2));
++        __ orn(scratch2, scratch, both);
++        __ Branch(slow, eq, scratch2, Operand(zero_reg));
++      }
++      __ slli_d(value, scratch, kSmiShift);
++      break;
++    case Operation::kBitwiseOr:
++      __ mov(value, both);
++      break;
++    case Operation::kBitwiseAnd:
++      __ and_(value, lhs, value);
++      break;
++    case Operation::kBitwiseXor:
++      __ xor_(value, lhs, value);
++      break;
++    case Operation::kShiftLeft:
++      // The bits that leave the upper half are the ones that leave int32.
++      __ srai_d(scratch, value, kSmiShift);
++      __ andi(scratch, scratch, 31);
++      __ sll_d(value, lhs, scratch);
++      break;
++    case Operation::kShiftRight:
++      __ srai_d(scratch, value, kSmiShift);
++      __ andi(scratch, scratch, 31);
++      __ srai_d(both, lhs, kSmiShift);
++      __ sra_d(both, both, scratch);
++      __ slli_d(value, both, kSmiShift);
++      break;
++    case Operation::kShiftRightLogical:
++      // The result is a uint32: not a Smi from 2^31 on.
++      __ srai_d(scratch, value, kSmiShift);
++      __ andi(scratch, scratch, 31);
++      __ srli_d(both, lhs, kSmiShift);
++      __ srl_d(both, both, scratch);
++      __ BranchTst(slow, ne, both, Operand(int64_t{1} << 31));
++      __ slli_d(value, both, kSmiShift);
++      break;
++    default:
++      UNREACHABLE();
++  }
++}
++
++void BaselineAssembler::SmiBinaryOpConstant(Operation op, Register value,
++                                            int constant, Label* slow) {
++  static_assert(!SmiValuesAre31Bits());
++  static_assert(kSmiTag == 0 && kSmiShift == 32);
++  DCHECK(Smi::IsValid(constant));
++  ScratchRegisterScope temps(this);
++  Register scratch = temps.AcquireScratch();
++  Register scratch2 = temps.AcquireScratch();
++  MacroAssembler::RareBranchScope rare(
++      masm_, true, detail::LiveExcept({scratch, scratch2}));
++  int64_t tagged = static_cast<int64_t>(Smi::FromInt(constant).ptr());
++  int shift = constant & 31;
++  if (op == Operation::kShiftRightLogical && shift == 0) {
++    // A negative number is not a Smi as a uint32.
++    __ BranchTst(slow, ne, value,
++                 Operand(std::numeric_limits<int64_t>::min() | kSmiTagMask));
++    return;
++  }
++  __ BranchTst(slow, ne, value, Operand(kSmiTagMask));
++  switch (op) {
++    case Operation::kAdd:
++      __ li(scratch2, Operand(tagged));
++      __ add_d(scratch, value, scratch2);
++      __ BranchSubOverflow(slow, Condition::overflow, scratch, Operand(value));
++      __ mov(value, scratch);
++      break;
++    case Operation::kSubtract:
++      __ li(scratch2, Operand(tagged));
++      __ sub_d(scratch, value, scratch2);
++      __ BranchSubOverflow(slow, Condition::overflow, value, Operand(scratch));
++      __ mov(value, scratch);
++      break;
++    case Operation::kMultiply:
++      // A positive constant: the product is zero only for zero, and +0.
++      DCHECK_GT(constant, 0);
++      __ srai_d(scratch, value, kSmiShift);
++      __ li(scratch2, Operand(static_cast<int64_t>(constant)));
++      __ mulw_d_w(scratch, scratch, scratch2);
++      __ slli_w(scratch2, scratch, 0);
++      __ Branch(slow, ne, scratch, Operand(scratch2));
++      __ slli_d(value, scratch, kSmiShift);
++      break;
++    case Operation::kBitwiseOr:
++      if (constant != 0) {
++        __ li(scratch, Operand(tagged));
++        __ or_(value, value, scratch);
++      }
++      break;
++    case Operation::kBitwiseAnd:
++      __ li(scratch, Operand(tagged));
++      __ and_(value, value, scratch);
++      break;
++    case Operation::kBitwiseXor:
++      if (constant != 0) {
++        __ li(scratch, Operand(tagged));
++        __ xor_(value, value, scratch);
++      }
++      break;
++    case Operation::kShiftLeft:
++      if (shift != 0) __ slli_d(value, value, shift);
++      break;
++    case Operation::kShiftRight:
++      if (shift != 0) {
++        __ srai_d(scratch, value, kSmiShift + shift);
++        __ slli_d(value, scratch, kSmiShift);
++      }
++      break;
++    case Operation::kShiftRightLogical:
++      __ srli_d(scratch, value, kSmiShift + shift);
++      __ slli_d(value, scratch, kSmiShift);
++      break;
++    default:
++      UNREACHABLE();
++  }
++}
++
++void BaselineAssembler::SmiCompare(Operation op, Register value, Register lhs,
++                                   Label* slow) {
++  ScratchRegisterScope temps(this);
++  Register both = temps.AcquireScratch();
++  Register if_true = temps.AcquireScratch();
++  Register if_false = temps.AcquireScratch();
++  MacroAssembler::RareBranchScope rare(
++      masm_, true, detail::LiveExcept({lhs, both, if_true, if_false}));
++  __ or_(both, lhs, value);
++  // Before the branch: loads from the roots are not moved over it.
++  __ LoadRoot(if_true, RootIndex::kTrueValue);
++  __ LoadRoot(if_false, RootIndex::kFalseValue);
++  __ BranchTst(slow, ne, both, Operand(kSmiTagMask));
++  switch (op) {
++    case Operation::kEqual:
++    case Operation::kStrictEqual:
++      __ seleq(value, lhs, value, if_true, if_false);
++      break;
++    case Operation::kLessThan:
++      __ sellt(value, lhs, value, if_true, if_false);
++      break;
++    case Operation::kGreaterThan:
++      __ sellt(value, value, lhs, if_true, if_false);
++      break;
++    case Operation::kLessThanOrEqual:
++      __ sellt(value, value, lhs, if_false, if_true);
++      break;
++    case Operation::kGreaterThanOrEqual:
++      __ sellt(value, lhs, value, if_false, if_true);
++      break;
++    default:
++      UNREACHABLE();
++  }
++}
++
++void BaselineAssembler::SmiCompareAndJump(Operation op, Register value,
++                                          Register lhs, Label* slow,
++                                          Label* if_true, Label* if_false) {
++  ScratchRegisterScope temps(this);
++  Register rhs = temps.AcquireScratch();
++  Register boolean = temps.AcquireScratch();
++  Register other = temps.AcquireScratch();
++  __ mov(rhs, value);
++  {
++    MacroAssembler::RareBranchScope rare(
++        masm_, true, detail::LiveExcept({lhs, rhs, boolean, other}));
++    __ LoadRoot(boolean, RootIndex::kTrueValue);
++    __ LoadRoot(other, RootIndex::kFalseValue);
++    __ BranchTst(slow, ne, lhs, Operand(kSmiTagMask));
++    __ BranchTst(slow, ne, rhs, Operand(kSmiTagMask));
++  }
++  // The jump to |if_true| is taken when a <cc> b.
++  Condition cc = lt;
++  Register a = lhs;
++  Register b = rhs;
++  switch (op) {
++    case Operation::kEqual:
++    case Operation::kStrictEqual:
++      cc = eq;
++      __ seleq(boolean, lhs, rhs, boolean, other);
++      break;
++    case Operation::kLessThan:
++      __ sellt(boolean, lhs, rhs, boolean, other);
++      break;
++    case Operation::kGreaterThan:
++      a = rhs;
++      b = lhs;
++      __ sellt(boolean, rhs, lhs, boolean, other);
++      break;
++    case Operation::kLessThanOrEqual:
++      cc = ge;
++      a = rhs;
++      b = lhs;
++      __ sellt(boolean, rhs, lhs, other, boolean);
++      break;
++    case Operation::kGreaterThanOrEqual:
++      cc = ge;
++      __ sellt(boolean, lhs, rhs, other, boolean);
++      break;
++    default:
++      UNREACHABLE();
+   }
++  __ mov(value, boolean);
++  __ Branch(if_true, cc, a, Operand(b));
++  __ Branch(if_false);
+ }
+ #endif  // V8_ENABLE_SPARKPLUG_PLUS
+ 
+diff --git a/chromium/v8/src/flags/flag-definitions.h b/chromium/v8/src/flags/flag-definitions.h
+index 4fab7bf0d8..a579c3606c 100644
+--- a/chromium/v8/src/flags/flag-definitions.h
++++ b/chromium/v8/src/flags/flag-definitions.h
+@@ -3306,6 +3306,14 @@ DEFINE_BOOL_READONLY(sparkplug_inline_smi, false,
+                      "operations into baseline code")
+ #endif
+ DEFINE_IMPLICATION(sparkplug_plus, short_builtin_calls)
++#if defined(V8_ENABLE_SPARKPLUG_PLUS) && V8_TARGET_ARCH_E2K
++// On e2k every operation of baseline code that goes to a builtin pays for
++// two transfers through a register and for the feedback update there: an
++// order of magnitude more than the operation on Smis itself.
++DEFINE_BOOL(sparkplug_smi_fast_paths, true,
++            "baseline code does arithmetic, bitwise operations and compares "
++            "on Smis itself where the feedback says the operands are Smis")
++#endif
+ 
+ DEFINE_BOOL(super_ic, true, "use an IC for super property loads")
+ 

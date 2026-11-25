@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 03:24:34 +0100
+Subject: [PATCH 36/99] v8: e2k: load constants without relocation by a plain
+ instruction
+
+li64 keeps a slot to itself because its literal is found and replaced
+later. A constant that nobody patches does not need that and can share
+a wide command with its neighbours.
+---
+ chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+index 79c9b20cef..62b494567f 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+@@ -1799,7 +1799,12 @@ void MacroAssembler::li(Register rd, Operand j, LiFlags mode) {
+     immediate = j.immediate();
+   }
+   if (MustUseReg(j.rmode())) RecordRelocInfo(j.rmode(), immediate);
+-  li64(rd, immediate);
++  if (mode == OPTIMIZE_SIZE && !MustUseReg(j.rmode()) &&
++      !j.IsHeapNumberRequest()) {
++    Assembler::li(rd, immediate);
++  } else {
++    li64(rd, immediate);
++  }
+ }
+ 
+ void MacroAssembler::LoadIsolateField(Register dst, IsolateFieldId id) {

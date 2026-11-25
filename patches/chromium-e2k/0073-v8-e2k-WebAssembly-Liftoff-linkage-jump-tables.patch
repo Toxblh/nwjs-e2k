@@ -1,0 +1,416 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 23:07:54 +0100
+Subject: [PATCH 73/99] v8: e2k: WebAssembly: Liftoff, linkage, jump tables
+
+d8 builds with v8_enable_webassembly = true and runs modules compiled by
+TurboFan and by Liftoff.
+
+- wasm-linkage.h, liftoff-assembler-defs.h: the registers of loong64 (the
+  instruction layer is the same).
+- liftoff-assembler-e2k-inl.h: the loong64 file. The frame set-up keeps
+  its three instructions in their own slots and counts branch offsets in
+  instructions; an i32 returned by a C function is sign-extended (clang
+  returns it zero-extended).
+- Jump tables are built by the instruction layer
+  (Assembler::WasmJumpSlot, WasmFarJumpSlot, WasmLazyCompileSlot): a jump
+  slot is one instruction, b, patched in its 32-bit displacement; a far
+  jump slot is li64 and jirl, patched in the 64-bit literal; a lazy
+  compile slot is li and b. A code space is at most 512 MB.
+- e2k joins loong64 in the lists of architectures with the generic
+  JS-to-wasm and wasm-to-JS wrappers, far jumps between code spaces, i64
+  rotations in Liftoff, the JSPI handler table entry and code coverage.
+- CpuFeatures::SupportsSimd128() is false: modules with simd128 are
+  refused.
+
+The trap handler stays off (explicit bounds and null checks).
+---
+ chromium/v8/BUILD.gn                          |  1 +
+ .../src/builtins/setup-builtins-internal.cc   |  3 +-
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc  | 52 +++++++++++++---
+ chromium/v8/src/codegen/e2k/assembler-e2k.h   | 15 +++++
+ chromium/v8/src/common/globals.h              |  4 ++
+ chromium/v8/src/flags/flag-definitions.h      |  2 +-
+ .../wasm/baseline/liftoff-assembler-defs.h    |  2 +-
+ .../src/wasm/baseline/liftoff-assembler-inl.h |  2 +
+ .../v8/src/wasm/baseline/liftoff-assembler.h  |  2 +-
+ .../v8/src/wasm/baseline/liftoff-compiler.cc  |  6 +-
+ chromium/v8/src/wasm/function-compiler.h      |  2 +-
+ chromium/v8/src/wasm/jump-table-assembler.cc  | 62 +++++++++++++++++++
+ chromium/v8/src/wasm/jump-table-assembler.h   |  6 ++
+ chromium/v8/src/wasm/wasm-code-manager.h      |  2 +-
+ chromium/v8/src/wasm/wasm-linkage.h           |  2 +-
+ chromium/v8/src/wasm/wasm-objects.cc          |  3 +-
+ 16 files changed, 148 insertions(+), 18 deletions(-)
+
+diff --git a/chromium/v8/BUILD.gn b/chromium/v8/BUILD.gn
+index b9edad1504..5b5a8014bf 100644
+--- a/chromium/v8/BUILD.gn
++++ b/chromium/v8/BUILD.gn
+@@ -5335,6 +5335,7 @@ v8_header_set("v8_internal_headers") {
+       "src/compiler/backend/e2k/instruction-codes-e2k.h",
+       "src/execution/e2k/frame-constants-e2k.h",
+       "src/regexp/e2k/regexp-macro-assembler-e2k.h",
++      "src/wasm/baseline/e2k/liftoff-assembler-e2k-inl.h",
+     ]
+     if (v8_enable_sparkplug) {
+       sources += [
+diff --git a/chromium/v8/src/builtins/setup-builtins-internal.cc b/chromium/v8/src/builtins/setup-builtins-internal.cc
+index 93d6879a0b..ef333a41f6 100644
+--- a/chromium/v8/src/builtins/setup-builtins-internal.cc
++++ b/chromium/v8/src/builtins/setup-builtins-internal.cc
+@@ -215,7 +215,8 @@ V8_NOINLINE Tagged<Code> BuildWithMacroAssembler(
+ #if V8_ENABLE_WEBASSEMBLY &&                                                   \
+     (V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_IA32 ||      \
+      V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_RISCV64 || V8_TARGET_ARCH_LOONG64 || \
+-     V8_TARGET_ARCH_PPC64 || V8_TARGET_ARCH_S390X || V8_TARGET_ARCH_RISCV32)
++     V8_TARGET_ARCH_PPC64 || V8_TARGET_ARCH_S390X || V8_TARGET_ARCH_RISCV32 || \
++     V8_TARGET_ARCH_E2K)
+   if (builtin == Builtin::kWasmReturnPromiseOnSuspendAsm) {
+     handler_table_offset = HandlerTable::EmitReturnTableStart(&masm);
+     HandlerTable::EmitReturnEntry(
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index 5c97d321ae..f5e5a3d393 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -33,11 +33,10 @@ namespace v8 {
+ namespace internal {
+ 
+ bool CpuFeatures::SupportsSimd128() {
+-#if V8_ENABLE_SIMD128
+-  return IsSupported(LSX);
+-#else
++  // The 128-bit instructions of the backend are still those of LoongArch
++  // (LSX), which the assembler turns into a trap: WebAssembly modules that
++  // use simd128 are refused.
+   return false;
+-#endif  // V8_ENABLE_SIMD128
+ }
+ 
+ void CpuFeatures::ProbeImpl(bool cross_compile) {
+@@ -46,9 +45,6 @@ void CpuFeatures::ProbeImpl(bool cross_compile) {
+   // Only use statically determined features for cross compile (snapshot).
+   if (cross_compile) return;
+ 
+-  // Probe for additional features at runtime.
+-  base::CPU cpu;
+-  if (cpu.has_lsx()) supported_.Add(LSX);
+ 
+   // Set a static value on whether Simd is supported.
+   // This variable is only used for certain archs to query SupportWasmSimd128()
+@@ -1148,6 +1144,48 @@ void Assembler::TailCallC(int arg, int32_t offset) {
+   LA(tail_c(arg, offset));
+ }
+ void Assembler::li64(Register rd, int64_t imm) { LA(li64(rd, imm)); }
++
++// A layer of its own is plain: every instruction keeps its slots.
++bool Assembler::IsWasmJumpOffset(int64_t offset) {
++  return is_intn(offset, 30) && (offset & 7) == 0;
++}
++
++void Assembler::WasmJumpSlot(uint8_t* slot, int64_t offset) {
++  static const std::array<uint8_t, kInstrSize> model = [] {
++    la::Assembler a;
++    a.b(0);
++    CHECK_EQ(a.pc_offset(), kInstrSize);
++    std::array<uint8_t, kInstrSize> code;
++    memcpy(code.data(), a.code().data(), kInstrSize);
++    return code;
++  }();
++  memcpy(slot, model.data(), kInstrSize);
++  la::Assembler::set_branch_target_at(slot, offset);
++}
++
++void Assembler::WasmFarJumpSlot(uint8_t* slot, Address target) {
++  static const std::array<uint8_t, 2 * kInstrSize> model = [] {
++    la::Assembler a;
++    a.li64(t7, 0);
++    a.jirl(zero_reg, t7, 0);
++    CHECK_EQ(a.pc_offset(), 2 * kInstrSize);
++    std::array<uint8_t, 2 * kInstrSize> code;
++    memcpy(code.data(), a.code().data(), 2 * kInstrSize);
++    return code;
++  }();
++  memcpy(slot, model.data(), 2 * kInstrSize);
++  la::Assembler::set_li64_at(slot, target);
++}
++
++void Assembler::WasmLazyCompileSlot(uint8_t* slot, uint32_t func_index,
++                                    int64_t offset) {
++  la::Assembler a;
++  a.li(kWasmCompileLazyFuncIndexRegister, func_index);
++  a.b(0);
++  CHECK_EQ(a.pc_offset(), 2 * kInstrSize);
++  memcpy(slot, a.code().data(), 2 * kInstrSize);
++  la::Assembler::set_branch_target_at(slot + kInstrSize, offset - kInstrSize);
++}
+ void Assembler::li(Register rd, int64_t imm) { LA(li(rd, imm)); }
+ void Assembler::maxi_d(Register rd, Register rj, int32_t imm) {
+   LA(maxi_d(rd, rj, imm));
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index e81c5783c5..5c34b4272d 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -311,6 +311,21 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   // to tell serializer address of the instruction that follows
+   // LUI/ORI instruction pair.
+   // TODO(LOONG_dev): check this
++  // The slots of the jump tables of WebAssembly, which are written and
++  // patched without an assembler (wasm/jump-table-assembler.cc). `offset` is
++  // in bytes from the start of the slot.
++  // One instruction: a jump over `offset` bytes. Two such slots differ in
++  // the 32-bit displacement only.
++  static bool IsWasmJumpOffset(int64_t offset);
++  static void WasmJumpSlot(uint8_t* slot, int64_t offset);
++  // Two instructions: a jump to any address. The target is the last 8 bytes
++  // of the first one (li64).
++  static void WasmFarJumpSlot(uint8_t* slot, Address target);
++  // Two instructions: kWasmCompileLazyFuncIndexRegister = func_index and a
++  // jump over `offset` bytes from the start of the slot.
++  static void WasmLazyCompileSlot(uint8_t* slot, uint32_t func_index,
++                                  int64_t offset);
++
+   // On e2k a 64-bit constant is one instruction (li64).
+   static constexpr int kInstructionsFor64BitConstant = 1;
+ 
+diff --git a/chromium/v8/src/common/globals.h b/chromium/v8/src/common/globals.h
+index 3a49c5812c..4ab30468f1 100644
+--- a/chromium/v8/src/common/globals.h
++++ b/chromium/v8/src/common/globals.h
+@@ -496,6 +496,10 @@ constexpr uint32_t kDefaultMaxWasmCodeSpaceSizeMb = 128;
+ #elif V8_TARGET_ARCH_PPC64
+ // Branches only take 26 bits.
+ constexpr uint32_t kDefaultMaxWasmCodeSpaceSizeMb = 32;
++#elif V8_TARGET_ARCH_E2K
++// A direct branch (disp) reaches +-1 GB; the assembler takes half of that
++// (Assembler::IsWasmJumpOffset).
++constexpr uint32_t kDefaultMaxWasmCodeSpaceSizeMb = 512;
+ #else
+ // Use 1024 MB limit for code spaces on other platforms. This is smaller than
+ // the total allowed code space (kMaxWasmCodeMemory) to avoid unnecessarily
+diff --git a/chromium/v8/src/flags/flag-definitions.h b/chromium/v8/src/flags/flag-definitions.h
+index a579c3606c..06a2a284d9 100644
+--- a/chromium/v8/src/flags/flag-definitions.h
++++ b/chromium/v8/src/flags/flag-definitions.h
+@@ -2409,7 +2409,7 @@ DEFINE_IMPLICATION(fuzzing, wasm_allow_mixed_eh_for_testing)
+ #if V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_X64 ||   \
+     defined(V8_TARGET_ARCH_IA32) || defined(V8_TARGET_ARCH_RISCV64) ||    \
+     defined(V8_TARGET_ARCH_RISCV32) || defined(V8_TARGET_ARCH_LOONG64) || \
+-    defined(V8_TARGET_ARCH_MIPS64)
++    defined(V8_TARGET_ARCH_MIPS64) || defined(V8_TARGET_ARCH_E2K)
+ DEFINE_BOOL(wasm_code_coverage, false, "enable Wasm code coverage")
+ #else
+ DEFINE_BOOL_READONLY(wasm_code_coverage, false, "enable Wasm code coverage")
+diff --git a/chromium/v8/src/wasm/baseline/liftoff-assembler-defs.h b/chromium/v8/src/wasm/baseline/liftoff-assembler-defs.h
+index b10fc4eb33..7b3f384422 100644
+--- a/chromium/v8/src/wasm/baseline/liftoff-assembler-defs.h
++++ b/chromium/v8/src/wasm/baseline/liftoff-assembler-defs.h
+@@ -57,7 +57,7 @@ constexpr Simd128RegList kLiftoffAssemblerSimd128CacheRegs = {};
+ // For the "WasmLiftoffFrameSetup" builtin.
+ constexpr Register kLiftoffFrameSetupFunctionReg = t0;
+ 
+-#elif V8_TARGET_ARCH_LOONG64
++#elif V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K
+ 
+ // t6-t8 and s3-s4: scratch registers, s6: root
+ // s8: pointer-compression-cage base
+diff --git a/chromium/v8/src/wasm/baseline/liftoff-assembler-inl.h b/chromium/v8/src/wasm/baseline/liftoff-assembler-inl.h
+index 4cbc6d8b14..d34c729f08 100644
+--- a/chromium/v8/src/wasm/baseline/liftoff-assembler-inl.h
++++ b/chromium/v8/src/wasm/baseline/liftoff-assembler-inl.h
+@@ -23,6 +23,8 @@
+ #include "src/wasm/baseline/mips64/liftoff-assembler-mips64-inl.h"
+ #elif V8_TARGET_ARCH_LOONG64
+ #include "src/wasm/baseline/loong64/liftoff-assembler-loong64-inl.h"
++#elif V8_TARGET_ARCH_E2K
++#include "src/wasm/baseline/e2k/liftoff-assembler-e2k-inl.h"
+ #elif V8_TARGET_ARCH_S390X
+ #include "src/wasm/baseline/s390/liftoff-assembler-s390-inl.h"
+ #elif V8_TARGET_ARCH_RISCV64
+diff --git a/chromium/v8/src/wasm/baseline/liftoff-assembler.h b/chromium/v8/src/wasm/baseline/liftoff-assembler.h
+index f210dc7389..31b6c6fb4a 100644
+--- a/chromium/v8/src/wasm/baseline/liftoff-assembler.h
++++ b/chromium/v8/src/wasm/baseline/liftoff-assembler.h
+@@ -955,7 +955,7 @@ class LiftoffAssembler : public MacroAssembler {
+                             int32_t amount);
+ 
+ #if V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_LOONG64 || \
+-    V8_TARGET_ARCH_MIPS64
++    V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_E2K
+   inline void emit_i64_rol(LiftoffRegister dst, LiftoffRegister src,
+                            Register amount);
+   inline void emit_i64_roli(LiftoffRegister dst, LiftoffRegister src,
+diff --git a/chromium/v8/src/wasm/baseline/liftoff-compiler.cc b/chromium/v8/src/wasm/baseline/liftoff-compiler.cc
+index 1ff021b6bc..0e6e88c372 100644
+--- a/chromium/v8/src/wasm/baseline/liftoff-compiler.cc
++++ b/chromium/v8/src/wasm/baseline/liftoff-compiler.cc
+@@ -443,7 +443,7 @@ void CheckBailoutAllowed(LiftoffBailoutReason reason, const char* detail,
+ 
+   // Some externally maintained architectures don't fully implement Liftoff yet.
+ #if V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_S390X || V8_TARGET_ARCH_PPC64 || \
+-    V8_TARGET_ARCH_LOONG64
++    V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K
+   return;
+ #endif
+ 
+@@ -3073,7 +3073,7 @@ class LiftoffCompiler {
+                             &LiftoffAssembler::emit_i64_shri);
+       case kExprI64Rol:
+ #if V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_LOONG64 || \
+-    V8_TARGET_ARCH_MIPS64
++    V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_E2K
+         return EmitI64Shift(&LiftoffAssembler::emit_i64_rol,
+                             &LiftoffAssembler::emit_i64_roli);
+ #else
+@@ -3081,7 +3081,7 @@ class LiftoffCompiler {
+ #endif
+       case kExprI64Ror:
+ #if V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_LOONG64 || \
+-    V8_TARGET_ARCH_MIPS64
++    V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_E2K
+         return EmitI64Shift(&LiftoffAssembler::emit_i64_ror,
+                             &LiftoffAssembler::emit_i64_rori);
+ #else
+diff --git a/chromium/v8/src/wasm/function-compiler.h b/chromium/v8/src/wasm/function-compiler.h
+index 76dfc9ce30..7fa40acee3 100644
+--- a/chromium/v8/src/wasm/function-compiler.h
++++ b/chromium/v8/src/wasm/function-compiler.h
+@@ -163,7 +163,7 @@ class V8_EXPORT_PRIVATE JSToWasmWrapperCompilationUnit final {
+ inline bool CanUseGenericJsToWasmWrapper(const CanonicalSig* sig) {
+ #if (V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_IA32 ||  \
+      V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_S390X || V8_TARGET_ARCH_PPC64 || \
+-     V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_RISCV64)
++     V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_RISCV64 || V8_TARGET_ARCH_E2K)
+   return v8_flags.wasm_generic_wrapper && IsJSCompatibleSignature(sig);
+ #else
+   return false;
+diff --git a/chromium/v8/src/wasm/jump-table-assembler.cc b/chromium/v8/src/wasm/jump-table-assembler.cc
+index dfebd423c7..2e11f0bdd8 100644
+--- a/chromium/v8/src/wasm/jump-table-assembler.cc
++++ b/chromium/v8/src/wasm/jump-table-assembler.cc
+@@ -593,6 +593,68 @@ void JumpTableAssembler::SkipUntil(int offset) {
+   DCHECK_EQ(offset, pc_offset());
+ }
+ 
++#elif V8_TARGET_ARCH_E2K
++// The instructions come from the assembler (Assembler::WasmJumpSlot and the
++// two functions after it): an instruction is a slot of kInstrSize bytes of
++// e2k wide commands, there is no fixed word to put a field into.
++void JumpTableAssembler::EmitLazyCompileJumpSlot(uint32_t func_index,
++                                                 Address lazy_compile_target) {
++  uint8_t code[kLazyCompileTableSlotSize];
++  Assembler::WasmLazyCompileSlot(
++      code, func_index, static_cast<int64_t>(lazy_compile_target - pc_));
++  for (int i = 0; i < kLazyCompileTableSlotSize; i += 8) {
++    emit<uint64_t>(base::ReadUnalignedValue<uint64_t>(
++        reinterpret_cast<Address>(code + i)));
++  }
++}
++
++bool JumpTableAssembler::EmitJumpSlot(Address target) {
++  int64_t offset = static_cast<int64_t>(target - pc_);
++  if (!Assembler::IsWasmJumpOffset(offset)) return false;
++  uint8_t code[kJumpTableSlotSize];
++  Assembler::WasmJumpSlot(code, offset);
++  // This function also patches slots that other threads may be running.
++  // Only the displacement of the branch differs between two jump slots: one
++  // aligned 32-bit word.
++  for (int i = 0; i < kJumpTableSlotSize; i += 4) {
++    emit<uint32_t>(base::ReadUnalignedValue<uint32_t>(
++                       reinterpret_cast<Address>(code + i)),
++                   kRelaxedStore);
++  }
++  return true;
++}
++
++void JumpTableAssembler::EmitFarJumpSlot(Address target) {
++  uint8_t code[kFarJumpTableSlotSize];
++  Assembler::WasmFarJumpSlot(code, target);
++  for (int i = 0; i < kFarJumpTableSlotSize; i += 8) {
++    emit<uint64_t>(base::ReadUnalignedValue<uint64_t>(
++        reinterpret_cast<Address>(code + i)));
++  }
++}
++
++// static
++void JumpTableAssembler::PatchFarJumpSlot(WritableJitAllocation& jit_allocation,
++                                          Address slot, Address target) {
++  // The target is the 64-bit literal that ends the first instruction: one
++  // aligned machine word, written at once.
++  uint8_t code[kFarJumpTableSlotSize];
++  Assembler::WasmFarJumpSlot(code, target);
++  Address literal = slot + kInstrSize - kSystemPointerSize;
++  DCHECK(IsAligned(literal, kSystemPointerSize));
++  jit_allocation.WriteValue(
++      literal,
++      base::ReadUnalignedValue<Address>(reinterpret_cast<Address>(
++          code + kInstrSize - kSystemPointerSize)),
++      kRelaxedStore);
++}
++
++void JumpTableAssembler::SkipUntil(int offset) {
++  // On this platform the jump table is not zapped with valid instructions, so
++  // skipping over bytes is not allowed.
++  DCHECK_EQ(offset, pc_offset());
++}
++
+ #elif V8_TARGET_ARCH_PPC64
+ void JumpTableAssembler::EmitLazyCompileJumpSlot(uint32_t func_index,
+                                                  Address lazy_compile_target) {
+diff --git a/chromium/v8/src/wasm/jump-table-assembler.h b/chromium/v8/src/wasm/jump-table-assembler.h
+index 91252dc6e6..d407130d50 100644
+--- a/chromium/v8/src/wasm/jump-table-assembler.h
++++ b/chromium/v8/src/wasm/jump-table-assembler.h
+@@ -237,6 +237,12 @@ class V8_EXPORT_PRIVATE JumpTableAssembler {
+   static constexpr int kJumpTableLineSize = kJumpTableSlotSize;
+   static constexpr int kFarJumpTableSlotSize = kJumpTableSlotSize;
+   static constexpr int kLazyCompileTableSlotSize = 3 * kInstrSize;
++#elif V8_TARGET_ARCH_E2K
++  // See Assembler::WasmJumpSlot and the two functions after it.
++  static constexpr int kJumpTableLineSize = 1 * kInstrSize;
++  static constexpr int kJumpTableSlotSize = 1 * kInstrSize;
++  static constexpr int kFarJumpTableSlotSize = 2 * kInstrSize;
++  static constexpr int kLazyCompileTableSlotSize = 2 * kInstrSize;
+ #elif V8_TARGET_ARCH_LOONG64
+   static constexpr int kJumpTableLineSize = 1 * kInstrSize;
+   static constexpr int kJumpTableSlotSize = 1 * kInstrSize;
+diff --git a/chromium/v8/src/wasm/wasm-code-manager.h b/chromium/v8/src/wasm/wasm-code-manager.h
+index bab5eca796..2b9760c103 100644
+--- a/chromium/v8/src/wasm/wasm-code-manager.h
++++ b/chromium/v8/src/wasm/wasm-code-manager.h
+@@ -645,7 +645,7 @@ class V8_EXPORT_PRIVATE NativeModule final {
+ 
+ #if V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_S390X || V8_TARGET_ARCH_ARM64 || \
+     V8_TARGET_ARCH_PPC64 || V8_TARGET_ARCH_LOONG64 ||                     \
+-    V8_TARGET_ARCH_RISCV64 || V8_TARGET_ARCH_MIPS64
++    V8_TARGET_ARCH_RISCV64 || V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_E2K
+   static constexpr bool kNeedsFarJumpsBetweenCodeSpaces = true;
+ #else
+   static constexpr bool kNeedsFarJumpsBetweenCodeSpaces = false;
+diff --git a/chromium/v8/src/wasm/wasm-linkage.h b/chromium/v8/src/wasm/wasm-linkage.h
+index e8748c06a6..1f3ecd0749 100644
+--- a/chromium/v8/src/wasm/wasm-linkage.h
++++ b/chromium/v8/src/wasm/wasm-linkage.h
+@@ -80,7 +80,7 @@ constexpr DoubleRegister kFpReturnRegisters[] = {f2, f4};
+ constexpr std::array<Simd128Register, 0> kSimd128ParamRegisters{};
+ constexpr std::array<Simd128Register, 0> kSimd128ReturnRegisters{};
+ 
+-#elif V8_TARGET_ARCH_LOONG64
++#elif V8_TARGET_ARCH_LOONG64 || V8_TARGET_ARCH_E2K
+ // ===========================================================================
+ // == LOONG64 ================================================================
+ // ===========================================================================
+diff --git a/chromium/v8/src/wasm/wasm-objects.cc b/chromium/v8/src/wasm/wasm-objects.cc
+index e7319a98ea..1373db87e2 100644
+--- a/chromium/v8/src/wasm/wasm-objects.cc
++++ b/chromium/v8/src/wasm/wasm-objects.cc
+@@ -2643,7 +2643,8 @@ bool UseGenericWasmToJSWrapper(wasm::ImportCallKind kind,
+ #if !V8_TARGET_ARCH_X64 && !V8_TARGET_ARCH_ARM64 && !V8_TARGET_ARCH_ARM && \
+     !V8_TARGET_ARCH_IA32 && !V8_TARGET_ARCH_RISCV64 &&                     \
+     !V8_TARGET_ARCH_RISCV32 && !V8_TARGET_ARCH_PPC64 &&                    \
+-    !V8_TARGET_ARCH_S390X && !V8_TARGET_ARCH_LOONG64 && !V8_TARGET_ARCH_MIPS64
++    !V8_TARGET_ARCH_S390X && !V8_TARGET_ARCH_LOONG64 &&                    \
++    !V8_TARGET_ARCH_MIPS64 && !V8_TARGET_ARCH_E2K
+   return false;
+ #else
+   if (suspend != wasm::Suspend::kNoSuspend) return false;

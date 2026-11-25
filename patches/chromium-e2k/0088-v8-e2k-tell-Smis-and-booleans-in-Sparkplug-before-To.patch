@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Fri, 16 Oct 2026 13:54:01 +0100
+Subject: [PATCH 88/99] v8: e2k: tell Smis and booleans in Sparkplug before
+ ToBooleanForBaselineJump
+
+Without static roots every JumpIfToBoolean of Sparkplug called
+ToBooleanForBaselineJump, some 90 wide commands. As
+JumpIfStaticRootToBoolean does elsewhere, a Smi (zero is false), true and
+false are told in place; other values still go to the builtin.
+---
+ chromium/v8/src/baseline/baseline-compiler.cc | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/chromium/v8/src/baseline/baseline-compiler.cc b/chromium/v8/src/baseline/baseline-compiler.cc
+index dccb250ca1..c07e585194 100644
+--- a/chromium/v8/src/baseline/baseline-compiler.cc
++++ b/chromium/v8/src/baseline/baseline-compiler.cc
+@@ -802,6 +802,21 @@ void BaselineCompiler::JumpIfToBoolean(bool do_jump_if_true, Label* label,
+     __ JumpIfStaticRootToBoolean(kInterpreterAccumulatorRegister, &no_jump,
+                                  Label::kNear, label, distance);
+   }
++#elif V8_TARGET_ARCH_E2K
++  // Without static roots every value went to ToBooleanForBaselineJump (a
++  // call and some 90 wide commands): Smis, true and false are told here.
++  Label no_jump, not_smi;
++  Label* if_true = do_jump_if_true ? label : &no_jump;
++  Label* if_false = do_jump_if_true ? &no_jump : label;
++  __ JumpIfNotSmi(kInterpreterAccumulatorRegister, &not_smi);
++  __ JumpIfSmi(kEqual, kInterpreterAccumulatorRegister, Smi::FromInt(0),
++               if_false);
++  __ Jump(if_true);
++  __ Bind(&not_smi);
++  __ JumpIfRoot(kInterpreterAccumulatorRegister, RootIndex::kTrueValue,
++                if_true);
++  __ JumpIfRoot(kInterpreterAccumulatorRegister, RootIndex::kFalseValue,
++                if_false);
+ #endif
+   CallBuiltin<Builtin::kToBooleanForBaselineJump>(
+       kInterpreterAccumulatorRegister);
+@@ -812,7 +827,7 @@ void BaselineCompiler::JumpIfToBoolean(bool do_jump_if_true, Label* label,
+   __ JumpIfSmi(do_jump_if_true ? kNotEqual : kEqual, kReturnRegister1,
+                Smi::FromInt(0), label, distance);
+ 
+-#ifdef V8_STATIC_ROOTS
++#if defined(V8_STATIC_ROOTS) || V8_TARGET_ARCH_E2K
+   __ Bind(&no_jump);
+ #endif
+ }

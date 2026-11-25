@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 19:36:07 +0100
+Subject: [PATCH 68/99] v8: e2k: compare-exchange on 8 and 16 bit elements
+ keeps the rest of the word
+
+The sequence taken from loong64 loads the 32-bit word that holds the element,
+then cuts the expected value to the element size into the same temporary and
+inserts the new value there, so a successful Atomics.compareExchange on an
+Int8Array or Int16Array stored the expected value at offset 0 of the word and
+zeroes in the other neighbours ([0x11, 0x22, 0x11, 0x11] became
+[0x22, 5, 0, 0]), for shared and plain buffers, in every tier.
+Give the expected value its own temporary register.
+---
+ .../v8/src/compiler/backend/e2k/code-generator-e2k.cc     | 8 ++++++--
+ .../src/compiler/backend/e2k/instruction-selector-e2k.cc  | 5 ++++-
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index c8d4a7ddfc..6e0bdd4c20 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -665,9 +665,13 @@ LSXSize LaneSizeToLSXSize(LaneSize size) {
+     RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);              \
+     __ ExtractBits(i.OutputRegister(0), i.TempRegister(2), i.TempRegister(1),  \
+                    size, sign_extend);                                         \
+-    __ ExtractBits(i.TempRegister(2), i.InputRegister(2), zero_reg, size,      \
++    /* The expected value goes to its own register: TempRegister(2) holds */  \
++    /* the loaded word, into which the new value is inserted below (the   */  \
++    /* loong64 original overwrites the word here and then stores the      */  \
++    /* expected value with the new one in place of the neighbours).       */  \
++    __ ExtractBits(i.TempRegister(3), i.InputRegister(2), zero_reg, size,      \
+                    sign_extend);                                               \
+-    __ BranchShort(&exit, ne, i.TempRegister(2),                               \
++    __ BranchShort(&exit, ne, i.TempRegister(3),                               \
+                    Operand(i.OutputRegister(0)));                              \
+     __ InsertBits(i.TempRegister(2), i.InputRegister(3), i.TempRegister(1),    \
+                   size);                                                       \
+diff --git a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+index 66311da49a..24620d07cd 100644
+--- a/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/instruction-selector-e2k.cc
+@@ -2660,10 +2660,13 @@ void VisitAtomicCompareExchange(InstructionSelector* selector, OpIndex node,
+       g.UseUniqueRegister(old_value), g.UseUniqueRegister(new_value)};
+   InstructionOperand outputs[1];
+   outputs[0] = g.DefineAsRegister(node);
+-  InstructionOperand temps[3];
++  // The fourth temporary holds the expected value cut to the element size
++  // (8 and 16 bit elements), next to the word loaded from memory.
++  InstructionOperand temps[4];
+   temps[0] = g.TempRegister();
+   temps[1] = g.TempRegister();
+   temps[2] = g.TempRegister();
++  temps[3] = g.TempRegister();
+   InstructionCode code = opcode | AddressingModeField::encode(addressing_mode) |
+                          AtomicWidthField::encode(width);
+   if (access_kind == MemoryAccessKind::kTrapping) {

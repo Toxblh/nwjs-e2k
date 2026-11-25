@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 16:29:42 +0100
+Subject: [PATCH 56/99] v8: e2k: bytecode handlers start the dispatch to the
+ next bytecode at their entry
+
+The chain "opcode of the next bytecode, address of its handler, prepared
+branch" is the longest path of a short handler on e2k and does not depend
+on its body.  Dispatch() built it after the body, in the registers of the
+body's temporaries, so the scheduler could not move it up.  The nodes are
+now created in the constructor of InterpreterAssembler and used by
+Dispatch() unless a call has been made; unused, they are dead code.
+Handlers that call on the critical path and the Wide prefixes are left as
+they were.  Ldar: 15 wide commands -> 12, short Star: 15 -> 11.
+---
+ .../src/interpreter/interpreter-assembler.cc  | 37 +++++++++++++++++++
+ .../src/interpreter/interpreter-assembler.h   |  7 ++++
+ 2 files changed, 44 insertions(+)
+
+diff --git a/chromium/v8/src/interpreter/interpreter-assembler.cc b/chromium/v8/src/interpreter/interpreter-assembler.cc
+index 799b840ab9..e40295b281 100644
+--- a/chromium/v8/src/interpreter/interpreter-assembler.cc
++++ b/chromium/v8/src/interpreter/interpreter-assembler.cc
+@@ -65,6 +65,30 @@ InterpreterAssembler::InterpreterAssembler(CodeAssemblerState* state,
+       Bytecodes::Returns(bytecode)) {
+     SaveBytecodeOffset();
+   }
++
++#if V8_TARGET_ARCH_E2K
++  // On e2k the chain "opcode of the next bytecode, address of its handler,
++  // prepared branch" is the longest path of a short handler (two loads of
++  // three cycles each and the preparation of the indirect branch), and it
++  // does not depend on the body.  Built in Dispatch() it comes after the body
++  // and in the registers of the body's temporaries; built here it gets
++  // registers of its own and the scheduler runs it alongside the body.
++  // Dispatch() uses it unless a call has been made (the debugger may have
++  // replaced the bytecode array meanwhile); where it is not used it is dead
++  // code.
++  if (!Bytecodes::IsPrefixScalingBytecode(bytecode) &&
++      !Bytecodes::MakesCallAlongCriticalPath(bytecode)) {
++    early_offset_ = IntPtrAdd(
++        UncheckedParameter<IntPtrT>(
++            InterpreterDispatchDescriptor::kBytecodeOffset),
++        IntPtrConstant(CurrentBytecodeSize()));
++    early_bytecode_ = LoadBytecode(early_offset_);
++    early_entry_ = Load<RawPtrT>(
++        UncheckedParameter<ExternalReference>(
++            InterpreterDispatchDescriptor::kDispatchTable),
++        TimesSystemPointerSize(early_bytecode_));
++  }
++#endif
+ }
+ 
+ InterpreterAssembler::~InterpreterAssembler() {
+@@ -1402,6 +1426,19 @@ void InterpreterAssembler::InlineShortStar(TNode<WordT> target_bytecode) {
+ void InterpreterAssembler::Dispatch() {
+   Comment("========= Dispatch");
+   DCHECK_IMPLIES(Bytecodes::MakesCallAlongCriticalPath(bytecode_), made_call_);
++#if V8_TARGET_ARCH_E2K
++  if (early_entry_ && !made_call_ &&
++      bytecode_offset_.value() ==
++          UncheckedParameter<IntPtrT>(
++              InterpreterDispatchDescriptor::kBytecodeOffset)) {
++    bytecode_offset_ = early_offset_;
++    if (Bytecodes::IsStarLookahead(bytecode_, operand_scale_)) {
++      StarDispatchLookahead(early_bytecode_);
++    }
++    DispatchToBytecodeHandlerEntry(early_entry_, BytecodeOffset());
++    return;
++  }
++#endif
+   TNode<IntPtrT> target_offset = Advance();
+   TNode<WordT> target_bytecode = LoadBytecode(target_offset);
+   DispatchToBytecodeWithOptionalStarLookahead(target_bytecode);
+diff --git a/chromium/v8/src/interpreter/interpreter-assembler.h b/chromium/v8/src/interpreter/interpreter-assembler.h
+index f687411eea..8d12e5d392 100644
+--- a/chromium/v8/src/interpreter/interpreter-assembler.h
++++ b/chromium/v8/src/interpreter/interpreter-assembler.h
+@@ -491,6 +491,13 @@ class V8_EXPORT_PRIVATE InterpreterAssembler : public CodeStubAssembler {
+   bool made_call_;
+   bool reloaded_frame_ptr_;
+   bool bytecode_array_valid_;
++#if V8_TARGET_ARCH_E2K
++  // The dispatch to the next bytecode, started at the entry of the handler
++  // (see the constructor): its offset, its opcode and its handler.
++  TNode<IntPtrT> early_offset_;
++  TNode<WordT> early_bytecode_;
++  TNode<RawPtrT> early_entry_;
++#endif
+ };
+ 
+ }  // namespace interpreter

@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 12:52:46 +0100
+Subject: [PATCH 48/99] v8: e2k: compare with a constant as a literal of the
+ compare
+
+A branch on `reg <cond> constant` loaded the constant into a scratch
+register and compared two registers. The compares take a literal of any
+width themselves: new layer instruction bcmpi (==, <, <= signed and
+unsigned, either sense), used by BranchShortOrFallback when the right
+side is a plain non-zero constant.
+---
+ chromium/v8/src/codegen/e2k/assembler-e2k.cc  | 19 +++++++++++++++++++
+ chromium/v8/src/codegen/e2k/assembler-e2k.h   |  3 +++
+ chromium/v8/src/codegen/e2k/la_asm.h          |  7 +++++++
+ .../v8/src/codegen/e2k/macro-assembler-e2k.cc |  9 +++++++++
+ 4 files changed, 38 insertions(+)
+
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.cc b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+index ecd82da856..eacfa61501 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.cc
+@@ -1174,6 +1174,25 @@ void Assembler::tstz(Register rd, Register rj, Register rk) { LA(tstz(rd, rj, rk
+ void Assembler::tstzi(Register rd, Register rj, int64_t mask) { LA(tstzi(rd, rj, mask)); }
+ void Assembler::tstnz(Register rd, Register rj, Register rk) { LA(tstnz(rd, rj, rk)); }
+ void Assembler::tstnzi(Register rd, Register rj, int64_t mask) { LA(tstnzi(rd, rj, mask)); }
++void Assembler::bcmpi(Condition cond, Register rj, int64_t imm,
++                      int32_t offset) {
++  int cmp = 0;
++  bool negate = false;
++  switch (cond) {
++    case eq: break;
++    case ne: negate = true; break;
++    case less: cmp = 1; break;
++    case greater_equal: cmp = 1; negate = true; break;
++    case less_equal: cmp = 2; break;
++    case greater: cmp = 2; negate = true; break;
++    case Uless: cmp = 3; break;
++    case Ugreater_equal: cmp = 3; negate = true; break;
++    case Uless_equal: cmp = 4; break;
++    case Ugreater: cmp = 4; negate = true; break;
++    default: UNREACHABLE();
++  }
++  LA(bcmpi(cmp, negate, rj, imm, offset));
++}
+ void Assembler::beqz(Register rj, int32_t offset) { LA(beqz(rj, offset)); }
+ void Assembler::bnez(Register rj, int32_t offset) { LA(bnez(rj, offset)); }
+ void Assembler::jirl(Register rd, Register rj, int32_t offset) { LA(jirl(rd, rj, offset)); }
+diff --git a/chromium/v8/src/codegen/e2k/assembler-e2k.h b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+index 7bc0e0520b..df06510a19 100644
+--- a/chromium/v8/src/codegen/e2k/assembler-e2k.h
++++ b/chromium/v8/src/codegen/e2k/assembler-e2k.h
+@@ -482,6 +482,9 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   void tstzi(Register rd, Register rj, int64_t mask);
+   void tstnz(Register rd, Register rj, Register rk);
+   void tstnzi(Register rd, Register rj, int64_t mask);
++  // Not LoongArch: branch on rj <cond> imm, the constant a literal of the
++  // compare.
++  void bcmpi(Condition cond, Register rj, int64_t imm, int32_t offset);
+   void beqz(Register rj, int32_t offset);
+   inline void beqz(Register rj, Label* L) {
+     beqz(rj, shifted_branch_offset21(L));
+diff --git a/chromium/v8/src/codegen/e2k/la_asm.h b/chromium/v8/src/codegen/e2k/la_asm.h
+index 011acc6136..eccde2f343 100644
+--- a/chromium/v8/src/codegen/e2k/la_asm.h
++++ b/chromium/v8/src/codegen/e2k/la_asm.h
+@@ -324,6 +324,13 @@ class Assembler : private e2k::Assembler {
+   void btnez(Register rj, Register rk, int32_t offset) { br(&E::cmpandedb, true, R(rj), R(rk), offset); }
+   void bteqzi(Register rj, int64_t mask, int32_t offset) { br(&E::cmpandedb, false, R(rj), mask, offset); }
+   void btnezi(Register rj, int64_t mask, int32_t offset) { br(&E::cmpandedb, true, R(rj), mask, offset); }
++  // Not LoongArch: branch on rj compared with a constant, which goes into the
++  // compare as a literal.  cmp: 0 ==, 1 < and 2 <= signed, 3 < and 4 <=
++  // unsigned; negate: branch when the comparison does not hold.
++  void bcmpi(int cmp, bool negate, Register rj, int64_t imm, int32_t offset) {
++    static const Cmp f[5] = {&E::cmpedb, &E::cmpldb, &E::cmpledb, &E::cmpbdb, &E::cmpbedb};
++    br(f[cmp], negate, R(rj), imm, offset);
++  }
+   void bceqz(CFRegister cj, int32_t offset) { brc(~P(cj), offset); }
+   void bcnez(CFRegister cj, int32_t offset) { brc(P(cj), offset); }
+   // pc = rj + offset instructions, rd = address of the next instruction,
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+index c789f9bca7..ef22205493 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+@@ -3391,6 +3391,15 @@ bool MacroAssembler::BranchShortOrFallback(Label* L, Condition cond,
+   if (need_link) block_trampoline_pool.emplace(this);
+   DCHECK_NE(rj, zero_reg);
+ 
++  // A constant goes into the compare as a literal, not through a register.
++  if (cond != cc_always && !need_link && !rk.is_reg() &&
++      RelocInfo::IsNoInfo(rk.rmode()) && rk.immediate() != 0) {
++    if (L->is_bound() && !is_near(L, OffsetSize::kOffset16)) return false;
++    int32_t offset = GetOffset(L, OffsetSize::kOffset16);
++    bcmpi(cond, rj, rk.immediate(), offset);
++    return true;
++  }
++
+   // Be careful to always use shifted_branch_offset only just before the
+   // branch instruction, as the location will be remember for patching the
+   // target.

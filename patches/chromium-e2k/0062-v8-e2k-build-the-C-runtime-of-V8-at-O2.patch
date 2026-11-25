@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 17:44:18 +0100
+Subject: [PATCH 62/99] v8: e2k: build the C++ runtime of V8 at -O2
+
+The e2k tree is built with -O1 from CFLAGS/CXXFLAGS, which the toolchain
+puts after the flags of a target.  JSON.parse/stringify, exceptions, string
+and array runtime functions are C++, and at -O1 they are what the page
+waits for: json of the lab benchmark takes 1201 ms at -O1 and 682 ms at
+-O2, tryCatch 1038 -> 858, sort 831 -> 798.
+
+The config e2k_runtime_o2 passes "-Xclang -O2 -fvectorize
+-fslp-vectorize", which reaches the compiler proper after the driver's
+-O1; the object is byte for byte that of -O2.  It is added to
+v8_base_without_compiler, v8_libbase, cppgc_base, v8_heap_base and
+v8_bigint: not to the compiler, the builtins generators and mksnapshot.
+The image of the builtins does not change.
+---
+ chromium/v8/BUILD.gn | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/chromium/v8/BUILD.gn b/chromium/v8/BUILD.gn
+index fedb8d9c98..61267757a7 100644
+--- a/chromium/v8/BUILD.gn
++++ b/chromium/v8/BUILD.gn
+@@ -940,6 +940,25 @@ config("internal_config_base") {
+   ]
+ }
+ 
++# The e2k tree is built with -O1 given in CFLAGS/CXXFLAGS, which the toolchain
++# puts after the flags of the target, so a target cannot ask for more with
++# -O2.  The C++ runtime (heap, objects, strings, JSON, parser, interpreter,
++# C++ builtins) is what a page spends its time in next to the JIT code, and
++# -O1 costs it a third on JSON.  "-Xclang -O2" reaches the compiler proper
++# after the driver's -O1, and the two -f flags are what the driver adds at
++# -O2: the objects are byte for byte those of -O2.
++config("e2k_runtime_o2") {
++  visibility = [ "./*" ]
++  if (current_cpu == "e2k" && !is_debug) {
++    cflags = [
++      "-Xclang",
++      "-O2",
++      "-fvectorize",
++      "-fslp-vectorize",
++    ]
++  }
++}
++
+ config("internal_config") {
+   defines = []
+ 
+@@ -6994,6 +7013,7 @@ v8_cluster_source_set("v8_base_without_compiler") {
+     ":internal_config",
+     ":cppgc_base_config",
+   ]
++  configs += [ ":e2k_runtime_o2" ]
+ 
+   deps = [
+     ":torque_generated_definitions",
+@@ -7431,6 +7451,7 @@ v8_component("v8_libbase") {
+   }
+ 
+   configs = [ ":internal_config_base" ]
++  configs += [ ":e2k_runtime_o2" ]
+ 
+   public_configs = [ ":libbase_config" ]
+   v8_add_configs += [ "//build/config/compiler:thinlto_optimize_max" ]
+@@ -7733,6 +7754,7 @@ v8_source_set("v8_bigint") {
+   }
+ 
+   configs = [ ":internal_config" ]
++  configs += [ ":e2k_runtime_o2" ]
+ }
+ 
+ v8_header_set("v8_heap_base_headers") {
+@@ -7793,6 +7815,7 @@ v8_source_set("v8_heap_base") {
+   }
+ 
+   configs = [ ":internal_config" ]
++  configs += [ ":e2k_runtime_o2" ]
+ 
+   deps = [ ":v8_config_headers" ]
+ 
+@@ -7990,6 +8013,7 @@ v8_cluster_source_set("cppgc_base") {
+     ":internal_config",
+     ":cppgc_base_config",
+   ]
++  configs += [ ":e2k_runtime_o2" ]
+ 
+   public_deps = [
+     ":cppgc_headers",

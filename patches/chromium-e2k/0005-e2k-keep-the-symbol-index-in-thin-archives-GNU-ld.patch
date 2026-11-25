@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Wed, 7 Oct 2026 20:13:07 +0100
+Subject: [PATCH 05/99] e2k: keep the symbol index in thin archives (GNU ld)
+
+---
+ chromium/build/config/compiler/BUILD.gn | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/chromium/build/config/compiler/BUILD.gn b/chromium/build/config/compiler/BUILD.gn
+index 041de0a19f..c0f90c2fde 100644
+--- a/chromium/build/config/compiler/BUILD.gn
++++ b/chromium/build/config/compiler/BUILD.gn
+@@ -2352,6 +2352,9 @@ config("thin_archive") {
+       "-T",
+       "-s",
+     ]
++  } else if (current_cpu == "e2k") {
++    # GNU ld (there is no lld for e2k) needs the archive symbol index.
++    arflags = [ "-T" ]
+   } else if ((is_posix && (!is_apple || (use_lld || use_mold))) || is_fuchsia) {
+     # The macOS and iOS default linker ld64 does not support reading thin
+     # archives.

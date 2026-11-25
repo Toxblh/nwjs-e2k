@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 18:34:59 +0100
+Subject: [PATCH 67/99] v8: e2k: keep the Float64Mod fast path to operands
+ whose product is exact
+
+The fast path taken from loong64 computes left - trunc(left / right) * right
+with a fused fnmsub_d. e2k-v5 has no fused multiply-subtract, the layer
+emulates it with a rounded multiplication and a subtraction, so for
+left >= 2^53 the remainder came out wrong but inside [0, right) and the range
+check did not send it to the C fallback: 2**60 % 3 was 0, in every tier.
+Take the fast path only for left < 2^52, where the product is exact.
+---
+ chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+index db4c60aa8b..f8e7a7c6cf 100644
+--- a/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
++++ b/chromium/v8/src/codegen/e2k/macro-assembler-e2k.cc
+@@ -3096,6 +3096,16 @@ void MacroAssembler::Float64Mod(DoubleRegister out, DoubleRegister left,
+     CompareF64(right, zero_temp, CLE);
+     BranchTrueShortF(&slow);
+ 
++    // e2k has no fused multiply-subtract: fnmsub_d below is a multiplication
++    // and a subtraction, each rounded. The product quotient * right is exact
++    // only while it fits in 53 bits, so the fast path is limited to
++    // left < 2^52 (then quotient * right <= left + right <= 2^53); above that
++    // a rounded product gave a wrong remainder inside [0, right), which the
++    // range check below cannot tell from a right one (2**60 % 3 was 0).
++    Move(dst_temp, 4503599627370496.0);
++    CompareF64(left, dst_temp, CLT);
++    BranchFalseShortF(&slow);
++
+     // Both are positive integers. The fast path is only valid if the computed
+     // remainder stays within the range [0, right).
+     fdiv_d(dst_temp, left, right);

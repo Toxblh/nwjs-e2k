@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 00:26:32 +0100
+Subject: [PATCH 29/99] v8: e2k: do not let the assembler shift builtins in the
+ embedded blob
+
+GNU as moves a label of a code section off the page offsets 0xdc0-0xdff
+and 0xee0-0xfff by inserting an empty command (its workaround for a CPU
+erratum on branch targets). That shifted every following builtin by 32
+bytes against the offsets V8 keeps, and JSEntry was entered 160 bytes too
+early. Builtin symbols are now set to the current location instead of
+being labels.
+---
+ .../embedded/platform-embedded-file-writer-generic.cc     | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/chromium/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.cc b/chromium/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.cc
+index 0e1c3842da..7788468079 100644
+--- a/chromium/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.cc
++++ b/chromium/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.cc
+@@ -128,7 +128,15 @@ void PlatformEmbeddedFileWriterGeneric::SourceInfo(int fileid,
+ void PlatformEmbeddedFileWriterGeneric::DeclareFunctionBegin(const char* name,
+                                                              uint32_t size) {
+   DeclareSymbolGlobal(name);
++#if defined(V8_TARGET_ARCH_E2K) && !defined(USE_SIMULATOR)
++  // The e2k assembler moves a label in a code section off the page offsets
++  // 0xdc0-0xdff and 0xee0-0xfff (a workaround for a CPU erratum on branch
++  // targets) by inserting an empty command, which shifts the rest of the
++  // blob. A symbol set to the current location is left where it is.
++  fprintf(fp_, ".set %s, .\n", name);
++#else
+   DeclareLabel(name);
++#endif
+ 
+   if (target_arch_ == EmbeddedTargetArch::kArm ||
+       target_arch_ == EmbeddedTargetArch::kArm64) {

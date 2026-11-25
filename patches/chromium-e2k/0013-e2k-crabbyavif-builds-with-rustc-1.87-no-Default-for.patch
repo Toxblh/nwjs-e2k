@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Fri, 9 Oct 2026 21:50:25 +0100
+Subject: [PATCH 13/99] e2k: crabbyavif builds with rustc 1.87 (no Default for
+ raw pointers)
+
+---
+ .../third_party/crabbyavif/src/src/capi/io.rs   | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/chromium/third_party/crabbyavif/src/src/capi/io.rs b/chromium/third_party/crabbyavif/src/src/capi/io.rs
+index 474e86e374..1fe3c1b075 100644
+--- a/chromium/third_party/crabbyavif/src/src/capi/io.rs
++++ b/chromium/third_party/crabbyavif/src/src/capi/io.rs
+@@ -26,19 +26,32 @@ use crate::internal_utils::VecExtension;
+ use crate::*;
+ 
+ #[repr(C)]
+-#[derive(Clone, Default)]
++#[derive(Clone)]
+ pub struct avifROData {
+     pub data: *const u8,
+     pub size: usize,
+ }
+ 
++// Written by hand: `Default` for raw pointers needs Rust 1.88.
++impl Default for avifROData {
++    fn default() -> Self {
++        Self { data: std::ptr::null(), size: 0 }
++    }
++}
++
+ #[repr(C)]
+-#[derive(Clone, Debug, Default)]
++#[derive(Clone, Debug)]
+ pub struct avifRWData {
+     pub data: *mut u8,
+     pub size: usize,
+ }
+ 
++impl Default for avifRWData {
++    fn default() -> Self {
++        Self { data: std::ptr::null_mut(), size: 0 }
++    }
++}
++
+ impl From<&Vec<u8>> for avifRWData {
+     fn from(v: &Vec<u8>) -> Self {
+         avifRWData {

@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Thu, 15 Oct 2026 03:40:55 +0100
+Subject: [PATCH 80/99] v8: e2k: load both stub cache entries before the first
+ compare
+
+A megamorphic IC probed the stub cache strictly in sequence: the entry
+offset was scaled with a multiplication (long on e2k), then the key was
+loaded and compared, then the map, then the handler, and only after a
+primary miss the secondary entry was loaded.
+
+On e2k a cache miss stalls only the first use of the value and several
+misses are served at once, and the secondary offset depends only on the
+map and the name.  So compute both offsets in 64-bit arithmetic (the
+masks keep the same bits as the 32-bit computation), scale them with
+shifts, and load key, map and handler of both entries before the first
+branch.  A primary miss then only compares the secondary entry that is
+already in registers.
+
+Counted in d8: 15-24% of the megamorphic probes miss the primary table
+in compiler-like code (Octane Typescript, JetStream typescript, uglify,
+jshint), 0-8% elsewhere.  Megamorphic named loads and stores are 5-13%
+faster in a micro-benchmark (the larger gain with more primary misses),
+Octane Typescript +3.6%, the rest of Octane within noise.
+---
+ chromium/v8/src/ic/accessor-assembler.cc | 68 ++++++++++++++++++++++++
+ 1 file changed, 68 insertions(+)
+
+diff --git a/chromium/v8/src/ic/accessor-assembler.cc b/chromium/v8/src/ic/accessor-assembler.cc
+index d281c6ac86..094abd0267 100644
+--- a/chromium/v8/src/ic/accessor-assembler.cc
++++ b/chromium/v8/src/ic/accessor-assembler.cc
+@@ -3355,6 +3355,73 @@ void AccessorAssembler::TryProbeStubCache(StubCache* stub_cache,
+   Counters* counters = isolate()->counters();
+   IncrementCounter(counters->megamorphic_stub_cache_probes(), 1);
+ 
++#if V8_TARGET_ARCH_E2K
++  // On e2k a cache miss stalls only the first use of the loaded value, and
++  // several misses are served at once.  Both offsets depend only on the map
++  // and the name, so both entries are loaded at once, before the primary one
++  // is compared; a primary miss then only compares the secondary entry that
++  // is already in registers.  The secondary loads follow the primary ones in
++  // the same block, so they are issued before the first branch.
++  {
++    TNode<IntPtrT> map_word = BitcastTaggedToWord(lookup_start_object_map);
++    TNode<IntPtrT> name_word = BitcastTaggedToWord(name);
++    // The same offsets as StubCachePrimaryOffset() and
++    // StubCacheSecondaryOffset() compute in 32 bits: the masks keep bits that
++    // depend only on bits 0..25 of the operands, equal in 64-bit arithmetic.
++    TNode<IntPtrT> raw_hash =
++        ChangeInt32ToIntPtr(Signed(LoadNameRawHash(name)));
++    CSA_DCHECK(this,
++               WordEqual(WordAnd(raw_hash,
++                                 IntPtrConstant(Name::kHashNotComputedMask)),
++                         IntPtrConstant(0)));
++    TNode<IntPtrT> primary_offset = Signed(WordAnd(
++        IntPtrAdd(raw_hash,
++                  WordXor(map_word,
++                          WordShr(map_word, StubCache::kPrimaryTableBits))),
++        IntPtrConstant((StubCache::kPrimaryTableSize - 1)
++                       << StubCache::kCacheIndexShift)));
++    TNode<IntPtrT> hash_a = IntPtrAdd(map_word, name_word);
++    TNode<IntPtrT> secondary_offset = Signed(WordAnd(
++        IntPtrAdd(hash_a, WordShr(hash_a, StubCache::kSecondaryTableBits)),
++        IntPtrConstant((StubCache::kSecondaryTableSize - 1)
++                       << StubCache::kCacheIndexShift)));
++    // offset * (sizeof(Entry) >> kCacheIndexShift) as shifts and an add:
++    // a multiplication is long on e2k.
++    static_assert(sizeof(StubCache::Entry) >> StubCache::kCacheIndexShift ==
++                  6);
++    auto entry = [&](StubCache::Table table, TNode<IntPtrT> offset) {
++      TNode<ExternalReference> base = ExternalConstant(
++          ExternalReference::Create(stub_cache->key_reference(table)));
++      return Signed(
++          IntPtrAdd(ReinterpretCast<IntPtrT>(base),
++                    IntPtrAdd(WordShl(offset, 2), WordShl(offset, 1))));
++    };
++    static_assert(offsetof(StubCache::Entry, key) == 0);
++    constexpr int kMapOffset = offsetof(StubCache::Entry, map);
++    constexpr int kValueOffset = offsetof(StubCache::Entry, value);
++    TNode<IntPtrT> primary = entry(StubCache::kPrimary, primary_offset);
++    TNode<IntPtrT> secondary = entry(StubCache::kSecondary, secondary_offset);
++    TNode<Object> key1 = Load<Object>(primary);
++    TNode<Object> map1 = Load<Object>(primary, IntPtrConstant(kMapOffset));
++    TNode<MaybeObject> handler1 = ReinterpretCast<MaybeObject>(Load(
++        MachineType::AnyTagged(), primary, IntPtrConstant(kValueOffset)));
++    TNode<Object> key2 = Load<Object>(secondary);
++    TNode<Object> map2 = Load<Object>(secondary, IntPtrConstant(kMapOffset));
++    TNode<MaybeObject> handler2 = ReinterpretCast<MaybeObject>(Load(
++        MachineType::AnyTagged(), secondary, IntPtrConstant(kValueOffset)));
++
++    GotoIf(TaggedNotEqual(name, key1), &try_secondary);
++    GotoIf(TaggedNotEqual(lookup_start_object_map, map1), &try_secondary);
++    *var_handler = handler1;
++    Goto(if_handler);
++
++    BIND(&try_secondary);
++    GotoIf(TaggedNotEqual(name, key2), &miss);
++    GotoIf(TaggedNotEqual(lookup_start_object_map, map2), &miss);
++    *var_handler = handler2;
++    Goto(if_handler);
++  }
++#else
+   // Probe the primary table.
+   TNode<IntPtrT> primary_offset =
+       StubCachePrimaryOffset(name, lookup_start_object_map);
+@@ -3371,6 +3438,7 @@ void AccessorAssembler::TryProbeStubCache(StubCache* stub_cache,
+                            lookup_start_object_map, if_handler, var_handler,
+                            &miss);
+   }
++#endif  // V8_TARGET_ARCH_E2K
+ 
+   BIND(&miss);
+   {

@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 13 Oct 2026 14:58:16 +0100
+Subject: [PATCH 54/99] v8: e2k: checked int32 multiplication: the branch
+ compares the product itself
+
+Int32MulWithOverflow made a 0/1 flag of the overflow (sign extension,
+xor, an unsigned compare, a merge) and the branch then compared the flag
+with zero: in the code that runs, five commands between the product and
+the check, on the path of every checked multiplication. For a branch or
+a deoptimization check t8 now keeps the product in 64 bits and the
+result is its low half sign-extended; the branch compares the two.
+intLoop of tests/bench.js: 246 -> 182 ms.
+---
+ .../backend/e2k/code-generator-e2k.cc         | 34 +++++++++++++++++--
+ 1 file changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+index de5e4f602d..735ef8404c 100644
+--- a/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
++++ b/chromium/v8/src/compiler/backend/e2k/code-generator-e2k.cc
+@@ -414,6 +414,14 @@ Condition FlagsConditionToConditionCmp(FlagsCondition condition) {
+   UNREACHABLE();
+ }
+ 
++// Whether kE2kMulOvf_w leaves the 64-bit product in t8 for the branch that
++// follows (see there) rather than a flag.
++bool MulOvfLeavesProduct(Instruction* instr) {
++  return instr->arch_opcode() == kE2kMulOvf_w &&
++         (instr->flags_mode() == kFlags_branch ||
++          instr->flags_mode() == kFlags_deoptimize);
++}
++
+ Condition FlagsConditionToConditionTst(FlagsCondition condition) {
+   switch (condition) {
+     case kNotEqual:
+@@ -1483,6 +1491,22 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       DCHECK(temps.hasAvailable());
+       temps.Exclude(t8);
+       Register scratch = t8;
++      if (MulOvfLeavesProduct(instr)) {
++        // For a branch t8 is the product in 64 bits and the result its low
++        // half sign-extended: they differ when it overflowed, and the branch
++        // compares them itself. Making a 0/1 flag of it first was four more
++        // commands on the path of every checked multiplication.
++        Register right = no_reg;
++        if (instr->InputAt(1)->IsRegister()) {
++          right = i.InputRegister(1);
++        } else {
++          right = temps.Acquire();
++          __ li(right, i.InputOperand(1));
++        }
++        __ mulw_d_w(t8, i.InputRegister(0), right);
++        __ slli_w(i.OutputRegister(), t8, 0);
++        break;
++      }
+       if (instr->flags_mode() == kFlags_set) {
+         scratch = i.OutputRegister(instr->OutputCount() - 1);
+       }
+@@ -4592,13 +4616,17 @@ void AssembleBranchToLabels(CodeGenerator* gen, MacroAssembler* masm,
+   } else if (instr->arch_opcode() == kE2kMulOvf_w ||
+              instr->arch_opcode() == kE2kMulOvf_d) {
+     DCHECK_LE(instr->OutputCount(), 1);
+-    // Overflow occurs if overflow register is not zero
++    // Overflow occurs if overflow register is not zero, or, when t8 is the
++    // whole product, if it is not the result.
++    Operand no_overflow = MulOvfLeavesProduct(instr)
++                              ? Operand(i.OutputRegister())
++                              : Operand(zero_reg);
+     switch (condition) {
+       case kOverflow:
+-        __ Branch(tlabel, ne, t8, Operand(zero_reg));
++        __ Branch(tlabel, ne, t8, no_overflow);
+         break;
+       case kNotOverflow:
+-        __ Branch(tlabel, eq, t8, Operand(zero_reg));
++        __ Branch(tlabel, eq, t8, no_overflow);
+         break;
+       default:
+         UNSUPPORTED_COND(instr->arch_opcode(), condition);

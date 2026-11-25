@@ -1,0 +1,2 @@
+{ "name": "nw-e2k-smoke", "version": "1.0.0", "main": "index.html",
+  "window": { "width": 900, "height": 700, "title": "NW.js on Elbrus" } }
