@@ -153,3 +153,51 @@
   nw.Window.capturePage -> shots/nwjs-smoke-capturePage.png.
 - Real NW.js app: WaveDrom Editor 3.7.0 (x86 release; its app zip appended to the nw binary, unzipped) runs:
   editor + timing diagram rendering (shots/nwjs-wavedrom-1.png).
+- Second -O1/-Os iteration (dav1d mc_tmpl, history_embeddings_search, js-temporal-objects at -Os) did not move the
+  remaining 6 flagged slots (they are probably at function joins); left as is: they are in V8 Temporal ZonedDateTime,
+  dav1d blend (AV1 video), one std::sort instance in history embeddings search, skrifa TrueType hinting (Rust from
+  the seed) and 2 outside code. On a host without the guard none of this matters.
+- A nonexistent app path (`nw /nonexistent`) ends in SIGILL ILL_ILLOPN in extensions::Extension::Create (a CHECK on
+  the error path while NW loads the app as an extension); not investigated.
+- NW dist: built on the x86 server (xz -T32 there: 1 min instead of 45 on the Elbrus host), copied to
+  ~/elnw/dist/nwjs-v0.117.0-linux-e2k.tar.xz, 237 MB, md5 2da8e29f6dc18297b86914d1c23620da; checked from the tarball
+  on the Elbrus host: `nw --version`, nw.sh + examples/nwsmoke.
+
+## 2026-11-25 VS Code 1.147.0 (x86 release, JS unchanged) on the e2k Electron
+- resources/ of the x86 tarball + the Electron package. Native modules rebuilt on the Elbrus host with node-gyp of node26
+  (N-API, `--nodedir=~/node26/headers`, lcc 1.29.16, sources = npm packages of the same versions):
+  kerberos, native-is-elevated, node-pty, @parcel/watcher, @vscode/native-watchdog, @vscode/policy-watcher,
+  @vscode/spdlog, @vscode/sqlite3 (needs NODE_PATH for npm's `tar` module in its extract step), native-keymap
+  (needs libxkbfile-devel headers: taken from the ALT e2kv5 rpm into /tmp, PKG_CONFIG_PATH).
+  Left x86 (prebuilt only / closed): vsda, @vscode/os-proxy-resolver, @github/copilot-sdk, @vscode/deviceid.
+- spdlog.node built with node-addon-api 8.9 had an undefined Napi::details::default_basic_finalizer<...> (an inline
+  template whose address is taken in a default template argument is not emitted by lcc); with its own
+  node-addon-api 7.1.0 it links.
+- VS Code starts, opens a folder, the editor highlights JavaScript (shots/electron-vscode-{1,2}.png); a second
+  `code <file>` call reaches the running instance over its IPC socket.
+- lcc 1.29.16 bug (reduced, /tmp/elnw-style test t2.cc): a function template that is only named in a default
+  template argument of another function template is never instantiated -> `U deffin<X>` in the .so. In
+  node-addon-api this is AttachData<FreeType, finalizer = default_[basic_]finalizer<FreeType>> -> spdlog, node-pty,
+  @parcel/watcher, policy-watcher, kerberos fail at dlopen (undefined Napi::details::default_*finalizer<...>);
+  __attribute__((used)) or static do not help. Workaround: `(void)&default_basic_finalizer<FreeType>;` in the body of
+  AttachData (~/elnw/bin/natbuild3.sh patches every napi-inl.h). Candidate MCST report. (node26's own N-API test
+  addons are C, so this did not show there.)
+
+## 2026-11-25 publication (requested by the user via the coordinator)
+- Private GitHub repos created from the Mac: Toxblh/electron-e2k and Toxblh/nwjs-e2k (visibility PRIVATE checked),
+  one commit each by Anton Palgunov <toxblh@gmail.com>, unsigned (the 1Password signing agent needs the user), no AI
+  attribution. Content: the 99 e2k Chromium/V8 patches (e2k-base..e2k-v8-js3, author emails rewritten to the gmail
+  address), Electron/NW.js patches and tree fixes, build scripts with generic paths and no hosts, Russian READMEs,
+  LOG.md passed through a sanitizer (no IPs, hosts, home paths). ALT spec patches and NW.js upstream deltas are not
+  vendored (third-party emails/IPs in them): the README says where they come from, nwjs-e2k has make-nw-deltas.sh.
+- Audit before push (tree + `git log -p`): IPv4 addresses (only version numbers match), home directories of this
+  machine and the Mac, ALT/BaseALT domains and the e2k mirror host, e-mails other than the author's, the closed lcc
+  sources, AI attribution: nothing found.
+- Releases e2k-20261125 with the two tarballs as assets.
+- The same lcc bug in [Basic]Env::SetInstanceData<T, fini = DefaultFini<T>> (spdlog loads, then fails lazily on
+  Napi::Env::DefaultFini<FunctionReference>): natbuild4.sh names DefaultFini/DefaultFiniWithHint in those bodies and
+  rebuilds the modules that call SetInstanceData (spdlog, sqlite3, kerberos). node-pty after the first workaround:
+  pty.spawn('/bin/sh') inside Electron prints `pty-on-e2k e2k`, exit 0.
+- sqlite3.c (8.5 MB amalgamation) with lcc -O3 on the Elbrus host got ~3 min of CPU in 40 min next to the other agents' jobs
+  (nice 19): compiled instead on the x86 server with the e2k cross clang (-O2, same defines, 90 s) and dropped into
+  the node-gyp build dir; the C++ binding is still built by lcc.
