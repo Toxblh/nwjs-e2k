@@ -201,3 +201,21 @@
 - sqlite3.c (8.5 MB amalgamation) with lcc -O3 on the Elbrus host got ~3 min of CPU in 40 min next to the other agents' jobs
   (nice 19): compiled instead on the x86 server with the e2k cross clang (-O2, same defines, 90 s) and dropped into
   the node-gyp build dir; the C++ binding is still built by lcc.
+- native-keymap uses the V8 API directly: needs -DV8_CPPGC_MICROTASK_QUEUE (V8 15.4 headers) and -L for the local
+  libxkbfile; then it loads. All 9 rebuilt modules load in Electron; spdlog writes a rotating log, node-pty spawns a
+  shell, sqlite3 opens a database, parcel watcher / policy-watcher / kerberos / keymap export their APIs.
+- VS Code with all of them on a fresh profile: starts with no native-module errors in the main-process log (only the
+  Copilot sign-in onboarding dialog shows on a new profile: shots/electron-vscode-3.png).
+
+## State at the end (2026-11-25)
+- the Elbrus host: dist ~/elnw/dist (README.md + 2 tarballs), shots ~/elnw/shots (9 PNG), apps ~/elnw/apps (smoke, nwsmoke,
+  wavedrom), runtime copies in /tmp/elnw (electron-v46n-e2k, nwjs-v0.117.0-e2k, obsidian-e2k, ticktick-e2k,
+  vscode-e2k with the e2k native modules, natbuild/). Units stopped (Xvfb :93, x86srv-rexec as found).
+- x86 server: ~/elnw (el/src + out/e2k-electron, nw/src + out/nw + out/Release, nwgit, vscode, bin, xbin, usrbin),
+  43 GB; / has 16 GB free. Rust seeds ~/xtools/rseed/{e2k-electron,nw} (hard-linked copies of e2k-rel3).
+- Remaining: Electron's own spec runner (needs its spec node_modules with native test modules for e2k); electron
+  node_headers target (configure.py lacks e2k); rebase on the release branch e2k-chrome-rel (VA-API, AV1, libc++
+  num_get and other Chrome-side fixes are not in e2k-v8-js3); chrome-sandbox / SUID sandbox; GPU acceleration;
+  NW.js: the 6 hangguard false positives left in libnw.so (only matter on hosts with that module), the CHECK on a
+  missing app path; MCST reports: lcc template instantiation (node-addon-api), lccopt __lccrt_builtin_cmp_eq_i_v2i2
+  and __lccrt_builtin_shuffle_v16v16i16 missing from liblccrt_s.a.
