@@ -219,3 +219,58 @@
   NW.js: the 6 hangguard false positives left in libnw.so (only matter on hosts with that module), the CHECK on a
   missing app path; MCST reports: lcc template instantiation (node-addon-api), lccopt __lccrt_builtin_cmp_eq_i_v2i2
   and __lccrt_builtin_shuffle_v16v16i16 missing from liblccrt_s.a.
+
+## 2026-11-25 (evening) v5 package fix: RPATH
+- The packaged electron (and nw, libnw.so, libnode.so, chrome_crashpad_handler) kept the cross sysroot RPATH
+  (/e2k/lib64:...), so `electron` without LD_LIBRARY_PATH failed on libXNVCtrl.so.0 (reported by the user).
+  ~/elnw/bin/fixrpath.py rewrites DT_RPATH in place: electron + crashpad -> `$ORIGIN`; nw + crashpad -> `$ORIGIN/lib`;
+  libnw.so, libnode.so -> `$ORIGIN`. Checked on the Elbrus host from the repacked tarballs with LD_LIBRARY_PATH unset:
+  --version of both, Electron smoke app under Xvfb. READMEs got a "which archive for which CPU" table.
+  New md5: electron-v46.0.0-nightly.20260902-linux-e2k.tar.xz d80edc31e31509aa5b21cdfbb593b963,
+  nwjs-v0.117.0-linux-e2k.tar.xz 6d52547852ec0d35f8727e3e41244d14 (release assets replaced).
+
+## 2026-11-25 (evening) e2k-v4 builds (Elbrus-8C, 1C+)
+- Base: the v4 tree of 25.11 (~/v4/ctree/chromium on the x86 server: V8 branch v4 = qp operations probed at run time from IDR,
+  no quick packing of Sparkplug/Maglev code on v4; abseil futex ERESTARTSYS retry), sysroot ~/v4/root2 (e2kv4 builds
+  of the same 771 packages), wrapper ~/v4/xbin (-march=elbrus-v4, scroll_snap fix, per-compile timeout), Rust seed
+  ~/v4/rseed/chromev4, rexec queue ~/v4/rexec run on the 8C itself by the v4-rexec worker on the Elbrus host.
+- Trees (hard-linked copies of the v4 tree): ~/elnw/el4/src (out/e2k-electron-v4), ~/elnw/nw4/src (out/nw,
+  out/Release). Same patch application as v5 (Electron: same 5 problems, same fixes; NW: same 7 rejects, same fixes,
+  ~/elnw/pub/nw-e2k-tree.patch applies cleanly), plus the node26-v4 libuv fix "no io_uring on Elbrus kernels before
+  6.1" in electron_node and node-nw (the 8C runs 5.10: io_uring task work made futex waits return -ERESTARTSYS).
+- Wrapper copy ~/elnw/xbin4 (= ~/v4/xbin + js2c -O0/__OPTIMIZE_SIZE__ + link flags for ./electron, ./nw,
+  ./chrome_crashpad_handler: placeholder PT_INTERP /opt/e2k-app/lib/<160 '/'>/ld-linux.so.2 and RPATH
+  `$ORIGIN:$ORIGIN/lib:/opt/e2k-app/LIB<160 '/'>`, the layout of the v4 Chromium package, so setinterp.py can bind
+  them to the shipped glibc), rustc wrapper ~/elnw/usrbin4 (v4 one + the /ref link-arg tolerance, /ref =
+  out/chromev4), seeds ~/v4/rseed/{e2k-electron-v4,nw}, libnotify headers added to ~/v4/root2 (noted).
+- Disk: removed my own v5 out dirs (~/elnw/el/src/out/e2k-electron except the unstripped electron, kept in
+  ~/elnw/keep; ~/elnw/nw/src/out/{nw,Release}), logged in ~/xwork/disk-cleanup.log.
+- 8C test environment (an 8C host, ALT Server 10.4, glibc 2.29, kernel 5.10, no X): /tmp/elnw/xvfb-e2kv4 = ALT
+  e2kv4 xorg-xvfb, xkbcomp, xwd, xkeyboard-config, DejaVu fonts + their library closure from root2 + glibc 2.35
+  (~/elnw/bin/rpmget.py from the e2kv4 mirror). Xvfb runs through lib/ld-linux.so.2; it executes /usr/bin/xkbcomp, so
+  run-xvfb.sh starts it in an unprivileged mount namespace (unshare -rm) where /usr/bin is a symlink farm onto a
+  second bind of the real /usr/bin plus an xkbcomp wrapper. xwd -root works.
+- Electron v4: 42.4k steps, 83 min (next to the NW.js v4 build, -j150 + -j90 on the x86 server + distcc), no Rust seed miss,
+  no compile failure. electron flags 0x4000000 elbrus-v4, PT_INTERP placeholder and RPATH reserve in place.
+  Packaging ~/elnw/bin/pack-v4.py: stripped app files, lib/ = NEEDED closure from root2 + GTK3 + libnotify + NSS
+  modules + glibc 2.35 core (113 libs), lib/setinterp.py, setup.sh.
+- NW.js v4: 52.9k steps, 98 min, then libnw.so failed: rust_allocator_internal::* defined twice - the v4 tree links
+  //build/rust/allocator:node26_malloc_impls into v8_libbase, and libnw.so takes archives --whole-archive next to my
+  RUST_ALLOC_E2K_MALLOC allocator_impls. Emptying the other one only in libnw.so broke host tools; final: in the NW
+  v4 tree node26_malloc_impls has no sources (allocator_impls.cc provides the functions). libnode.so via GYP 151 s.
+- Tests on an 8C host (Elbrus-8C, cpu family 4, 1.2 GHz, glibc 2.29, kernel 5.10; Xvfb :93 from the private env, DejaVu
+  fonts via FONTCONFIG_FILE), packages bound with ./setup.sh, nothing installed on the host:
+  - Electron: --version; node mode: fib(30) 154 ms, WebAssembly, N-API addon (cross-built for v4 against
+    electron_node headers, flags elbrus-v4); smoke app: renderer fib(30) 155 ms, sort 998 ms, IPC, preload,
+    Intl, RegExp, wasm, canvas, capturePage (shots/e2kv4-8C-electron-smoke-capturePage.png); only dbus errors
+    (no session bus on the server).
+  - Obsidian 1.8.10 (resources from the x86 deb): starts, self-updates to 1.15.1, opens the vault and renders the note
+    (shots/e2kv4-8C-electron-obsidian.png).
+  - NW.js: --version; smoke: nw 0.117.0 / node 26.7.0, fib(30) 156 ms, fs/crypto/zlib/Intl/wasm, N-API addon,
+    capturePage (shots/e2kv4-8C-nwjs-smoke-capturePage.png); WaveDrom Editor 3.7.0 (shots/e2kv4-8C-nwjs-wavedrom.png).
+  - No futex/-ERESTARTSYS aborts (libuv fix in), no SIGILL; there is no e2k_hangguard module on the 8C.
+  - Both dist tarballs re-checked from the archive on the 8C (setup.sh, --version, smoke with the addon).
+- Dist (on the Elbrus host ~/elnw/dist, release assets):
+  electron-v46.0.0-nightly.20260902-linux-e2kv4.tar.xz 211 MB md5 b08672749f89f3252728d7b87d89a231,
+  nwjs-v0.117.0-linux-e2kv4.tar.xz 275 MB md5 72432fe34f4441ab7abddc2bc5b65f80.
+- Note on names: Elbrus-8C2 is the 8SV (e2k-v5), not a v4 CPU; v4 = Elbrus-8C and 1C+; 16C (v6) runs both.

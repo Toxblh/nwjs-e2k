@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 24 Nov 2026 02:07:52 +0400
+Subject: [PATCH 2/4] v8: e2k: detect qp operations at run time (e2k-v4
+ support)
+
+The LSX layer (la_asm.h) builds the 128-bit instructions from the qp
+operations and 128-bit registers of e2k-v5. Elbrus-8C/1C+ (e2k-v4) have
+neither; everything else the backend emits is valid v4 code (the opcode
+table regenerated with GNU as -mcpu=elbrus-v4 is identical except the
+unused %lsr1/%ilcr1).
+
+CpuFeatures::ProbeImpl now adds LSX only when the IDR model number says
+v5 or later, and SupportsSimd128() follows LSX. The embedded builtins
+already test supports_simd_128_ before saving or restoring 128-bit
+registers, so the snapshot (built with the static feature set) serves
+both. On v4 wasm SIMD is rejected by the decoder.
+---
+ src/codegen/e2k/assembler-e2k.cc | 33 ++++++++++++++++++++++++++------
+ 1 file changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/src/codegen/e2k/assembler-e2k.cc b/src/codegen/e2k/assembler-e2k.cc
+index cc8dd61..86ff7a2 100644
+--- a/src/codegen/e2k/assembler-e2k.cc
++++ b/src/codegen/e2k/assembler-e2k.cc
+@@ -32,19 +32,40 @@
+ namespace v8 {
+ namespace internal {
+ 
+-bool CpuFeatures::SupportsSimd128() {
+-  // The 128-bit instructions of the backend (LoongArch LSX) are made of the
+-  // qp operations of e2k-v5 by the layer (la_asm.h), which every target of
+-  // this port has.
++namespace {
++
++// The 128-bit instructions of the backend (LoongArch LSX) are made of the qp
++// operations and 128-bit registers of e2k-v5 by the layer (la_asm.h); e2k-v4
++// and older (Elbrus-8C, -1C+) have neither, everything else the backend emits
++// is v4 code.  The model number (IDR bits 7:0, readable in user mode) tells
++// them apart: Elbrus-8C 7, Elbrus-1C+ 8, Elbrus-8SV (v5) 9, the v6 models
++// 10 and up.
++bool HostHasQpOperations() {
++#if defined(__e2k__)
++  uint64_t idr;
++  __asm__ volatile("rrd %%idr, %0" : "=r"(idr));
++  return (idr & 0xff) >= 9;
++#else
+   return true;
++#endif
+ }
+ 
++}  // namespace
++
++bool CpuFeatures::SupportsSimd128() { return IsSupported(LSX); }
++
+ void CpuFeatures::ProbeImpl(bool cross_compile) {
+   supported_.Add(FPU);
+-  supported_.Add(LSX);
+ 
+   // Only use statically determined features for cross compile (snapshot).
+-  if (cross_compile) return;
++  // The embedded builtins test supports_simd_128_ at run time before they
++  // touch a 128-bit register, so one snapshot serves v4 and v5 hosts.
++  if (cross_compile) {
++    supported_.Add(LSX);
++    return;
++  }
++
++  if (HostHasQpOperations()) supported_.Add(LSX);
+ 
+ 
+   // Set a static value on whether Simd is supported.

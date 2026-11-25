@@ -1,0 +1,75 @@
+--- a/third_party/abseil-cpp/absl/synchronization/internal/futex_waiter.cc
++++ b/third_party/abseil-cpp/absl/synchronization/internal/futex_waiter.cc
+@@ -72,7 +72,8 @@
+     if (!first_pass) MaybeBecomeIdle();
+     const int err = WaitUntil(&futex_, 0, t);
+     if (err != 0) {
+-      if (err == -EINTR || err == -EWOULDBLOCK) {
++      // e2k kernel 5.10 leaks -ERESTARTSYS (-512) to user space: retry as EINTR.
++      if (err == -EINTR || err == -EWOULDBLOCK || err == -512) {
+         // Do nothing, the loop will retry.
+       } else if (err == -ETIMEDOUT) {
+         return false;
+--- a/build/config/rust.gni
++++ b/build/config/rust.gni
+@@ -236,9 +236,14 @@
+   } else if (current_cpu == "loong64") {
+     rust_abi_target = "loongarch64-unknown-linux-gnu"
+   } else if (current_cpu == "e2k") {
+-    # The baseline of ALT e2k packages, and the only target the system
+-    # rustc ships a standard library for.
+-    rust_abi_target = "e2kv5-unknown-linux-gnu"
++    # v4 build (Elbrus-8C): target code for e2kv4 with the e2kv4 standard
++    # library of ALT's rust package; build scripts and proc macros (host build
++    # tools) stay e2kv5, they run in rustc / on the build Elbrus (8SV).
++    if (toolchain_for_rust_host_build_tools) {
++      rust_abi_target = "e2kv5-unknown-linux-gnu"
++    } else {
++      rust_abi_target = "e2kv4-unknown-linux-gnu"
++    }
+   } else {
+     # Best guess for other future platforms.
+     rust_abi_target = current_cpu + "-unknown-linux-gnu"
+--- a/build/rust/allocator/BUILD.gn
++++ b/build/rust/allocator/BUILD.gn
+@@ -130,3 +130,9 @@
+     visibility = [ ":*" ]
+   }
+ }
++
++# node26 (e2k): rust_allocator_internal on libc malloc (see node26_malloc_impls.cc); linked through //v8:v8_libbase
++# so that no Rust target's rsp changes.
++static_library("node26_malloc_impls") {
++  sources = [ "node26_malloc_impls.cc" ]
++}
+--- a/build/rust/allocator/node26_malloc_impls.cc
++++ b/build/rust/allocator/node26_malloc_impls.cc
+@@ -0,0 +1,28 @@
++// node26 (e2k): rust_allocator_internal on plain libc malloc, for builds without PartitionAlloc-as-malloc whose
++// Rust allocator crate is the one of the PartitionAlloc configuration (the native rustc seed only has that rlib).
++#include <stdlib.h>
++#include <string.h>
++#include <stddef.h>
++namespace rust_allocator_internal {
++static inline bool small(size_t align) { return align <= alignof(max_align_t); }
++static unsigned char* big(size_t size, size_t align) {
++  void* p = nullptr;
++  return posix_memalign(&p, align, size ? size : 1) == 0 ? static_cast<unsigned char*>(p) : nullptr;
++}
++unsigned char* alloc(size_t size, size_t align) {
++  return small(align) ? static_cast<unsigned char*>(malloc(size)) : big(size, align);
++}
++unsigned char* alloc_zeroed(size_t size, size_t align) {
++  if (small(align)) return static_cast<unsigned char*>(calloc(1, size));
++  unsigned char* p = big(size, align);
++  if (p) memset(p, 0, size);
++  return p;
++}
++void dealloc(unsigned char* p, size_t, size_t) { free(p); }
++unsigned char* realloc(unsigned char* p, size_t old_size, size_t align, size_t new_size) {
++  if (small(align)) return static_cast<unsigned char*>(::realloc(p, new_size));
++  unsigned char* n = big(new_size, align);
++  if (n) { memcpy(n, p, old_size < new_size ? old_size : new_size); free(p); }
++  return n;
++}
++}  // namespace rust_allocator_internal

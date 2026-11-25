@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 24 Nov 2026 03:14:37 +0400
+Subject: [PATCH 3/4] v8: e2k: V8_E2K_QP=0/1 overrides the qp probe
+
+To exercise the e2k-v4 code paths (no LSX, no wasm SIMD) on an e2k-v5
+host, and the other way round.
+---
+ src/codegen/e2k/assembler-e2k.cc | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/codegen/e2k/assembler-e2k.cc b/src/codegen/e2k/assembler-e2k.cc
+index 86ff7a2..e9bc9f3 100644
+--- a/src/codegen/e2k/assembler-e2k.cc
++++ b/src/codegen/e2k/assembler-e2k.cc
+@@ -41,6 +41,8 @@ namespace {
+ // them apart: Elbrus-8C 7, Elbrus-1C+ 8, Elbrus-8SV (v5) 9, the v6 models
+ // 10 and up.
+ bool HostHasQpOperations() {
++  // V8_E2K_QP=0/1 overrides the probe (to run the v4 code paths on a v5 host).
++  if (const char* e = getenv("V8_E2K_QP")) return e[0] == '1';
+ #if defined(__e2k__)
+   uint64_t idr;
+   __asm__ volatile("rrd %%idr, %0" : "=r"(idr));

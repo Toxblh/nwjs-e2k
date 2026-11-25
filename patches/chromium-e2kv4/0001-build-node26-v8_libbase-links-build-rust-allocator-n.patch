@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 17 Nov 2026 08:28:00 +0400
+Subject: [PATCH 1/4] build: node26: v8_libbase links
+ //build/rust/allocator:node26_malloc_impls (Rust allocator impls on libc
+ malloc for the node build without PartitionAlloc-as-malloc)
+
+---
+ BUILD.gn | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/BUILD.gn b/BUILD.gn
+index 2bd6d9d..4a85b38 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -7469,7 +7469,10 @@ v8_component("v8_libbase") {
+   v8_add_configs += [ "//build/config/compiler:thinlto_optimize_max" ]
+   v8_remove_configs += [ "//build/config/compiler:thinlto_optimize_default" ]
+ 
+-  deps = [ ":v8_config_headers" ]
++  deps = [
++    ":v8_config_headers",
++    "//build/rust/allocator:node26_malloc_impls",  # node26 (e2k): no PA-as-malloc, Rust allocator impls
++  ]
+ 
+   public_deps = [
+     ":v8_abseil",

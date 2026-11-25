@@ -11,6 +11,30 @@
 | V8 | 15.4.80.20 | бэкенд e2k + правки V8 от NW.js (nwjs/v8 7d30a50b) |
 | Node.js | 26.7.0 | nwjs/node c8241474, собран через GYP как libnode.so |
 
+
+## Какой архив для какого процессора
+| архив | процессоры | система |
+|---|---|---|
+| `…-linux-e2k.tar.xz` (e2k-v5) | Эльбрус-8СВ (он же 8С2, e2k-v5); 16С (e2k-v6) тоже исполняет | библиотеки из системы (ALT с glibc 2.35, ядро 6.1); RPATH = `$ORIGIN`, LD_LIBRARY_PATH не нужен |
+| `…-linux-e2kv4.tar.xz` (e2k-v4) | Эльбрус-8С, 1С+ (e2k-v4); 8СВ и 16С тоже исполняют | всё своё: glibc 2.35 и библиотеки в `lib/`; после распаковки один раз `./setup.sh` (пишет путь к `lib/` в бинарники) |
+
+Код v4 работает и на v5/v6, но без 128-битных операций (wasm SIMD выключен) и без плотной упаковки кода
+Sparkplug/Maglev, поэтому на 8СВ лучше архив v5.
+
+## Исправлено 2026-11-25
+RPATH в пакете e2k-v5 указывал на корень перекрёстной сборки, и без LD_LIBRARY_PATH запуск падал
+(`libXNVCtrl.so.0: cannot open shared object file`). Теперь RPATH = `$ORIGIN` (и `$ORIGIN/lib` у NW.js), правится на
+месте `build/fixrpath.py`; архивы в выпуске заменены.
+
+## e2k-v4 (Эльбрус-8С, 1С+)
+Тот же NW.js на дереве Chromium e2k-v4 (сборка 25.11): `patches/chromium-e2kv4` (V8: модель процессора по IDR,
+без 128-битных операций и плотной упаковки на v4; abseil, rust.gni, распределитель Rust), затем те же
+`patches/nwjs-e2k`, затем `patches/nwjs-e2kv4` (libuv node-nw без io_uring на ядрах до 6.1; пустой
+node26_malloc_impls, иначе двойное определение в libnw.so). Сборка `build/v4/xs-el4` с `XS_PROJ=nw4 XS_OUT=nw`
+и `build/v4/args-nwjs-v4.gn`, libnode.so — тот же GYP. Пакет самодостаточный (`build/v4/pack-v4.py`, `setup.sh`).
+Проверено на Эльбрусе-8С (glibc 2.29, ядро 5.10, Xvfb): `nw --version`, проверочное приложение с N-API-модулем,
+WaveDrom Editor 3.7.0. fib(30) ≈ 155 мс.
+
 ## Как устроено
 NW.js — это форк Chromium (nwjs/chromium.src), форк V8 (nwjs/v8), форк Node (nwjs/node) и код самого NW.js
 (`content/nw`). Вместо форка Chromium мы берём **разность** NW.js относительно апстрима (1010 файлов,

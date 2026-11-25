@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date:   Tue Nov 24 02:41:37 2026 +0400
+
+    uv: e2k: no io_uring on Elbrus kernels before 6.1
+    
+    On 5.10-elbrus (Elbrus-8C, 4x8SV hosts) io_uring task work
+    sets TIF_NOTIFY_SIGNAL; a futex wait of that thread then returns
+    -ERESTARTSYS (-512) to user space instead of being restarted, and glibc
+    aborts with "The futex facility returned an unexpected error code"
+    (abseil: "Futex operation failed with error -512"). libuv sets up its
+    epoll-batching ring on any kernel >= 5.10.186, so every node process that
+    spawned a child or watched a few fds was exposed. Use plain epoll there.
+
+diff --git a/deps/uv/src/unix/linux.c b/deps/uv/src/unix/linux.c
+index 1109648..da6c2c2 100644
+--- a/deps/uv/src/unix/linux.c
++++ b/deps/uv/src/unix/linux.c
+@@ -461,6 +461,17 @@ static int uv__use_io_uring(uint32_t flags) {
+ #elif defined(__powerpc64__) || defined(__ppc64__)
+   /* See https://github.com/libuv/libuv/issues/4283. */
+   return 0; /* Random SIGSEGV in signal handler. */
++#elif defined(__e2k__)
++  /* Elbrus kernels before 6.1 (5.10-elbrus): after io_uring task work
++   * (TIF_NOTIFY_SIGNAL) an interrupted futex wait returns -ERESTARTSYS (-512)
++   * to user space instead of being restarted, and glibc aborts ("The futex
++   * facility returned an unexpected error code"). Use plain epoll there.
++   */
++  if (uv__kernel_version() < /* 6.1.0 */ 0x060100)
++    return 0;
++  if (0 == (flags & UV__IORING_SETUP_SQPOLL))
++    return 1;
++  return 0;
+ #else
+   /* Ternary: unknown=0, yes=1, no=-1 */
+   static _Atomic int use_io_uring;

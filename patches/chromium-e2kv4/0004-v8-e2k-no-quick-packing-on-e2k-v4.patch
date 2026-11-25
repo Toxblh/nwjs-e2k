@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anton Palgunov <toxblh@gmail.com>
+Date: Tue, 24 Nov 2026 03:22:29 +0400
+Subject: [PATCH 4/4] v8: e2k: no quick packing on e2k-v4
+
+Sparkplug and Maglev pack their code in one pass (kPackFuse), which puts
+a reader right after the operation that makes its operand. On Elbrus-8C
+(e2k-v4) Maglev code packed that way computes wrong values: the node
+tests test-crypto-randomfill-properties (args[2]->IsUint32() fails),
+test-util-inspect, test-webstreams-queue-wraparound and
+test-zlib-invalid-input ("Invalid typed array length: 65536") fail on 8C
+every time, and pass with --no-maglev, with --no-e2k-quick-pack, and on
+8SV with the same binary (also with V8_E2K_QP=0). Without LSX (v4 and
+older) the assemblers keep the scheduling window, which places readers
+by the measured delays.
+---
+ src/codegen/e2k/assembler-e2k.h | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/codegen/e2k/assembler-e2k.h b/src/codegen/e2k/assembler-e2k.h
+index a3be999..5ffa89e 100644
+--- a/src/codegen/e2k/assembler-e2k.h
++++ b/src/codegen/e2k/assembler-e2k.h
+@@ -1804,7 +1804,14 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
+   // the order given (the packing of E2K_NO_SCHED=1) instead of going through
+   // the scheduling window, which TurboFan and the builtins keep.  Set before
+   // the first instruction.
+-  void set_quick_pack(bool on) { quick_pack_ = on; }
++  // The one-pass packing (kPackFuse) puts a reader right after its maker and
++  // relies on the hardware waiting for the operand; on e2k-v4 (Elbrus-8C,
++  // no LSX) that code computes wrong values (Maglev: node's crypto/zlib/util
++  // tests fail on 8C, pass with --no-e2k-quick-pack and on 8SV), so v4 keeps
++  // the scheduling window, which places readers by the measured delays.
++  void set_quick_pack(bool on) {
++    quick_pack_ = on && CpuFeatures::IsSupported(LSX);
++  }
+ 
+  private:
+   bool quick_pack_ = false;

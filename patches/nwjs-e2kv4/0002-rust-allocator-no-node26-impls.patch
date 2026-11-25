@@ -1,0 +1,18 @@
+NW.js on the e2k-v4 tree: that tree links //build/rust/allocator:node26_malloc_impls into v8_libbase;
+libnw.so takes archives --whole-archive, so it would clash with allocator_impls.cc (RUST_ALLOC_E2K_MALLOC):
+leave node26_malloc_impls empty here. Apply after patches/nwjs-e2k and patches/chromium-e2kv4.
+
+--- a/build/rust/allocator/BUILD.gn
++++ b/build/rust/allocator/BUILD.gn
+@@ -140,3 +140,11 @@
+     visibility = [ ":*" ]
+   }
+ }
++
++# node26 (e2k): rust_allocator_internal on libc malloc (see node26_malloc_impls.cc); linked through //v8:v8_libbase
++# so that no Rust target's rsp changes.
++static_library("node26_malloc_impls") {
++  # NW.js/e2k: allocator_impls.cc provides the same functions (RUST_ALLOC_E2K_MALLOC); libnw.so links archives
++  # --whole-archive, so this one stays empty in the NW.js tree.
++  sources = []
++}
